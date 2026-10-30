@@ -56,6 +56,8 @@ export class CodexAppServerClient {
     this.threadForkTimeoutMs = options.threadForkTimeoutMs ?? 60000;
     this.onNotification = typeof options.onNotification === "function" ? options.onNotification : null;
     this.onDynamicToolCall = typeof options.onDynamicToolCall === "function" ? options.onDynamicToolCall : null;
+    // 原生续聊没有 Corptie Agent 身份时，用明确的工具不可用原因回应模型。
+    this.unboundDynamicToolError = options.unboundDynamicToolError ?? null;
     this.notifications = [];
     // Codex plan snapshots have no native event ID or revision. Distinguish
     // physical notifications, including A -> B -> A within the same turn.
@@ -988,7 +990,7 @@ export class CodexAppServerClient {
         throw error;
       }
       if (!this.onDynamicToolCall || !agentId) {
-        throw new Error(`No Corptie dynamic-tool identity is bound to thread ${params.threadId ?? "unknown"}.`);
+        throw new Error(this.unboundDynamicToolError ?? `No Corptie dynamic-tool identity is bound to thread ${params.threadId ?? "unknown"}.`);
       }
       const value = await this.onDynamicToolCall({
         ...params,

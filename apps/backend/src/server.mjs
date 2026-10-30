@@ -1,6 +1,8 @@
 import http from "node:http";
 import { deleteUnreceivedUserMessage } from "./application/userMessageDeletion.mjs";
 import { routeBackendHttpRequest } from "./application/backendHttpRouter.mjs";
+import { NativeCodexSessionReader } from "./application/nativeCodexSessionReader.mjs";
+import { NativeCodexContinuation } from "./application/nativeCodexContinuation.mjs";
 import { detailServiceFor } from "./application/detailDocumentService.mjs";
 import { detailMigrationConfiguration } from "./application/detailMigrationConfiguration.mjs";
 import { parseDetailWebCards } from "./application/detailWebPresentation.mjs";
@@ -1071,12 +1073,12 @@ const firstRunSetup = new FirstRunSetupService({
     { id: "codex-app-server", name: "Codex", discover: resolveCodexCommand,
       programDiscovery: new ProviderExecutableDiscovery({ candidates: codexExecutableCandidates,
         controlledPath: controlledCodexCommand }),
-      runningPrograms: () => codexRuntime.runningPrograms(),
+      runningPrograms: () => [...codexRuntime.runningPrograms(), ...nativeCodexContinuation.runningPrograms()],
       withProgramTransition: async (path, probe, operation) => {
         const saved = firstRunSetup.state.providers["codex-app-server"];
         if (codexAppServerCommand() === path && saved?.probe?.fingerprint === probe.fingerprint) return operation();
         codexEnvironmentSetup.assertNoPendingLogin();
-        return codexRuntime.withExecutableTransition(operation);
+        return codexRuntime.withExecutableTransition(() => nativeCodexContinuation.withExecutableTransition(operation));
       },
       ...codexEnvironmentSetup,
       prepare: async () => {
@@ -1091,6 +1093,7 @@ const firstRunSetup = new FirstRunSetupService({
         if (codexEnvironmentHasActiveSession(codexEnvironmentRegistry.current)) {
           throw new Error("此 Provider 正在执行，请结束后再更改程序。");
         }
+        await nativeCodexContinuation.releaseIdleClients();
         await codexRuntime.close();
       } },
     { id: "claude-sdk", name: "Claude Code", discover: () => resolveExternalCommand("claude", { environmentVariables: ["CORPTIE_CLAUDE_PATH"] }),
@@ -2119,7 +2122,23 @@ const handleEntityRoutes = createEntityHttpRoutes({
   taskCompletionService, sessionTitleReservations, emitEvent
 });
 
+const nativeCodexContinuation = new NativeCodexContinuation({
+  home: () => codexEnvironmentRegistry.nativeHome,
+  journalPath: () => join(store.dataRoot, "native-codex-continuations.json"),
+  runtimeOptions: (home) => ({ command: codexAppServerCommand,
+    env: () => codexEnvironment({ home }),
+    validateCommand: (path) => firstRunSetup.validateRuntimeProgram("codex-app-server", path) }),
+  assertAvailable: async (threadId) => {
+    if (store.getAgentSessionBindingByProviderSession("codex-app-server", threadId)) {
+      throw Object.assign(new Error("该会话已由 Corptie 工作台管理，请在工作台中继续对话。"), {
+        statusCode: 409, code: "NATIVE_SESSION_ALREADY_MANAGED"
+      });
+    }
+  }
+});
 const backendHttpPorts = Object.freeze({
+  nativeCodexSessionReader: new NativeCodexSessionReader({ home: () => codexEnvironmentRegistry.nativeHome }),
+  nativeCodexContinuation,
   get detailWritesAllowed() { return detailMigration.detailWritesAllowed; },
   get detailActionService() { return detailActionService; },
   get clientDeviceGateway() { return clientDeviceGateway; },
@@ -2447,6 +2466,7 @@ startBackendRuntime();
 
 
 const shutdownBackend = createBackendShutdown({
+  nativeCodexContinuation,
   backgroundAgentService, memoryExtractionScheduler, getClientDeviceGateway: () => clientDeviceGateway,
   taskSummaryService, turnObservability, runtimeActivity, mcpCleanupInterval, turnExecutionProbe, mcpRegistryService,
   stateSyncPublisher, scheduledSessionTaskService,

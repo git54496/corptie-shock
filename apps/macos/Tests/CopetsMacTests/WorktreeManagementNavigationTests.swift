@@ -6,7 +6,7 @@ import XCTest
 
 final class WorktreeManagementNavigationTests: XCTestCase {
     func testWorktreeTabIsAnIndependentMainNavigationDestination() {
-        XCTAssertEqual(AppTab.allCases, [.console, .automations, .scenes, .worktrees, .resources, .agents, .memory, .settings])
+        XCTAssertEqual(AppTab.allCases, [.console, .automations, .scenes, .worktrees, .resources, .agents, .memory, .codexHistory, .settings])
         XCTAssertEqual(AppTab.worktrees.systemImage, "arrow.triangle.branch")
         XCTAssertEqual(AppTab.worktrees.index, 3)
     }

@@ -1585,3 +1585,39 @@
 
 "展开消息" = "Expand message";
 "收起消息" = "Collapse message";
+
+// Native Codex session browser
+"Codex 会话" = "Codex Sessions";
+"读取失败，请重试" = "Could not load. Please try again.";
+"搜索标题或工作目录" = "Search title or working directory";
+"已归档" = "Archived";
+"未找到本机 Codex 会话索引。请先在 Codex 中创建本地会话，或检查 Codex Home 设置。" = "No local Codex session index found. Create a local session in Codex or check the Codex Home setting.";
+"没有匹配的会话" = "No matching sessions";
+"未命名会话" = "Untitled session";
+"加载更多会话" = "Load more sessions";
+"本机历史 · 只读" = "Local history · Read only";
+"刷新历史" = "Refresh history";
+"选择一个 Codex 会话" = "Select a Codex session";
+"浏览本机 Codex 保存的消息和工具记录" = "Browse messages and tool records saved by local Codex";
+"加载更早记录" = "Load earlier records";
+"部分记录尚未写完或格式无效，已跳过；可刷新重试。" = "Some incomplete or invalid records were skipped. Refresh to try again.";
+"此页没有可展示的消息，可加载更早记录或刷新。" = "No messages on this page. Load earlier records or refresh.";
+"工具结果" = "Tool result";
+"用户" = "You";
+
+// Native Codex continuation
+"上一条消息结果尚未确认，请先刷新状态或重试原消息。" = "The previous message is unconfirmed. Refresh status or retry the same message.";
+"已在 Codex 中确认上一轮结束？" = "Have you confirmed the previous turn ended in Codex?";
+"已核对，解除等待" = "Confirmed, clear waiting state";
+"这不会重发上一条消息；请先核对执行结果，避免重复操作。" = "This will not resend the previous message. Check its result first to avoid duplicate actions.";
+"原生 Codex 会话 · 原历史续聊" = "Native Codex session · Continue existing history";
+"保留原工作目录、模型和权限。Codex App 专属工具可能不可用；请勿在两端同时发送。" = "Keeps the original workspace, model and permissions. Codex App tools may be unavailable. Do not send from both apps at once.";
+"续聊消息" = "Continuation message";
+"等待核对执行结果" = "Waiting for result confirmation";
+"Codex 正在处理" = "Codex is working";
+"核对后解除等待" = "Confirm result and clear waiting state";
+"恢复并续聊" = "Unarchive and continue";
+"打开确认页面" = "Open confirmation page";
+"选择答案" = "Choose an answer";
+"输入答案" = "Enter an answer";
+"提交答案" = "Submit answers";

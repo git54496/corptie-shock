@@ -1,5 +1,6 @@
 import { handleDesktopDetail, handleDesktopDetailSync } from "./detailDocumentService.mjs";
 import { handleDetailActionHttp } from "./detailActionHttpAdapter.mjs";
+import { handleNativeCodexSessionHttpRequest } from "./nativeCodexSessionHttpApi.mjs";
 
 export function routeBackendHttpRequest(request, response, ports) {
   const {
@@ -73,6 +74,11 @@ export function routeBackendHttpRequest(request, response, ports) {
   })) return;
   if (rejectUnavailableStoreRequest({
     request, response, url, backendStoreReady, store, dataRootMigrationCoordinator, sendJson
+  })) return;
+
+  if (ports.nativeCodexSessionReader && handleNativeCodexSessionHttpRequest({
+    request, response, url, reader: ports.nativeCodexSessionReader,
+    continuation: ports.nativeCodexContinuation, readJson, sendJson
   })) return;
 
   if (handleDesktopDetailSync({ request, response, url, store, sendJson }) ||

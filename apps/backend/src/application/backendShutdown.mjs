@@ -2,7 +2,7 @@ export function createBackendShutdown({
   backgroundAgentService, memoryExtractionScheduler, getClientDeviceGateway, taskSummaryService,
   turnObservability, runtimeActivity, mcpCleanupInterval, turnExecutionProbe, mcpRegistryService,
   stateSyncPublisher, scheduledSessionTaskService, getResetForecastMonitor,
-  openClackyManager, feishuGateway, codexRuntime, skillMcpGateway,
+  openClackyManager, feishuGateway, codexRuntime, skillMcpGateway, nativeCodexContinuation,
   runIsolationCoordinator, projectCodeFreshnessMonitor,
   closeTimelineReadPool, store, dataRootMigrationCoordinator,
   backendDataRootOwnership
@@ -28,6 +28,7 @@ export function createBackendShutdown({
       openClackyManager.stop();
       await feishuGateway.close();
       await codexRuntime.close();
+      await nativeCodexContinuation?.close();
       await skillMcpGateway.close();
       await runIsolationCoordinator?.close();
       projectCodeFreshnessMonitor.close();

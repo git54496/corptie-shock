@@ -487,7 +487,11 @@ struct ConversationNativeRowBuilder {
             item.collaborationRouteStatus ?? "",
             item.collaborationRoutingVersion.map(String.init) ?? ""
         ].joined(separator: ":") + ":" + imageSignature
-        return [
+        let planSignature = item.executionPlan.map { "plan:\($0.revision)" } ?? ""
+        let toolSignature = item.toolExecution.map { "tool:\($0.hashValue)" } ?? ""
+        let changeSignature = item.changeSet.map { "changes:\($0.hashValue)" } ?? ""
+        let inputSignature = item.userInput.map { "input:\($0.hashValue)" } ?? ""
+        let components: [String] = [
             item.id,
             item.type,
             item.status ?? "",
@@ -498,10 +502,10 @@ struct ConversationNativeRowBuilder {
             item.automationRunError ?? "",
             item.queuePosition.map(String.init) ?? "",
             item.turnStatus,
-            item.executionPlan.map { "plan:\($0.revision)" } ?? "",
-            item.toolExecution.map { "tool:\($0.hashValue)" } ?? "",
-            item.changeSet.map { "changes:\($0.hashValue)" } ?? "",
-            item.userInput.map { "input:\($0.hashValue)" } ?? "",
+            planSignature,
+            toolSignature,
+            changeSignature,
+            inputSignature,
             item.presentationRole ?? "",
             collaborationSignature,
             "\(text.count)",
@@ -509,6 +513,7 @@ struct ConversationNativeRowBuilder {
             "\(presentationText.count)",
             String(presentationText.suffix(96)),
             fileChangesSignature(item)
-        ].joined(separator: ":")
+        ]
+        return components.joined(separator: ":")
     }
 }

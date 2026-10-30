@@ -101,6 +101,7 @@ enum AppTab: String, CaseIterable, Identifiable {
     case resources
     case agents
     case memory
+    case codexHistory
     case settings
 
     var id: String { rawValue }
@@ -119,7 +120,8 @@ enum AppTab: String, CaseIterable, Identifiable {
         case .resources: 4
         case .agents: 5
         case .memory: 6
-        case .settings: 7
+        case .codexHistory: 7
+        case .settings: 8
         }
     }
 
@@ -132,6 +134,7 @@ enum AppTab: String, CaseIterable, Identifiable {
         case .resources: L10n("资源管理")
         case .agents: L10n("Agents")
         case .memory: L10n("Memory")
+        case .codexHistory: L10n("Codex 会话")
         case .settings: L10n("Settings")
         }
     }
@@ -145,6 +148,7 @@ enum AppTab: String, CaseIterable, Identifiable {
         case .resources: "folder"
         case .agents: "person.2"
         case .memory: "brain.head.profile"
+        case .codexHistory: "text.bubble"
         case .settings: "gearshape"
         }
     }
@@ -444,6 +448,8 @@ private struct MainTabPageHost: NSViewRepresentable {
                     .padding(16).mainWindowPageCard())
             case .settings:
                 root = AnyView(SettingsView())
+            case .codexHistory:
+                root = AnyView(NativeCodexSessionsView())
             }
             let hostingView = NSHostingView(
                 rootView: root
