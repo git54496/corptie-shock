@@ -2,10 +2,15 @@ import { resolveExternalCommand, externalCommandCandidates } from "./externalCom
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const codexAppBundleBinaries = [
-  "/Applications/Codex.app/Contents/Resources/codex",
-  "/Applications/ChatGPT.app/Contents/Resources/codex"
-];
+// 统一维护新旧 App 内置程序路径，供初始化扫描和运行时查找共同使用。
+function codexAppBundleCandidates() {
+  return ["/Applications", join(homedir(), "Applications")].flatMap(root =>
+    ["Codex", "ChatGPT"].flatMap(name => {
+      const resources = join(root, `${name}.app`, "Contents", "Resources");
+      return ["codex", join("codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex")]
+        .map(binary => ({ path: join(resources, binary), source: name }));
+    }));
+}
 
 export function controlledCodexCommand() {
   return process.env.CORPTIE_CODEX_PATH || process.env.CORPTIE_CODEX_REAL_PATH || null;
@@ -13,14 +18,13 @@ export function controlledCodexCommand() {
 
 export function codexExecutableCandidates() {
   return [...externalCommandCandidates("codex").map(path => ({ path, source: "cli" })),
-    ...["/Applications", join(homedir(), "Applications")].flatMap(root =>
-      ["Codex", "ChatGPT"].map(name => ({ path: join(root, `${name}.app`, "Contents", "Resources", "codex"), source: name })))];
+    ...codexAppBundleCandidates()];
 }
 
 export function resolveCodexCommand(requestedCommand = "") {
   return resolveExternalCommand("codex", {
     requested: requestedCommand,
     environmentVariables: ["CORPTIE_CODEX_PATH", "CORPTIE_CODEX_REAL_PATH"],
-    extraCandidates: codexAppBundleBinaries
+    extraCandidates: codexAppBundleCandidates().map(candidate => candidate.path)
   });
 }

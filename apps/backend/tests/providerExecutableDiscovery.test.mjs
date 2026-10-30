@@ -1,9 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile, symlink, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProviderExecutableDiscovery, compareExecutableVersions, parseExecutableVersion } from "../src/application/providerExecutableDiscovery.mjs";
+import { codexExecutableCandidates } from "../src/utils/codexCommand.mjs";
+
+test("Codex discovery includes legacy and nested App binaries in both application directories", () => {
+  const candidates = codexExecutableCandidates();
+  for (const root of ["/Applications", join(homedir(), "Applications")]) {
+    for (const name of ["Codex", "ChatGPT"]) {
+      for (const binary of ["codex", "codex-cli/CodexCLI.app/Contents/MacOS/codex"]) {
+        const path = join(root, `${name}.app`, "Contents", "Resources", binary);
+        assert.ok(candidates.some(candidate => candidate.path === path && candidate.source === name), path);
+      }
+    }
+  }
+});
 
 test("semantic ordering handles numeric prereleases and core versions", () => {
   assert.ok(compareExecutableVersions("0.155.0-alpha.16", "0.155.0-alpha.9") > 0);
