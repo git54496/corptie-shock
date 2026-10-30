@@ -24,7 +24,14 @@ struct MainWindowNavigationRail: View {
             onSelect: { id in
                 if let tab = AppTab(rawValue: id) { selection = tab }
             },
-            onSettings: { selection = .settings }
+            onSettings: { selection = .settings },
+            customIcon: { id, selected in
+                AnyView(NavigationFigureIcon(
+                    id: id == "main-window.settings" ? AppTab.settings.rawValue : id,
+                    selected: selected
+                ))
+            },
+            flatAppearance: true
         )
         .padding(.horizontal, 8)
         .padding(.top, MainWindowLayoutMetrics.titlebarHeight + 8)

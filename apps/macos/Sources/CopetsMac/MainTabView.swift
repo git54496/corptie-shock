@@ -425,7 +425,6 @@ private struct MainTabPageHost: NSViewRepresentable {
     let selection: AppTab
     let router: AppTabRouter
     let resizeState: MainWindowResizeState
-    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
 
     func makeNSView(context: Context) -> MainTabPageContainer {
         let container = MainTabPageContainer { tab in
@@ -470,7 +469,8 @@ private struct MainTabPageHost: NSViewRepresentable {
     }
 
     func updateNSView(_ container: MainTabPageContainer, context: Context) {
-        container.select(selection, animated: !accessibilityReduceMotion && !resizeState.isLiveResize)
+        // 主导航直接替换可见页面，保留缓存状态，不播放横向滑动过渡。
+        container.select(selection, animated: false)
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: MainTabPageContainer, context: Context) -> CGSize? {

@@ -203,12 +203,18 @@ public struct PlatformNavigationRail: View {
     public let settingsAccessibilityID: String
     public let onSelect: (String) -> Void
     public let onSettings: () -> Void
+    /// 可选的宿主图标绘制入口；未提供时沿用系统符号。
+    private let customIcon: ((String, Bool) -> AnyView)?
+    /// 平面导航使用独立圆角选中底色，不使用整列玻璃或滑动指示器。
+    private let flatAppearance: Bool
 
     public init(items: [PlatformNavigationItem], selectedID: String, expanded: Bool,
                 verticalAlignment: Alignment = .top,
                 settingsSelected: Bool = false,
                 settingsTitle: String, settingsAccessibilityID: String,
-                onSelect: @escaping (String) -> Void, onSettings: @escaping () -> Void) {
+                onSelect: @escaping (String) -> Void, onSettings: @escaping () -> Void,
+                customIcon: ((String, Bool) -> AnyView)? = nil,
+                flatAppearance: Bool = false) {
         self.items = items
         self.selectedID = selectedID
         self.expanded = expanded
@@ -218,16 +224,35 @@ public struct PlatformNavigationRail: View {
         self.settingsAccessibilityID = settingsAccessibilityID
         self.onSelect = onSelect
         self.onSettings = onSettings
+        self.customIcon = customIcon
+        self.flatAppearance = flatAppearance
     }
 
     public var body: some View {
-        PlatformAnimatedTabSelection(selectedID: settingsSelected ? settingsAccessibilityID : selectedID) { displayedID, moving in
-            PlatformNavigationGlassContainer { railContents(selectedID: displayedID, moving: moving).padding(5) }
-                .platformGlassSurface(in: Capsule(), variant: .clear)
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier("navigation-tab-capsule")
+        Group {
+            if flatAppearance {
+                railContents(selectedID: settingsSelected ? settingsAccessibilityID : selectedID, moving: false)
+            } else {
+                PlatformAnimatedTabSelection(selectedID: settingsSelected ? settingsAccessibilityID : selectedID) { displayedID, moving in
+                    PlatformNavigationGlassContainer { railContents(selectedID: displayedID, moving: moving).padding(5) }
+                        .platformGlassSurface(in: Capsule(), variant: .clear)
+                }
+            }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("navigation-tab-capsule")
         .frame(maxHeight: .infinity, alignment: verticalAlignment)
+    }
+
+    @ViewBuilder private func selectionBackground(moving: Bool) -> some View {
+        if flatAppearance {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.primary.opacity(0.07))
+                .frame(width: expanded ? nil : 44, height: 44)
+                .accessibilityHidden(true)
+        } else {
+            PlatformTabSelectionIndicator(namespace: selectionGlass, moving: moving)
+        }
     }
 
     private func railContents(selectedID: String, moving: Bool) -> some View {
@@ -239,8 +264,12 @@ public struct PlatformNavigationRail: View {
                     onSelect(item.id)
                 } label: {
                     HStack(spacing: 10) {
-                        PlatformTabSymbol(symbol: item.symbol, selected: selected,
-                                          activation: activations[item.id, default: 0])
+                        if let customIcon {
+                            customIcon(item.id, selected)
+                        } else {
+                            PlatformTabSymbol(symbol: item.symbol, selected: selected,
+                                              activation: activations[item.id, default: 0])
+                        }
                         if expanded {
                             Text(item.title)
                                 .font(.system(size: 14, weight: selected ? .semibold : .medium))
@@ -253,7 +282,7 @@ public struct PlatformNavigationRail: View {
                     .foregroundStyle(selected ? Color.accentColor : .secondary)
                     .background {
                         if selected {
-                            PlatformTabSelectionIndicator(namespace: selectionGlass, moving: moving)
+                            selectionBackground(moving: moving)
                         }
                     }
                     .contentShape(Rectangle())
@@ -276,8 +305,12 @@ public struct PlatformNavigationRail: View {
                 onSettings()
             } label: {
                 HStack(spacing: 10) {
-                    PlatformTabSymbol(symbol: "gearshape", selected: selected,
-                                      activation: activations[settingsAccessibilityID, default: 0])
+                    if let customIcon {
+                        customIcon(settingsAccessibilityID, selected)
+                    } else {
+                        PlatformTabSymbol(symbol: "gearshape", selected: selected,
+                                          activation: activations[settingsAccessibilityID, default: 0])
+                    }
                     if expanded {
                         Text(settingsTitle)
                             .font(.system(size: 14, weight: .medium))
@@ -289,7 +322,7 @@ public struct PlatformNavigationRail: View {
                 .padding(.horizontal, expanded ? 8 : 0)
                 .foregroundStyle(selected ? Color.accentColor : .secondary)
                 .background {
-                    if selected { PlatformTabSelectionIndicator(namespace: selectionGlass, moving: moving) }
+                    if selected { selectionBackground(moving: moving) }
                 }
                 .contentShape(Rectangle())
             }
