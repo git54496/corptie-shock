@@ -1621,3 +1621,6 @@
 "选择答案" = "Choose an answer";
 "输入答案" = "Enter an answer";
 "提交答案" = "Submit answers";
+/* 创建入口术语 */
+"New Agent Conversation" = "New Agent Conversation";
+"Create Session in %@" = "Create Session in %@";

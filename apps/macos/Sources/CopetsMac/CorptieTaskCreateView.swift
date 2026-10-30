@@ -90,7 +90,7 @@ struct CorptieTaskCreateView: View {
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 16) {
-            Text(L10n("新建 Task"))
+            Text(L10n("New Session"))
                 .font(.title3.bold())
 
             FormAssistPanel(

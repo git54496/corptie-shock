@@ -22,8 +22,8 @@ struct ConsoleChatCanvasCard: View {
                 }
                 .buttonStyle(.plain).focused($createFocused)
                 .opacity(isHovering || createFocused ? 1 : 0)
-                .accessibilityLabel(L10n("New Assistant Session"))
-                .help(L10n("New Assistant Session"))
+                .accessibilityLabel(L10n("New Agent Conversation"))
+                .help(L10n("New Agent Conversation"))
             }
             if sessions.isEmpty {
                 Text("暂无匹配的 Chat").font(.caption).foregroundStyle(.secondary)

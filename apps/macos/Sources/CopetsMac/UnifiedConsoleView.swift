@@ -913,15 +913,11 @@ struct UnifiedConsoleView: View {
     var outlineCreationMenu: some View {
         Menu {
             if selectedWork == nil {
-                Button(L10n("New Assistant Session"), systemImage: "bubble.left.and.bubble.right") {
+                Button(L10n("New Agent Conversation"), systemImage: "bubble.left.and.bubble.right") {
                     showNewSessionCreation = true
                 }
+                Divider()
             }
-            Button(L10n("New Task"), systemImage: "checklist") {
-                presentTaskCreation(for: selectedWorkId)
-            }
-
-            Divider()
 
             Button(L10n("New Work"), systemImage: "scope") {
                 isCreatingWork = true
@@ -933,10 +929,10 @@ struct UnifiedConsoleView: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help(L10n("Create"))
-        .accessibilityLabel("新增 Work 或 Task").accessibilityIdentifier("work-outline-create")
+        .accessibilityLabel("新增 Agent 对话或 Work").accessibilityIdentifier("work-outline-create")
     }
 
-    func presentTaskCreation(for workID: String?) {
+    func presentTaskCreation(for workID: String) {
         taskCreationTarget = TaskCreationTarget(workID: workID)
     }
 

@@ -158,7 +158,7 @@ extension UnifiedConsoleView {
     func outlineChatHeader(hasUnread: Bool) -> some View {
         let isExpanded = !outlineExpansionPreferences.isAssistantCollapsed || !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return HoverRevealHeaderAction(
-            accessibilityLabel: L10n("New Assistant Session"),
+            accessibilityLabel: L10n("New Agent Conversation"),
             action: { showNewSessionCreation = true }
         ) {
             Button {

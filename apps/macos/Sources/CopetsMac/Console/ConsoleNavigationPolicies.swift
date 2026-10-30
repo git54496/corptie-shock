@@ -261,8 +261,8 @@ struct ConsoleWorkOutlineHeader: View {
             .buttonStyle(.plain)
             .focused($isCreateTaskFocused)
             .opacity(isHovering || isCreateTaskFocused ? 1 : 0.45)
-            .accessibilityLabel(L10nFormat("Create Task in %@", work.name))
-            .help(L10nFormat("Create Task in %@", work.name))
+            .accessibilityLabel(L10nFormat("Create Session in %@", work.name))
+            .help(L10nFormat("Create Session in %@", work.name))
         }
         .onHover { isHovering = $0 }
     }
