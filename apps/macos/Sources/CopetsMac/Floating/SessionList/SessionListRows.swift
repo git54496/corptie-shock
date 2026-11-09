@@ -64,16 +64,19 @@ struct DetailSessionRailRow: View {
                         }
                     }
 
-                Text(session.title)
-                    .font(.system(size: 10, weight: isSelected ? .semibold : .medium, design: .rounded))
-                    .foregroundStyle(isSelected ? Color.primary : Color.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(width: 64)
+                HStack(spacing: 2) {
+                    Text(session.title)
+                        .font(.system(size: 10, weight: isSelected ? .semibold : .medium, design: .rounded))
+                        .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    SessionTitleBadges(session: session, size: 10)
+                }
+                .frame(width: 64)
             }
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SessionSelectionPressStyle())
         .help("\(session.title)\n\(session.executionTaskStatus.label)")
     }
 }
@@ -127,42 +130,51 @@ struct CompactSessionRow: View {
     var selectionRequested: ((TaskSession) -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 10) {
-            SessionStatusLight(status: session.executionTaskStatus, diameter: 9)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(displayTitle ?? session.title)
-                    .font(.system(size: 12.5, weight: style.titleWeight))
-                    .lineLimit(1)
-                    .help(session.title)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            .layoutPriority(1)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            Spacer(minLength: 4)
-            if isUnread {
-                Circle()
-                    .fill(Color.red)
-                    .frame(width: 8, height: 8)
-                    .accessibilityLabel(L10n("Unread Session"))
-                    .help(L10n("Unread Session"))
-            }
-        }
-        .padding(.horizontal, 10)
-        .frame(height: style.height)
-        .standardSessionCardSurface()
-        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .onTapGesture {
+        Button {
             if let selectionRequested {
                 selectionRequested(session)
             } else {
                 backendClient.select(session: session, focusComposer: true)
             }
+        } label: {
+            HStack(spacing: 10) {
+                SessionStatusLight(status: session.executionTaskStatus, diameter: 9)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(displayTitle ?? session.title)
+                            .font(.system(size: 12.5, weight: style.titleWeight))
+                            .lineLimit(1)
+                            .help(session.title)
+                        SessionTitleBadges(session: session)
+                    }
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .layoutPriority(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Spacer(minLength: 4)
+                if (session.mailboxPendingCount ?? 0) > 0 {
+                    Image(systemName: "envelope.badge").font(.caption2).foregroundStyle(.secondary)
+                        .accessibilityLabel("信箱有待处理消息")
+                }
+                if isUnread {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 8, height: 8)
+                        .accessibilityLabel(L10n("Unread Session"))
+                        .help(L10n("Unread Session"))
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: style.height)
+            .standardSessionCardSurface()
+            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
+        .buttonStyle(SessionSelectionPressStyle())
         .contextMenu {
             SessionContextMenuContent(session: session, isRenaming: $isRenaming)
         }
@@ -285,7 +297,11 @@ enum ProviderBrandIcon {
         }
     }
 
-    static func image(for identity: String?, providers: [AgentProviderDescriptor]) -> NSImage? {
+    static func image(for identity: String?, providers: [AgentProviderDescriptor], resourceBundle: Bundle? = nil) -> NSImage? {
+        if let resourceBundle {
+            guard let name = assetName(for: identity, providers: providers) else { return nil }
+            return load(name, bundle: resourceBundle)
+        }
         switch assetName(for: identity, providers: providers) {
         case "codex": return codex
         case "claude-code": return claudeCode
@@ -294,8 +310,8 @@ enum ProviderBrandIcon {
         }
     }
 
-    private static func load(_ name: String) -> NSImage? {
-        guard let url = AppResourceBundle.bundle.url(
+    private static func load(_ name: String, bundle: Bundle = AppResourceBundle.bundle) -> NSImage? {
+        guard let url = bundle.url(
             forResource: name,
             withExtension: "png",
             subdirectory: "ProviderIcons"
@@ -338,12 +354,12 @@ struct SessionContextMenuContent: View {
 
         DetachedChatWindowMenuButton(session: session)
 
-        if let agentID = session.agentId {
+        if let roleID = session.roleId {
             Button {
                 NotificationCenter.default.post(
                     name: .showAgentOrb,
                     object: nil,
-                    userInfo: ["agentId": agentID]
+                    userInfo: ["agentId": roleID]
                 )
             } label: {
                 Label(L10n("Show Floating Orb"), systemImage: "circle.circle")

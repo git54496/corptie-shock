@@ -42,7 +42,7 @@ test("local context failures settle unsent deliveries without invalidating healt
     const updates = [];
     let invalidations = 0;
     const failure = Object.assign(new Error("Message was not sent to the model: context limit"), {
-      code: "SESSION_CONTEXT_BUDGET_EXCEEDED", dispatchState: "not_sent", stage
+      code: "CONTEXT_ASSEMBLY_FAILED", dispatchState: "not_sent", stage
     });
     const { operation, calls } = fixture({
       store: {
@@ -149,7 +149,7 @@ test("dispatch acceptance arms both monitors without native events for every Pro
         },
         sessionApplicationService: { sendMessage: async () => {
           if (settled) turn = { execution_status: "completed" };
-          return { turnId: "turn" };
+          return { turnId: "turn", delivery: "accepted" };
         } },
         providerTurnResponseWatchdog: { watch: entry => monitored.push(["watch", entry]) },
         onTurnAccepted: entry => {
@@ -166,6 +166,54 @@ test("dispatch acceptance arms both monitors without native events for every Pro
         assert.equal(monitored[1][1].routingVersion, 2);
       }
     }
+  }
+});
+
+test("an unknown send receipt keeps delivery uncertain without inventing a running Turn or starting monitors", async () => {
+  let delivery = { deliveryId: "delivery", bindingId: "binding", attemptCount: 0, status: "queued" };
+  const binding = { sessionId: "session", logicalSessionId: "logical", providerId: OPENCLACKY_PROVIDER_ID,
+    providerSessionId: "native", bindingId: "binding", routingVersion: 2 };
+  const { operation, calls } = fixture({
+    requireSessionReference: () => ({ ...binding, metadata: { session: { id: "session", status: "complete" } } }),
+    store: { getLogicalSession: () => ({}), listUnsettledSessionTurns: () => [],
+      getMessageDelivery: () => delivery, getAgentSessionBinding: () => binding, getSessionTurn: () => null,
+      upsertSessionTurn: () => assert.fail("unknown admission cannot prove execution"),
+      updateMessageDelivery: (_id, patch) => { delivery = { ...delivery, ...patch }; },
+      settleMessageDeliveryFromTurn: () => delivery },
+    sessionApplicationService: { sendMessage: async () => ({ turnId: "turn:uncertain", delivery: "unknown" }) },
+    providerTurnResponseWatchdog: { watch: () => assert.fail("unknown Turn cannot be watched") },
+    onTurnAccepted: () => assert.fail("unknown Turn cannot be probed")
+  });
+  await assert.rejects(operation.sendUnifiedSessionMessage("session", "hello", { deliveryId: "delivery" }, { fromAgentWorkQueue: true }), {
+    code: "DELIVERY_UNKNOWN", dispatchState: "unknown", deliveryStatus: "delivery_unknown"
+  });
+  assert.equal(delivery.status, "delivery_unknown");
+  assert.equal(delivery.providerTurnId, "turn:uncertain");
+  assert.equal(delivery.providerAcknowledgedAt, null);
+  assert.equal(calls.some(([name, type]) => name === "event" && type === "SessionRunStarted"), false);
+});
+
+test("invalid or conflicting receipts preserve an execution already proven by Provider events", async () => {
+  for (const receipt of [{}, { turnId: "wrong", delivery: "accepted" },
+    { turnId: "turn", delivery: "accepted", bindingId: "old-binding" }]) {
+    let delivery = { deliveryId: "delivery", bindingId: "binding", attemptCount: 0, status: "queued" };
+    let turn;
+    const { operation } = fixture({
+      store: { getLogicalSession: () => ({}), listUnsettledSessionTurns: () => [],
+        getMessageDelivery: () => delivery, getSessionTurn: () => turn,
+        updateMessageDelivery: (_id, patch) => { delivery = { ...delivery, ...patch }; },
+        settleMessageDeliveryFromTurn: () => delivery },
+      sessionApplicationService: { sendMessage: async () => {
+        delivery = { ...delivery, providerTurnId: "turn", status: "processing" };
+        turn = { execution_status: "running" };
+        return receipt;
+      } },
+      sessionBindingReadinessProbe: { verify: async () => ({ ready: true }), invalidateBinding: () => {} }
+    });
+    await assert.rejects(operation.sendUnifiedSessionMessage("session", "hello", { deliveryId: "delivery" },
+      { fromAgentWorkQueue: true }), error => error.dispatchState === "unknown" && error.deliveryStatus === "processing");
+    assert.equal(delivery.providerTurnId, "turn");
+    assert.equal(delivery.status, "processing");
   }
 });
 
@@ -192,7 +240,7 @@ test("a late dispatch acknowledgement settles against the durable Turn for every
             delivery={...delivery,status:turn.execution_status,lastError:status==="failed" ? "original failure" : null};
             return delivery;
           }},
-        sessionApplicationService:{sendMessage:async()=>{turn={execution_status:status};return {turnId:"turn"};}},
+        sessionApplicationService:{sendMessage:async()=>{turn={execution_status:status};return {turnId:"turn",delivery:"accepted"};}},
         providerTurnResponseWatchdog:{watch:()=>assert.fail("terminal Turn must not be watched")}
       });
       await operation.sendUnifiedSessionMessage("session","hello",{type:"desktop",deliveryId:"delivery"},{fromAgentWorkQueue:true});
@@ -201,4 +249,53 @@ test("a late dispatch acknowledgement settles against the durable Turn for every
       assert.equal(delivery.lastError,status==="failed" ? "original failure" : null);
     }
   }
+});
+
+test('attachment reads are bounded and parallel, retain order and finish before Provider submission', async () => {
+  const gates = [];
+  let active = 0, maximum = 0, sentImages;
+  const { operation } = fixture({
+    store: { getLogicalSession: () => ({}), listUnsettledSessionTurns: () => [] }, agentProviderRegistry: { supports: () => true },
+    chatResourceService: { readImage: async (_reference, managedPath) => {
+      active++; maximum = Math.max(maximum, active);
+      await new Promise(resolve => gates.push(resolve));
+      active--; return { path: managedPath, mimeType: 'image/png', byteLength: 1 };
+    } },
+    sessionApplicationService: { sendMessage: async (_id, message) => {
+      sentImages = message.images; return { turnId: "turn:images", delivery: "accepted" };
+    } },
+    providerTurnResponseWatchdog: { watch: () => {} }
+  });
+  const images = Array.from({ length: 6 }, (_, i) => ({ managedPath: `chat-resources/${i}.png` }));
+  const pending = operation.sendUnifiedSessionMessage('session', { text: 'Images', images }, {}, { fromAgentWorkQueue: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(active, 4);
+  assert.equal(sentImages, undefined);
+  gates.slice().reverse().forEach(release => release());
+  await new Promise(resolve => setImmediate(resolve));
+  gates.slice(4).forEach(release => release());
+  await pending;
+  assert.equal(maximum, 4);
+  assert.deepEqual(sentImages.map(image => image.absolutePath), images.map(image => image.managedPath));
+});
+
+test('a missing required image settles outstanding reads and never dispatches a partial message', async () => {
+  let release, settled = false, sends = 0;
+  const { operation } = fixture({
+    store: { getLogicalSession: () => ({}), listUnsettledSessionTurns: () => [] }, agentProviderRegistry: { supports: () => true },
+    chatResourceService: { readImage: async (_reference, path) => {
+      if (path.endsWith('missing.png')) throw Object.assign(new Error('Missing image'), { code: 'ENOENT' });
+      await new Promise(resolve => { release = resolve; });
+      return { path, mimeType: 'image/png', byteLength: 1 };
+    } },
+    sessionApplicationService: { sendMessage: async () => { sends++; return {}; } }
+  });
+  const pending = operation.sendUnifiedSessionMessage('session', { text: 'Images', images: [
+    { managedPath: 'chat-resources/missing.png' }, { managedPath: 'chat-resources/present.png' }
+  ] }, {}, { fromAgentWorkQueue: true });
+  const checked = assert.rejects(pending, { code: 'ENOENT' }).then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  release(); await checked;
+  assert.equal(sends, 0);
 });

@@ -39,7 +39,7 @@ export function interruptedAgentWorkRecoveryPatch(task) {
       lastError: "Provider stopped before the workspace continuation settled; it was requeued."
     };
   }
-  if (task.targetTurnId) {
+  if (task.targetTurnId || task.source?.batchId || task.source?.mailboxDispatchAttempted) {
     return {
       status: "cancelled",
       lastError: "Provider stopped after dispatch; message was not resent."
@@ -73,10 +73,10 @@ export function assertAgentWorkSessionReference(task, reference) {
   return reference;
 }
 
-export function userMessageStatusForAgentWork(status) {
+export function userMessageStatusForAgentWork(status, targetTurnId = undefined) {
   switch (status) {
     case "queued": return "queued";
-    case "running": return "processing";
+    case "running": return targetTurnId === null ? "preparing" : "processing";
     case "completed": return "consumed";
     case "failed": return "failed";
     case "cancelled": return "cancelled";

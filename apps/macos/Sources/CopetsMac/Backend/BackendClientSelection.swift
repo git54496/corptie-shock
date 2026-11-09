@@ -2,6 +2,10 @@ import Foundation
 
 extension BackendClient {
     func select(session: TaskSession, focusComposer: Bool = false) {
+        guard sessionSelectionController.selectedSessionID != session.id else {
+            if focusComposer { ComposerDraftRepository.requestUserFocus(for: session.id) }
+            return
+        }
         SessionSwitchTrace.shared.ensureSelection(sessionID: session.id)
         let trace = SessionSwitchTrace.shared.start(.backendSelection, sessionID: session.id)
         defer { SessionSwitchTrace.shared.finish(trace) }
@@ -37,6 +41,7 @@ extension BackendClient {
         workspaceRecoveryStatus = nil
         workspaceStatusController.stopRefreshing()
         Task { [weak self] in
+            await self?.prioritizeVisibleTimeline()
             await Task.yield()
             guard let self,
                   self.sessionSelectionController.generation == generation,
@@ -95,7 +100,7 @@ extension BackendClient {
         for session: TaskSession,
         expectedSelectionGeneration: UInt64
     ) async {
-        bindingVerificationSessionIDs.insert(session.id)
+        guard bindingVerificationSessionIDs.insert(session.id).inserted else { return }
         defer { bindingVerificationSessionIDs.remove(session.id) }
         do {
             var request = URLRequest(

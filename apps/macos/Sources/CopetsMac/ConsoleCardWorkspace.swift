@@ -10,6 +10,20 @@ private struct WorkCanvasEntryRequest: Equatable {
     let size: CGSize
 }
 
+private struct WorkCanvasDataRebuildInput: Equatable {
+    let active: Bool
+    let works: [Work]
+    let tasks: [CorptieTask]
+    let sessions: [CardSessionKey]
+}
+
+private struct CanvasTaskHierarchyProjection {
+    var roots: [String] = []
+    var rowsByRoot: [String: [CorptieTask]] = [:]
+    var depths: [String: Int] = [:]
+    var childCounts: [String: Int] = [:]
+}
+
 /// No transcript reads or per-card observers. Index on collection changes,
 /// derive attention membership without changing the selected conversation.
 struct ConsoleCardWorkspace<TaskMenu: View>: View {
@@ -33,6 +47,7 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
     let taskMenu: (CorptieTask) -> TaskMenu
     @State private var members: [String: [String]] = [:]
     @State private var expandedChildGroups: Set<String> = []
+    @State private var cardHierarchyByWork: [String: CanvasTaskHierarchyProjection] = [:]
     @ObservedObject private var displayPreferences = TaskCardDisplayPreferences.shared
     @State private var clickHistory = TaskCardClickHistory()
     @State private var canvasPositions: [String: CGPoint] = Self.loadCanvasPositions()
@@ -106,7 +121,6 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
     @State private var counts: [String: (attention: Int, running: Int)] = [:]
     @State private var residentTaskIDs = Set<String>()
     @State private var tasksByWork: [String: [CorptieTask]] = [:]
-    @State private var latestActivityByWork: [String: String] = [:]
     @State private var latestActivityByTask: [String: String] = [:]
     @State private var deferred: [String: ConsoleAttentionPolicy.Receipt] = Self.loadDeferred()
     private static var deferredKey: String { "console.taskCards.deferred.v1" }
@@ -117,6 +131,10 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
     }
 
     var body: some View {
+        // Keep this workspace's State alive across mode changes, without
+        // laying out its offscreen cards in the outline's animation frames.
+        ZStack(alignment: .topLeading) {
+        if isActive {
         VStack(spacing: 8) {
             if !reachable || syncError != nil {
                 Text("同步尚未就绪，状态和数量可能不是最新").font(.caption).foregroundStyle(.orange)
@@ -184,6 +202,8 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
                             }
                     }
         }
+        }
+        }
         .onAppear { if isActive { rebuild() } }
         .onChange(of: displayPreferences.taskIDs) { _, fixedIDs in
             // Fixing a Task supersedes a prior local dismissal of the same issue.
@@ -198,9 +218,11 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
         }
         .onDisappear { canvasDrag.cancel() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in canvasDrag.cancel() }
-        .onChange(of: Set(orderedWorks.map(\.id))) { _, _ in canvasDrag.cancel() }
+        .onChange(of: isActive ? Set(orderedWorks.map(\.id)) : []) { _, _ in canvasDrag.cancel() }
         .onChange(of: showsArchive) { _, _ in if isActive { rebuild() } }
-        .onChange(of: query) { _, _ in filteredCanvasPositions = nil }
+        .onChange(of: query) { _, _ in filteredCanvasPositions = nil; rebuildHierarchy() }
+        .onChange(of: sortMode) { _, _ in rebuildHierarchy() }
+        .onChange(of: expandedChildGroups) { _, _ in rebuildHierarchy() }
         .onChange(of: showsArchive) { _, _ in filteredCanvasPositions = nil }
         .onChange(of: browsing?.id) { _, next in
             if next == nil { viewportState.prepareForEntry() }
@@ -211,10 +233,14 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
         }
         .onReceive(AppStateStore.shared.$isReachable.removeDuplicates()) { reachable = $0 }
         .onReceive(AppStateStore.shared.$syncError.removeDuplicates()) { syncError = $0 }
-        .onChange(of: tasks) { _, _ in if isActive { rebuild() } }
-        .onChange(of: sessions.map(CardSessionKey.init)) { _, _ in if isActive { rebuild() } }
+        // Activation is handled above. Coalesce data changes into one rebuild,
+        // and do not map or compare the hidden canvas's entire inventories.
+        .onChange(of: WorkCanvasDataRebuildInput(active: isActive,
+            works: isActive ? works : [], tasks: isActive ? tasks : [],
+            sessions: isActive ? sessions.map(CardSessionKey.init) : [])) { previous, next in
+            if previous.active && next.active { rebuild() }
+        }
         .onChange(of: selectedTaskID) { _, _ in if isActive { rebuild() } }
-        .onChange(of: works) { _, _ in if isActive { rebuild() } }
     }
 
     private var canvasOrigin: CGPoint {
@@ -232,10 +258,7 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
 
     private var orderedWorks: [Work] {
         let index = Dictionary(uniqueKeysWithValues: works.map { ($0.id, $0) })
-        let visible = workOrder.compactMap { index[$0] }.filter { !displayedTasks(for: $0).isEmpty }
-        guard sortMode != .standard else { return visible }
-        return sortMode.ordered(visible, id: { $0.id }, title: { $0.name }, updatedAt: { $0.updatedAt },
-                                activityAt: { latestActivityByWork[$0.id] })
+        return workOrder.compactMap { index[$0] }.filter { !displayedTasks(for: $0).isEmpty }
     }
 
     // Animate structural changes, not streaming messages, hover or container width.
@@ -246,9 +269,6 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
     }
 
     private func rebuild() {
-        latestActivityByWork = Dictionary(grouping: sessions.filter { $0.lastMessageAt != nil },
-                                         by: { $0.workId ?? "" })
-            .mapValues { $0.compactMap(\.lastMessageAt).max() ?? "" }
         latestActivityByTask = Dictionary(grouping: sessions.filter { $0.lastMessageAt != nil },
                                          by: { $0.taskId ?? "" })
             .mapValues { $0.compactMap(\.lastMessageAt).max() ?? "" }
@@ -321,6 +341,32 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
         if attentionCount != nextAttentionCount { attentionCount = nextAttentionCount }
         let retainedIDs = Set(members.values.flatMap { $0 })
         retainedTasks = retainedTasks.filter { retainedIDs.contains($0.key) }
+        rebuildHierarchy()
+    }
+
+    private func rebuildHierarchy() {
+        let byID=Dictionary(tasks.map { ($0.id,$0) },uniquingKeysWith: { _,last in last })
+        var result:[String:CanvasTaskHierarchyProjection]=[:]
+        for work in works {
+            var candidates=displayedTasks(for:work)
+            var seen=Set(candidates.map(\.id))
+            var offset=0
+            while offset<candidates.count {
+                if let id=candidates[offset].parentTaskId,seen.insert(id).inserted,let parent=byID[id],parent.workId==work.id {candidates.append(parent)}
+                offset+=1
+            }
+            let nodes=candidates.map {TaskHierarchyIndex.Node(id:$0.id,workId:$0.workId,parentTaskId:$0.parentTaskId)}
+            let index=TaskHierarchyIndex(nodes:nodes)
+            let values=Dictionary(candidates.map {($0.id,$0)},uniquingKeysWith: { _,last in last })
+            let visible=TaskHierarchyIndex.visibleOrder(nodes:nodes,expanded:query.isEmpty ? expandedChildGroups : seen)
+            var projection=CanvasTaskHierarchyProjection(roots:index.rootIDsByWork[work.id] ?? [],
+                depths:index.depthByTaskID,childCounts:index.childrenByParentID.mapValues(\.count))
+            for id in visible {
+                if let root=index.rootByTaskID[id],let task=values[id] {projection.rowsByRoot[root,default:[]].append(task)}
+            }
+            result[work.id]=projection
+        }
+        cardHierarchyByWork=result
     }
 
     private func displayedTasks(for work: Work) -> [CorptieTask] {
@@ -333,33 +379,32 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
     }
 
     private func group(_ work: Work, availableWidth: CGFloat) -> some View {
-        let visibleTasks = displayedTasks(for: work)
-        let children=Dictionary(grouping:visibleTasks.filter{$0.parentTaskId != nil},by:{$0.parentTaskId!})
-        var roots=visibleTasks.filter{$0.parentTaskId == nil}
-        let rootIDs=Set(roots.map(\.id))
-        let missing=Set(children.keys).subtracting(rootIDs)
-        roots.append(contentsOf:tasks.filter{missing.contains($0.id)})
+        let hierarchy=cardHierarchyByWork[work.id] ?? CanvasTaskHierarchyProjection()
         return
         CompactWorkCard(work: work, isChatRunning: runningDiscussionWorkIDs.contains(work.id),
                         isChatSelected: discussionSessionIDByWork[work.id].map { selectedSessionID == $0 } ?? false,
                         isActive: isActive, discuss: { discuss(work) }, createTask: { createTask(work) }) {
-            WorkTaskCardGrid(itemCount: roots.count, availableWidth: availableWidth) {
-                ForEach(roots) { task in
+            WorkTaskCardGrid(itemCount: hierarchy.roots.count, availableWidth: availableWidth) {
+                ForEach(hierarchy.roots,id: \.self) { rootID in
                     VStack(alignment:.leading,spacing:6) {
-                        card(task).frame(maxWidth: .infinity, alignment: .topLeading)
-                        if (task.hierarchy?.childCount ?? children[task.id]?.count ?? 0)>0 {
-                            Button {
-                                if !expandedChildGroups.insert(task.id).inserted {expandedChildGroups.remove(task.id)}
-                            } label:{Label("\(task.hierarchy?.childCount ?? children[task.id]?.count ?? 0) \(L10n("子任务"))",systemImage:expandedChildGroups.contains(task.id) ? "chevron.down" : "chevron.right")}
-                            .font(.caption).buttonStyle(.plain)
-                            if expandedChildGroups.contains(task.id) || !query.isEmpty {
-                                ForEach(children[task.id] ?? []) {child in card(child).padding(.leading,14)}
-                            }
+                        ForEach(hierarchy.rowsByRoot[rootID] ?? []) { task in
+                            VStack(alignment:.leading,spacing:6) {
+                                card(task).frame(maxWidth:.infinity,alignment:.topLeading)
+                                let count=max(task.hierarchy?.childCount ?? 0,hierarchy.childCounts[task.id] ?? 0)
+                                if count>0 {
+                                    Button {
+                                        if !expandedChildGroups.insert(task.id).inserted {expandedChildGroups.remove(task.id)}
+                                    } label:{Label("\(count) \(L10n("子任务"))",systemImage:expandedChildGroups.contains(task.id) ? "chevron.down" : "chevron.right")}
+                                    .font(.caption).buttonStyle(.plain)
+                                    .accessibilityLabel(L10n(expandedChildGroups.contains(task.id) ? "收起子任务" : "展开子任务"))
+                                }
+                            }.padding(.leading,CGFloat(min(hierarchy.depths[task.id] ?? 0,6))*14)
                         }
                     }
                 }
             }
         }
+
         .modifier(groupInteraction(for: work.id, availableWidth: availableWidth))
     }
 
@@ -390,11 +435,11 @@ struct ConsoleCardWorkspace<TaskMenu: View>: View {
             ConsoleConversationCardLabel(title: task.title, execution: execution, needsAttention: needsAttention,
                 status: status(task, session), isSelected: selectedTaskID == task.id,
                 isFixed: displayPreferences.taskIDs.contains(task.id), hasScheduledWake: task.hasPendingScheduledWake == true,
-                isUnread: session.map(isSessionUnread) ?? false, isActive: isActive) {
+                isUnread: session.map(isSessionUnread) ?? false, isActive: isActive, session: session) {
                 interventionSummary(task, session: session)
             }
-        }.anchorPreference(key: TaskCardAnchors.self, value: .bounds) { [task.id: $0] }
-        .buttonStyle(.plain).disabled(task.deletionStatus == "deleting").contextMenu {
+        }
+        .buttonStyle(SessionSelectionPressStyle()).consoleHoverFeedback().disabled(task.deletionStatus == "deleting").contextMenu {
             Button("暂不处理") {
                 displayPreferences.setFixed(false, taskID: task.id)
                 deferred[task.id] = ConsoleAttentionPolicy.receipt(task, session: session)
@@ -534,7 +579,8 @@ private struct CompactWorkCard<Content: View>: View {
                         }
                         .contentShape(Rectangle())
                 }
-                    .buttonStyle(.plain)
+                    .buttonStyle(SessionSelectionPressStyle())
+                    .consoleHoverFeedback()
                     .fixedSize()
                     .overlay { ConsoleDiscussionActivityBorder(isRunning: isChatRunning, isActive: isActive) }
                     .accessibilityValue(isChatSelected ? L10n("Selected") : "")
@@ -547,6 +593,7 @@ private struct CompactWorkCard<Content: View>: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .consoleHoverFeedback()
                 .focused($isCreateTaskFocused)
                 .opacity(isHovering || isCreateTaskFocused ? 1 : 0)
                 .accessibilityLabel(L10nFormat("Create Session in %@", work.name))

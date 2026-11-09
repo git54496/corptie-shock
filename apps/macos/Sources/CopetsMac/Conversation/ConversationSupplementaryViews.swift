@@ -19,7 +19,7 @@ struct OrphanedWorkspaceRecoveryView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(L10n("Workspace missing"))
                         .font(.system(size: 13, weight: .bold))
-                    Text(L10n("This session is preserved, but Agent work is blocked until the workspace is restored or switched."))
+                    Text(L10n("This session is preserved, but Session work is blocked until the workspace is restored or switched."))
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(CorptiePalette.secondaryText)
                     if let path = status.originalPath {
@@ -113,7 +113,7 @@ struct ChatUsageBar: View {
                     ConversationComposerUsageSlot {
                         SessionUsageItem(
                             icon: "text.alignleft",
-                            value: "\(SessionUsagePolicy.exactTokens(used))/\(SessionUsagePolicy.exactTokens(window))",
+                            value: "\(L10n("Context used")) \(SessionUsagePolicy.percent(usedPercent))%",
                             progress: usedPercent / 100,
                             color: SessionMetaPalette.color(for: SessionUsagePolicy.contextTone(usedPercent: usedPercent)),
                             numericValue: used
@@ -132,7 +132,7 @@ struct ChatUsageBar: View {
                         ConversationComposerUsageSlot {
                             SessionUsageItem(
                                 icon: "bolt.fill",
-                                value: "\(SessionUsagePolicy.percent(remainingPercent))%",
+                                value: "\(L10n("Quota remaining")) \(SessionUsagePolicy.percent(remainingPercent))%",
                                 progress: remainingPercent / 100,
                                 color: SessionMetaPalette.color(for: SessionUsagePolicy.quotaTone(remainingPercent: remainingPercent))
                             )
@@ -162,7 +162,7 @@ struct ChatUsageBar: View {
                 }
             }
             .font(.system(size: 9, weight: .semibold))
-            .fixedSize(horizontal: true, vertical: false)
+            .lineLimit(2)
         }
     }
 

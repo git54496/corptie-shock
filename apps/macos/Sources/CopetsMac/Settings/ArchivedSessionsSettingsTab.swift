@@ -10,8 +10,6 @@ struct ArchivedSessionsSettingsTab: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(L10n("Archived Sessions"))
-                        .font(.system(size: 18, weight: .semibold, design: .rounded))
                     Text(L10n("Archived sessions are hidden from the main screen until you restore them."))
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(CorptiePalette.secondaryText)
@@ -46,9 +44,12 @@ struct ArchivedSessionsSettingsTab: View {
                             .frame(width: 28)
 
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(session.title)
-                                .font(.system(size: 13, weight: .semibold))
-                                .lineLimit(1)
+                            HStack(spacing: 4) {
+                                Text(session.title)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .lineLimit(1)
+                                SessionTitleBadges(session: session)
+                            }
                             HStack(spacing: 7) {
                                 Text(session.agent)
                                 Text("·")

@@ -166,7 +166,7 @@ struct MainWindowAndSidebarStateTests {
         #expect(mainTab.contains("setAccessibilityValue(L10n(isVisible ? \"Expanded\" : \"Collapsed\"))"))
         #expect(mainTab.contains(".environmentObject(router.sidebarState(for: tab))"))
 
-        for fileName in ["WarRoomView.swift", "AutomationsView.swift", "WorktreeManagementView.swift"] {
+        for fileName in ["WarRoomView.swift", "WorktreeManagementView.swift"] {
             let contents = try String(
                 contentsOf: sourceRoot.appendingPathComponent(fileName),
                 encoding: .utf8
@@ -182,11 +182,11 @@ struct MainWindowAndSidebarStateTests {
         #expect(unifiedConsole.contains("unifiedWorkOutlineSidebar"))
         #expect(unifiedConsole.contains("cardWorkspaceSidebar"))
 
-        let agents = try String(
-            contentsOf: sourceRoot.appendingPathComponent("AgentManagementView.swift"),
+        let roles = try String(
+            contentsOf: sourceRoot.appendingPathComponent("RoleManagementView.swift"),
             encoding: .utf8
         )
-        #expect(agents.contains("if sidebarState.isVisible && layoutMode == .split"))
+        #expect(roles.contains("if sidebarState.isVisible && layoutMode == .split"))
 
         #expect(!mainTab.contains("sessionDSH"))
         #expect(!mainTab.contains("SessionDSHView"))

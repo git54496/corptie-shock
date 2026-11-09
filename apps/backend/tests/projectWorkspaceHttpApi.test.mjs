@@ -31,6 +31,20 @@ function fixture() {
 }
 
 const input = { marker: true };
+test("rollback preview and confirmation use distinct routes and exact job identities", async () => {
+  const f = fixture();
+  const preview = { job: { id: "job:one" }, rollback: { id: "review:one", targets: [] } };
+  f.dependencies.worktreeIntegrationJobService.prepareRollback = async id => {
+    assert.equal(id, "job:one"); return preview;
+  };
+  f.dependencies.worktreeIntegrationJobService.confirmRollback = async (id, body) => {
+    assert.equal(id, "job:one"); assert.equal(body.reviewId, "review:one"); return { id, status: "canceled" };
+  };
+  f.dependencies.worktreeIntegrationJobService.resumeRollbackReview = id => ({ id, status: "queued" });
+  assert.deepEqual((await f.dispatch("/worktree-management/jobs/job:one/cancel-preview", "POST", {}).response).body, preview);
+  assert.equal((await f.dispatch("/worktree-management/jobs/job:one/rollback", "POST", { reviewId: "review:one", confirmed: true }).response).body.job.status, "canceled");
+  assert.equal((await f.dispatch("/worktree-management/jobs/job:one/resume", "POST", {}).response).body.job.status, "queued");
+});
 test("Worktree local-state route reads without repair and only accepts empty explicit repair", async () => {
   const f = fixture();
   const path = "/worktree-management/repositories/repo/worktrees/tree/local-state";
@@ -50,7 +64,7 @@ const cases = [
   ["/worktree-management/repositories/repo/integration-candidates", "POST", ["createCandidate", "repo", input], 200, "candidate"],
   ["/worktree-management/repositories/repo/integration-jobs", "POST", ["startCandidate", "repo", input], 202, "job"],
   ["/worktree-management/repositories/repo/cleanup", "POST", ["cleanupMergedWorktrees", "repo", input], 200, "result", "WorktreeCleanupCompleted"],
-  ["/worktree-management/repositories/repo/worktrees/tree/delete", "POST", ["deleteWorktree", "repo", "tree"], 200, "result", "WorktreeDeleted"],
+  ["/worktree-management/repositories/repo/worktrees/tree/delete", "POST", ["deleteWorktree", "repo", "tree", input], 200, "result", "WorktreeDeleted"],
   ["/worktree-management/jobs/job%2Fid", "GET", ["get", "job/id"], 200, "job"],
   ["/worktree-management/jobs/job/confirm", "POST", ["confirm", "job", input], 202, "job"],
   ["/worktree-management/jobs/job/cancel", "POST", ["cancel", "job", input], 202, "job"],

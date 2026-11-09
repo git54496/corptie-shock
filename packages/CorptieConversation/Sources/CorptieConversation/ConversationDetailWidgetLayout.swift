@@ -30,6 +30,19 @@ public enum ConversationDetailWidgetMetrics {
 }
 
 enum DetailWidgetSizing {
+    /// Called only at a content publication boundary, never from layout.
+    static func prepare(previous: [ClientDetailBusinessCard], current: [ClientDetailBusinessCard],
+                        cached: [String: DetailWidgetSize]) -> (sizes: [String: DetailWidgetSize], count: Int) {
+        let old = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        var sizes: [String: DetailWidgetSize] = [:]
+        var count = 0
+        for card in current {
+            if old[card.id] == card, let size = cached[card.id] { sizes[card.id] = size }
+            else { sizes[card.id] = preferredSize(for: card); count += 1 }
+        }
+        return (sizes, count)
+    }
+
     /// Bounded estimates of the default visible preview only. No native text
     /// measurement, geometry publication, transcript scanning or deferred work.
     static func preferredSize(for card: ClientDetailBusinessCard) -> DetailWidgetSize {
@@ -37,7 +50,15 @@ enum DetailWidgetSizing {
         let base = card.kind == "contextReferences" || card.actions.contains(where: { $0.operation == "editor.open" }) ? 68 : 54
         let page = card.nextCursor != nil
         switch card.payload {
-        case .session(let value): return .fitted(height: value.workName.isEmpty ? 72 : 84)
+        case .coordinationProgress(let value):
+            // Only the bounded visible preview participates in the grid estimate.
+            // Timeline hosts use the shared SwiftUI card's natural fitted size.
+            let rows = value.items.prefix(3).map { item in
+                max(20, textHeight(item.title, lines: 2)) + (item.previewSummary.isEmpty ? 0 : 3 + textHeight(item.previewSummary, lines: 2))
+            }
+            return listSize(rows, base: 46 + blockHeight(value.focus.trimmingCharacters(in: .whitespacesAndNewlines))
+                + blockHeight(value.decision.trimmingCharacters(in: .whitespacesAndNewlines)), page: value.hasMore || value.total > 3)
+        case .session(let value): return .fitted(height: value.workName.isEmpty ? 84 : 96)
         case .summary(let value): return .fitted(height: base + textHeight(value.text))
         case .work(let value): return .fitted(height: base + textHeight(value.name, lines: 2) + blockHeight(value.description))
         case .task(let value):
@@ -134,15 +155,21 @@ struct DetailWidgetLayout: Layout {
     // Reorderable containers wrap each row and don't forward LayoutValueKey
     // traits. Keep the bounded size directory alongside the ordered card data.
     let sizes: [DetailWidgetSize]
-    struct Cache { var widgets: [DetailWidgetSize] = []; var placement: DetailWidgetPlacement? }
+    var fixedWidth: CGFloat? = nil
+    struct Cache { var widgets: [DetailWidgetSize] = []; var placements: [DetailWidgetPlacement] = [] }
     func makeCache(subviews: Subviews) -> Cache { Cache() }
-    func updateCache(_ cache: inout Cache, subviews: Subviews) { cache.placement = nil }
-    private func plan(width: CGFloat?, subviews: Subviews, cache: inout Cache) -> DetailWidgetPlacement {
-        let width = width.flatMap { $0.isFinite ? $0 : nil } ?? ConversationDetailWidgetMetrics.railWidth - 24
+    func updateCache(_ cache: inout Cache, subviews: Subviews) {
         let widgets = subviews.indices.map { $0 < sizes.count ? sizes[$0] : .medium }
-        if let value = cache.placement, value.size.width == max(1, width), cache.widgets == widgets { return value }
+        if cache.widgets != widgets { cache.widgets = widgets; cache.placements.removeAll(keepingCapacity: true) }
+    }
+    private func plan(width: CGFloat?, subviews: Subviews, cache: inout Cache) -> DetailWidgetPlacement {
+        let width = fixedWidth ?? width.flatMap { $0.isFinite ? $0 : nil } ?? ConversationDetailWidgetMetrics.railWidth - 24
+        let widgets = subviews.indices.map { $0 < sizes.count ? sizes[$0] : .medium }
+        if cache.widgets != widgets { cache.widgets = widgets; cache.placements.removeAll(keepingCapacity: true) }
+        if let value = cache.placements.first(where: { $0.size.width == max(1, width) }) { return value }
         let value = DetailWidgetPlacement.make(width: width, widgets: widgets)
-        cache.widgets = widgets; cache.placement = value
+        if cache.placements.count == 3 { cache.placements.removeFirst() }
+        cache.placements.append(value)
         return value
     }
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
@@ -157,6 +184,22 @@ struct DetailWidgetLayout: Layout {
     }
 }
 
+/// A dashboard card is a viewport of known height, not content-sized. Parent
+/// layout probes must stop here rather than measure its nested scrolling tree.
+struct DetailWidgetViewport: Layout {
+    let size: DetailWidgetSize
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let fallback = CGFloat(size.columns) * ConversationDetailWidgetMetrics.referenceUnit
+            + CGFloat(size.columns - 1) * ConversationDetailWidgetMetrics.spacing
+        let width = proposal.width.flatMap { $0.isFinite ? max(1, $0) : nil } ?? fallback
+        return CGSize(width: width, height: size.height)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let content = subviews.first else { return }
+        content.place(at: bounds.origin, anchor: .topLeading, proposal: ProposedViewSize(bounds.size))
+    }
+}
+
 private struct DetailWidgetSizeKey: EnvironmentKey { static let defaultValue: DetailWidgetSize? = nil }
 extension EnvironmentValues {
     var detailWidgetSize: DetailWidgetSize? {
@@ -167,5 +210,21 @@ extension EnvironmentValues {
 extension View {
     func detailWidget(_ size: DetailWidgetSize) -> some View {
         environment(\.detailWidgetSize, size)
+    }
+}
+
+private struct DetailPrefersNaturalContentKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var detailPrefersNaturalContent: Bool {
+        get { self[DetailPrefersNaturalContentKey.self] }
+        set { self[DetailPrefersNaturalContentKey.self] = newValue }
+    }
+}
+
+private struct DetailFixedContentWidthKey: EnvironmentKey { static let defaultValue: CGFloat? = nil }
+extension EnvironmentValues {
+    var detailFixedContentWidth: CGFloat? {
+        get { self[DetailFixedContentWidthKey.self] }
+        set { self[DetailFixedContentWidthKey.self] = newValue }
     }
 }

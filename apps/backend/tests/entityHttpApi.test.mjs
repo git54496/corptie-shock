@@ -379,7 +379,7 @@ test("Task deletion endpoints expose preflight and execute only through the safe
       method: "POST",
       pathname: "/tasks/task%3Aone/actions/delete",
       body: {
-        mode: "force", acknowledgeDataLoss: true, confirmedBranchName: "task/one",
+        mode: "force", acknowledgeDataLoss: true,
         deleteWorktree: true, artifactDisposition: "work"
       },
       deleteTaskSafely: async (taskId, input, actor) => {
@@ -404,7 +404,7 @@ test("Task deletion endpoints expose preflight and execute only through the safe
     assert.deepEqual(calls, [
       ["inspect", "task:one", { type: "user", id: "user:local-macos" }],
       ["delete", "task:one", {
-        mode: "force", acknowledgeDataLoss: true, confirmedBranchName: "task/one",
+        mode: "force", acknowledgeDataLoss: true,
         deleteWorktree: true, artifactDisposition: "work"
       }, { type: "user", id: "user:local-macos" }]
     ]);
@@ -450,8 +450,8 @@ test("Task deletion HTTP errors preserve forbidden, missing, and association blo
     const deletion = {
       taskId: "task:blocked", status: "blocked", retryable: true,
       worktree: null, risks: [], blockers: [{
-        code: "TASK_HAS_BOUND_ARTIFACTS",
-        message: "Task remains bound to retained Artifact Required evidence."
+        code: "ACTIVE_WORKTREE_INTEGRATION_JOB",
+        message: "Integration job job:one is still stopping."
       }]
     };
     const blocked = await callApi({
@@ -460,13 +460,13 @@ test("Task deletion HTTP errors preserve forbidden, missing, and association blo
       body: { mode: "safe" },
       deleteTaskSafely: async () => {
         throw Object.assign(new Error(deletion.blockers[0].message), {
-          code: "TASK_DELETE_BLOCKED", statusCode: 409, deletion
+          code: "ACTIVE_WORKTREE_INTEGRATION_JOB", statusCode: 409, deletion
         });
       },
       ...services
     });
     assert.equal(blocked.statusCode, 409);
-    assert.equal(blocked.body.code, "TASK_DELETE_BLOCKED");
+    assert.equal(blocked.body.code, "ACTIVE_WORKTREE_INTEGRATION_JOB");
     assert.deepEqual(blocked.body.deletion, deletion);
   } finally {
     await services.store.close();
@@ -576,6 +576,35 @@ test("Skill HTTP preview and duplicate guard share the installer and update emit
     assert.equal(updated.statusCode, 200);
     assert.equal(updated.body.skill.skillId, installed.body.skill.skillId);
     assert.equal(services.entityEvents.at(-1).payload.action, "updated");
+  } finally {
+    await services.store.close();
+    await rm(services.directory, { recursive: true, force: true });
+  }
+});
+
+test("Skill HTTP async submission returns 202 and a queryable idempotent receipt", async () => {
+  const services = await createServices();
+  try {
+    const source = join(services.directory, "async-source");
+    await mkdir(source);
+    await writeFile(join(source, "SKILL.md"), "---\nname: async-sample\n---\nInstructions\n");
+    const body = { sourceType: "local", source, assist: false, async: true, requestId: "http-async" };
+    const accepted = await callApi({ ...services, method: "POST", pathname: "/skills", body });
+    assert.equal(accepted.statusCode, 202);
+    const id = accepted.body.operation.operationId;
+    const replay = await callApi({ ...services, method: "POST", pathname: "/skills", body });
+    assert.equal(replay.body.operation.operationId, id);
+    let operation;
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const result = await callApi({ ...services, method: "GET", pathname: `/skills/install-operations/${id}` });
+      assert.equal(result.statusCode, 200);
+      operation = result.body.operation;
+      if (["succeeded", "failed", "repair_required"].includes(operation.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(operation.status, "succeeded");
+    assert.equal(services.store.listRegistrySkills().length, 1);
+    assert.equal(services.entityEvents.filter((event) => event.type === "SkillChanged").length, 1);
   } finally {
     await services.store.close();
     await rm(services.directory, { recursive: true, force: true });

@@ -75,8 +75,17 @@ struct SessionConversationSurface: View {
     @State private var cachedSourceTailItem: CodexThreadItem?
     @State private var cachedDisplayEntries: [ChatDisplayEntry] = []
     @State private var cachedRowsRevision: UInt64 = 0
+    @State private var updatingDisclosureRow = false
+    private var cachedDisclosureRowIndices: [String: Int] { cachedChecklistDock.disclosureRowIndices }
+    @State private var checklistEventPlan: ConversationExecutionPlan?
+    @State private var cachedChecklistDock = ConversationChecklistDockProjection(rows: [])
     @State private var cachedAppKitRows: [AppKitChatTimelineRow] = [] {
-        didSet { cachedRowsRevision &+= 1 }
+        didSet {
+            cachedRowsRevision &+= 1
+            if !updatingDisclosureRow {
+                cachedChecklistDock.update(rows: cachedAppKitRows, previousRows: oldValue)
+            }
+        }
     }
     @State private var cachedTotalDisplayEntryCount = 0
     @State private var cachedVisibleMessageLimit = 0
@@ -88,8 +97,20 @@ struct SessionConversationSurface: View {
     @State private var expandedProcessTurnIds: Set<String> = []
     @State private var viewportState = ConversationViewportState()
     @State private var appKitScrollToBottomRevision = 0
-    @State private var headerClearance: CGFloat = 0
-    @State private var composerClearance: CGFloat = 0
+    @State private var quickMessagePresentation = ComposerQuickMessagePresentation()
+    private var currentChecklist: ConversationExecutionPlan? {
+        let cached = cachedSessionId == sessionId ? cachedChecklistDock.latestChecklist : nil
+        if let event = checklistEventPlan, event.taskId == selectedSession?.taskId,
+           event.revision >= (cached?.revision ?? 0) { return event }
+        return cached
+    }
+    private var hasPinnedChecklist: Bool {
+        !showsWelcome && currentChecklist != nil && currentChecklist?.closed != true
+    }
+    private var showsDockQuickMessages: Bool {
+        usesComposerJumpToLatest && !showsWelcome
+            && (quickMessagePresentation.showsMessages || composerJumpToLatestAction != nil)
+    }
     @State private var displayProjectionTask: Task<Void, Never>?
     @State private var displayProjectionGeneration = 0
     @State private var pendingProjectionSourceSignature: String?
@@ -105,6 +126,13 @@ struct SessionConversationSurface: View {
     @State private var loadingSearchToken: UUID?
     @State private var searchRowID: String?
     @State private var searchRowRevision = 0
+    @State private var navigationRowID: String?
+    @State private var navigationRevision = 0
+    @State private var navigationEpoch = 0
+    @State private var pendingNavigationMessageID: String?
+    @State private var navigationTask: Task<Void, Never>?
+    @State private var navigationError: String?
+
     @State private var scrollTargetTurnID: String?
     @State private var scrollTargetTurnRevision = 0
     @State private var pendingFork: SessionForkSelection?
@@ -202,7 +230,7 @@ struct SessionConversationSurface: View {
 
     private var displayedDetail: CodexThreadDetail? {
         if let renderInputs { return renderInputs.detail }
-        return timelineState.detail
+        return timelineState.presentationDetail
     }
 
     private var selectedSession: TaskSession? {
@@ -287,7 +315,8 @@ struct SessionConversationSurface: View {
                     notReadyReason: selectedSession?.notReadyReason ?? displayedDetail?.notReadyReason,
                     activityStatus: (selectedSession?.activityStatus ?? displayedDetail?.activityStatus).map { L10n($0) },
                     onSubmissionStarted: { if acceptsPresentationUpdates { hasSubmittedMessage = true } },
-                    renderInputs: renderInputs)
+                    onJumpToLatest: composerJumpToLatestAction, hasUnreadMessagesBelow: viewportState.hasNewMessagesBelow,
+                    quickMessagePresentation: quickMessagePresentation, renderInputs: renderInputs)
                 .id(sessionId)
             } else {
             MessageComposer(
@@ -300,7 +329,9 @@ struct SessionConversationSurface: View {
                 isReady: selectedSession?.isReady ?? displayedDetail?.isReady ?? true,
                 notReadyReason: selectedSession?.notReadyReason ?? displayedDetail?.notReadyReason,
                 activityStatus: (selectedSession?.activityStatus ?? displayedDetail?.activityStatus).map { L10n($0) },
-                onSubmissionStarted: { hasSubmittedMessage = true }
+                onSubmissionStarted: { hasSubmittedMessage = true },
+                onJumpToLatest: composerJumpToLatestAction, hasUnreadMessagesBelow: viewportState.hasNewMessagesBelow,
+                quickMessagePresentation: quickMessagePresentation
             )
             .id(sessionId)
             }
@@ -321,15 +352,29 @@ struct SessionConversationSurface: View {
         }
     }
 
-    var body: some View {
-        let _ = legacyRevision
-        let _ = SessionSwitchTrace.shared.mark(.conversationBody, sessionID: sessionId)
+    private var accountPreparationKey: String? {
+        selectedSession?.notReadyReason?.code == "CODEX_ACCOUNT_RESUME_REQUIRED" ? sessionId : nil
+    }
+
+    private var conversationRoot: some View {
         Group {
             if renderInputs?.retired == true {
                 Text(L10n("This conversation no longer exists."))
                     .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else { conversationLayout }
         }
+        .task(id: accountPreparationKey) { await prepareCurrentExecutionAccount() }
+    }
+
+    private func prepareCurrentExecutionAccount() async {
+        guard accountPreparationKey != nil, acceptsPresentationUpdates, displayedOnline,
+              let session = selectedSession, session.id == sessionId else { return }
+        await backendClient.verifyProviderBinding(for: session,
+            expectedSelectionGeneration: backendClient.sessionSelectionController.generation)
+    }
+
+    private var conversationWithLifecycle: some View {
+        conversationRoot
         .onAppear {
             guard acceptsPresentationUpdates else { return }
             restoreCachedProjectionDisplayCacheIfNeeded()
@@ -346,6 +391,10 @@ struct SessionConversationSurface: View {
         }
         .onChange(of: sessionId) { _, _ in
             hasSubmittedMessage = false
+            navigationEpoch &+= 1
+            navigationTask?.cancel(); navigationTask = nil
+            pendingNavigationMessageID = nil; navigationRowID = nil
+            navigationRevision &+= 1
             displayProjectionTask?.cancel()
             displayProjectionTask = nil
             displayProjectionGeneration &+= 1
@@ -380,6 +429,9 @@ struct SessionConversationSurface: View {
             displayProjectionGeneration &+= 1
         }
         .onDisappear {
+            navigationEpoch &+= 1
+            navigationTask?.cancel(); navigationTask = nil
+            pendingNavigationMessageID = nil
             displayProjectionTask?.cancel()
             displayProjectionTask = nil
             historyAnchorRestoreTask?.cancel()
@@ -390,32 +442,45 @@ struct SessionConversationSurface: View {
                 updateCachedDisplayEntries(for: detail)
             }
             restoreMissingHistoryAnchorIfNeeded()
+            if displayedSearchTarget != nil { Task { await applySearchTargetIfNeeded() } }
         }
-        .onReceive(backendClient.sessionSelectionController.$selectedSessionID) { selectedSessionID in
+    }
+
+    var body: some View {
+        let _ = legacyRevision
+        let _ = SessionSwitchTrace.shared.mark(.conversationBody, sessionID: sessionId)
+        conversationWithLifecycle
+        .onReceive(backendClient.sessionSelectionController.$selectedSessionID.whilePresented(renderInputs == nil && acceptsPresentationUpdates)) { selectedSessionID in
             if renderInputs == nil, selectedSessionID == sessionId { restoreMissingHistoryAnchorIfNeeded() }
         }
-        .onReceive(backendClient.$isLoadingDetail) { isLoading in
+        .onReceive(backendClient.$isLoadingDetail.whilePresented(renderInputs == nil && acceptsPresentationUpdates)) { isLoading in
             guard renderInputs == nil, backendClient.selectedSession?.id == sessionId else { return }
             displaysLoadingDetail = isLoading
         }
-        .onReceive(timelineHistory.$earlierHistoryLoadStateBySessionID, perform: receiveHistoryState)
+        .onReceive(timelineHistory.$earlierHistoryLoadStateBySessionID.whilePresented(renderInputs == nil && acceptsPresentationUpdates), perform: receiveHistoryState)
         .onChange(of: renderInputs?.historyState) { _, next in
             guard acceptsPresentationUpdates, let next else { return }
             applyHistoryState(next)
         }
-        .onReceive(backendClient.supplementaryDataController.$workspaceRecoveryStatus) { status in
+        .onReceive(backendClient.supplementaryDataController.$workspaceRecoveryStatus.whilePresented(renderInputs == nil && acceptsPresentationUpdates)) { status in
             guard renderInputs == nil, backendClient.selectedSession?.id == sessionId else { return }
             displayedWorkspaceRecoveryStatus = status
         }
         .task(id: displayedSearchTarget?.token) { await applySearchTargetIfNeeded() }
-        .onChange(of: appKitDetailRevision) { _, _ in
-            Task { await applySearchTargetIfNeeded() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .scrollSessionTimelineToTurn)) { notification in
+        .onReceive(NotificationCenter.default.publisher(for: .executionChecklistChanged).whilePresented(acceptsPresentationUpdates), perform: receiveChecklistChange)
+        .onReceive(NotificationCenter.default.publisher(for: .scrollSessionTimelineToTurn).whilePresented(acceptsPresentationUpdates)) { notification in
             guard allowsPageActions, notification.userInfo?["sessionId"] as? String == sessionId,
                   let turnID = notification.userInfo?["turnId"] as? String else { return }
             scrollTargetTurnID = turnID
             scrollTargetTurnRevision &+= 1
+        }
+    }
+
+    private func receiveChecklistChange(_ event: Notification) {
+        guard acceptsPresentationUpdates, event.object as? String == selectedSession?.taskId,
+              let next = event.userInfo?["checklist"] as? ConversationExecutionPlan else { return }
+        if next.taskId != checklistEventPlan?.taskId || next.revision > (checklistEventPlan?.revision ?? -1) {
+            checklistEventPlan = next
         }
     }
 
@@ -435,10 +500,30 @@ struct SessionConversationSurface: View {
     }
 
     private var conversationLayout: some View {
-        VStack(alignment: .leading, spacing: presentation == .workspaceCard ? 6 : 12) {
-            // The native viewport fills the conversation. Its document reserves
-            // the actual top and bottom chrome intersections, so messages pass
-            // behind glass while both scroll endpoints remain unobscured.
+        ConversationRegionStack {
+            messageViewport
+        } accessory: {
+            inputDock
+        }
+        .padding(1)
+        .background(Color.white.opacity(0.001))
+    }
+
+    private var messageViewport: some View {
+        VStack(spacing: 0) {
+            conversationTopChrome
+                .overlay(alignment: .bottom) {
+                    if showsHeader {
+                        Divider().allowsHitTesting(false).accessibilityHidden(true)
+                    }
+                }
+            messageViewportBody
+        }
+    }
+
+    private var messageViewportBody: some View {
+            // The input dock owns both the editor and quick actions.
+            // Neither floats over the message viewport.
             Group {
                 switch contentPhase {
                 case .live:
@@ -491,69 +576,102 @@ struct SessionConversationSurface: View {
                 }
             }
             .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+            .frame(height: showsWelcome ? 0 : nil)
+            .clipped()
             .background {
-                conversationChromeFrame(.viewport)
+                // The reading canvas stops at the viewport. The shared
+                // quick-message/editor dock exposes the window backdrop.
+                if !compactComposer { WorkbenchStyle.canvas }
             }
-            .overlay(alignment: .top) {
-                VStack(alignment: .leading, spacing: presentation == .workspaceCard ? 6 : 12) {
-                    if showsHeader {
-                        conversationHeader
-                    }
-                    backendConnectionBanner
-                    if let recovery = pageWorkspaceRecovery,
-                       recovery.orphaned {
-                        OrphanedWorkspaceRecoveryView(status: recovery)
-                    }
+            .overlay(alignment: .leading) {
+                if !compactComposer, !showsWelcome, displayedDetail != nil {
+                    UserMessageNavigationRail(baseURL: backendClient.baseURL, sessionID: sessionId,
+                        active: acceptsPresentationUpdates, navigate: navigateToUserMessage)
+                        .id(sessionId + ":" + (displayedDetail?.id ?? ""))
+                        .padding(.leading, 2)
+                        .padding(.top, topChromeClearance)
+                        .alert("无法定位消息", isPresented: Binding(get: { navigationError != nil },
+                            set: { if !$0 { navigationError = nil } })) {
+                            Button("好", role: .cancel) { navigationError = nil }
+                        } message: { Text(navigationError ?? "") }
                 }
-                .background { conversationChromeFrame(.header) }
-            }
-            .overlay(alignment: .bottomTrailing) {
-                jumpToLatestButton
-                    .padding(.trailing, 10)
-                    .padding(.bottom, composerClearance + 10)
             }
             .overlay(alignment: .bottom) {
-                // One editor at one structural position: placement changes must
-                // not recreate the native text view, attachments or draft owner.
-                VStack(spacing: 24) {
-                    if showsWelcome {
-                        ConversationWelcomeView(
-                            isAssistant: selectedSession?.resolvedSessionKind == .assistantChat
-                        )
+                if !usesComposerJumpToLatest {
+                    jumpToLatestButton
+                }
+            }
+
+    }
+
+    private var inputDock: some View {
+        VStack(spacing: 0) {
+            // One editor at one structural position: placement changes must
+            // not recreate the native text view, attachments or draft owner.
+            if hasPinnedChecklist, let plan = currentChecklist {
+                PinnedExecutionChecklistCard(plan: plan)
+                    .id(sessionId + ":" + plan.planId)
+                    .modifier(WorkbenchReadingLane(compact: compactComposer))
+                    .padding(.bottom, 6)
+            }
+            VStack(spacing: 24) {
+                if showsWelcome {
+                    ConversationWelcomeView(
+                        isAssistant: selectedSession?.resolvedSessionKind == .assistantChat
+                    )
+                }
+                VStack(spacing: 6) {
+                    if let session = selectedSession {
+                        if let page = renderInputs { SessionSendFailureSurface(message: page.sendFailure) }
+                        else { SessionSendFailureView(sessionID: session.id) }
                     }
-                    VStack(spacing: 6) {
-                        if let session = selectedSession {
-                            if let page = renderInputs { SessionSendFailureSurface(message: page.sendFailure) }
-                            else { SessionSendFailureView(sessionID: session.id) }
-                        }
-                        sessionReadinessNotice
+                    sessionReadinessNotice
+                    ConversationComposerDock {
+                        if showsDockQuickMessages { dockQuickMessages }
+                    } composer: {
                         sessionComposer
                     }
-                    .padding(.bottom, 4)
-                    .background { conversationChromeFrame(.composer) }
-                }
-                .frame(maxWidth: showsWelcome ? 720 : .infinity)
-                .padding(.horizontal, showsWelcome ? 24 : 0)
-                .frame(maxWidth: .infinity, maxHeight: showsWelcome ? .infinity : nil)
-                .padding(.top, showsWelcome ? headerClearance : 0)
-            }
-            .coordinateSpace(name: ConversationChromeFramePreferenceKey.coordinateSpace)
-            .onPreferenceChange(ConversationChromeFramePreferenceKey.self) { frames in
-                guard let clearances = ConversationChromeClearances(frames: frames) else { return }
-                if abs(headerClearance - clearances.top) >= 0.5 {
-                    headerClearance = clearances.top
-                }
-                if abs(composerClearance - clearances.bottom) >= 0.5 {
-                    composerClearance = clearances.bottom
                 }
             }
-            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+            .modifier(WorkbenchReadingLane(compact: compactComposer))
+            .frame(maxHeight: showsWelcome ? .infinity : nil)        }
+    }
+
+    private var conversationTopChrome: some View {
+        VStack(alignment: .leading, spacing: presentation == .workspaceCard ? 6 : 12) {
+            if showsHeader { conversationHeader }
+            if let inputs = renderInputs {
+                SearchMessageNavigationSurface(sessionID: inputs.scope.sessionID,
+                    target: inputs.searchTarget, matches: inputs.searchMatches) { delta in
+                    guard inputs.actionSession(generation: inputs.activity.generation) != nil else { return }
+                    UnifiedSearchNavigation.shared.step(delta)
+                }
+            }
+            backendConnectionBanner
+            if let recovery = pageWorkspaceRecovery, recovery.orphaned {
+                OrphanedWorkspaceRecoveryView(status: recovery)
+            }
         }
-        .padding(1)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color.white.opacity(0.001))
-        )
+    }
+
+    private var dockQuickMessages: some View {
+        ComposerQuickMessagesBar(backendClient: backendClient, sessionId: sessionId,
+            taskID: selectedSession?.taskId, online: displayedOnline,
+            refreshRevision: renderInputs?.quickMessageRevision ?? quickMessagePresentation.refreshRevision,
+            enabled: ComposerSendPolicy.canSend(session: selectedSession, sessionId: sessionId,
+                backendClient: backendClient, renderInputs: renderInputs)
+                && !(renderInputs?.sendingMessage ?? backendClient.isSendingMessage) && selectedSession?.archived != true,
+            activity: renderInputs?.activity, showsMessages: quickMessagePresentation.showsMessages,
+            onJumpToLatest: composerJumpToLatestAction, hasUnreadMessagesBelow: viewportState.hasNewMessagesBelow) { text in
+            guard ComposerSendPolicy.canSend(session: selectedSession, sessionId: sessionId,
+                backendClient: backendClient, renderInputs: renderInputs),
+                !(renderInputs?.sendingMessage ?? backendClient.isSendingMessage),
+                let session = selectedSession, session.archived != true else { return }
+            if backendClient.sendMessage(text, to: session, onSuccess: {
+                if let renderInputs { renderInputs.didSendMessage() }
+                else { quickMessagePresentation.refreshRevision &+= 1 }
+            }), acceptsPresentationUpdates { hasSubmittedMessage = true }
+        }
     }
 
     private func appKitCachedDetailMessages() -> some View {
@@ -583,8 +701,8 @@ struct SessionConversationSurface: View {
         displayEntries: [ChatDisplayEntry]
     ) -> some View {
         let rows = cachedSessionId == sessionId && cachedAppKitRows.count == displayEntries.count
-            ? cachedAppKitRows
-            : preparedAppKitRows(displayEntries, cache: cachedDisplayProjection)
+            ? cachedChecklistDock.timelineRows
+            : ConversationChecklistDockProjection(rows: preparedAppKitRows(displayEntries, cache: cachedDisplayProjection)).timelineRows
         return VStack(alignment: .leading, spacing: 6) {
             AppKitChatTimelineView(
                 sessionID: sessionId,
@@ -613,13 +731,17 @@ struct SessionConversationSurface: View {
                 },
                 searchRowID: searchRowID,
                 searchRowRevision: searchRowRevision,
+                navigationRowID: navigationRowID,
+                navigationRevision: navigationRevision,
                 scrollToTurnID: scrollTargetTurnID,
                 scrollToTurnRevision: scrollTargetTurnRevision,
                 historyRequestEpoch: historyRequestEpoch,
-                topClearance: max(headerClearance, topChromeClearance),
-                bottomClearance: composerClearance,
-                reservesVerticalScrollerGutter: !compactComposer
+                topClearance: topChromeClearance,
+                bottomClearance: 0,
+                reservesVerticalScrollerGutter: !compactComposer,
+                trailingScrollerExtension: 0
             )
+            .modifier(WorkbenchReadingLane(compact: compactComposer))
             .sheet(item: $pendingFork) { selection in
                 SessionForkSheet(selection: selection, backendClient: backendClient)
             }
@@ -642,11 +764,7 @@ struct SessionConversationSurface: View {
                 }
             }
             .onAppear {
-                if let currentDetail = displayedDetail {
-                    updateCachedDisplayEntries(for: currentDetail)
-                }
-            }
-            .onChange(of: appKitDetailRevision) { _, _ in
+                timelineState.setProtectsHistoryWindow(!viewportState.followsLatest || requestedRestorationAnchorRowID != nil)
                 if let currentDetail = displayedDetail {
                     updateCachedDisplayEntries(for: currentDetail)
                 }
@@ -672,9 +790,10 @@ struct SessionConversationSurface: View {
                     return row
                 }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .sessionTimelineSubmissionAccepted)) { notification in
+            .onReceive(NotificationCenter.default.publisher(for: .sessionTimelineSubmissionAccepted).whilePresented(acceptsPresentationUpdates)) { notification in
                 guard notification.object as? String == sessionId else { return }
                 if viewportState.followsLatest {
+                    timelineState.setProtectsHistoryWindow(false)
                     timelineRestorationIntent.clearAnchor()
                     refreshAfterRestorationAnchorRelinquished()
                 }
@@ -683,6 +802,7 @@ struct SessionConversationSurface: View {
                 _ = viewportState.timelineTailDidChange()
             }
             .onChange(of: viewportState.followsLatest) { _, followsLatest in
+                timelineState.setProtectsHistoryWindow(!followsLatest)
                 if followsLatest {
                     relinquishRestorationAnchorIfNeeded()
                 }
@@ -690,17 +810,28 @@ struct SessionConversationSurface: View {
         }
     }
 
+    private var usesComposerJumpToLatest: Bool {
+        !compactComposer && displayedOnline && pageWorkspaceRecovery?.blocksSessionInput != true
+    }
+
+    private var composerJumpToLatestAction: (() -> Void)? {
+        usesComposerJumpToLatest && viewportState.showsJumpToLatest ? { jumpToLatest() } : nil
+    }
+
+    private func jumpToLatest() {
+        timelineState.setProtectsHistoryWindow(false)
+        timelineRestorationIntent.clearAnchor()
+        viewportState.jumpToLatest()
+        if let currentDetail = displayedDetail {
+            updateCachedDisplayEntries(for: currentDetail)
+        }
+        appKitScrollToBottomRevision &+= 1
+    }
+
     @ViewBuilder
     private var jumpToLatestButton: some View {
         if viewportState.showsJumpToLatest {
-            Button {
-                timelineRestorationIntent.clearAnchor()
-                viewportState.jumpToLatest()
-                if let currentDetail = displayedDetail {
-                    updateCachedDisplayEntries(for: currentDetail)
-                }
-                appKitScrollToBottomRevision &+= 1
-            } label: {
+            Button(action: jumpToLatest) {
                 Image(systemName: "arrow.down")
                     .font(.system(size: 12, weight: .bold))
                     .frame(width: 30, height: 30)
@@ -711,8 +842,9 @@ struct SessionConversationSurface: View {
     }
 
     private var appKitDetailRevision: String {
-        guard let detail = displayedDetail else { return "none" }
-        return detailSourceSignature(for: detail)
+        // Layout reevaluations read scalar state, never message contents.
+        let revision = renderInputs?.detailPresentationRevision ?? timelineState.presentationRevision
+        return "\(sessionId)|\(revision)|\(visibleMessageLimit)|\(requestedRestorationAnchorRowID ?? "latest")"
     }
 
     private var followsLatestBinding: Binding<Bool> {
@@ -742,8 +874,7 @@ struct SessionConversationSurface: View {
     /// history prepend changes the full detail revision but leaves this value
     /// unchanged, so loading older messages does not create a false unread cue.
     private var latestTimelineContentRevision: String {
-        guard let detail = displayedDetail else { return "none" }
-        return timelineTailContentRevision(for: detail.items)
+        renderInputs?.detailTailContentRevision ?? timelineState.tailContentRevision
     }
 
     private func appKitRow(
@@ -808,10 +939,10 @@ struct SessionConversationSurface: View {
 
     private var replyIdentity: ConversationReplyIdentity? {
         guard let session = selectedSession else { return nil }
-        let agents = renderInputs?.agents ?? EntityAPIClient.shared.agents
-        let agent = agents.first { $0.agentId == session.agentId }
-        return ConversationReplyIdentity(agentID: agent?.agentId ?? session.agentId ?? session.id,
-            name: agent?.name ?? L10n("Agent"), avatarPath: agent?.avatarPath)
+        let roles = renderInputs?.roles ?? EntityAPIClient.shared.roles
+        let agent = roles.first { $0.roleId == session.roleId }
+        return ConversationReplyIdentity(roleID: agent?.roleId ?? session.roleId ?? session.id,
+            name: agent?.name ?? L10n("Role"), avatarPath: agent?.avatarPath)
     }
 
     private var forkUnavailableReason: String? {
@@ -914,6 +1045,22 @@ struct SessionConversationSurface: View {
         }
         expandedProcessTurnIds = nextExpandedTurnIds
 
+        if let index = cachedDisclosureRowIndices[turnId], cachedAppKitRows.indices.contains(index),
+           cachedAppKitRows[index].executionPlan?.taskId != nil {
+            // The index and both heights were prepared with the data. Expanding
+            // a checklist never reprojects the other messages or reads storage.
+            var row = cachedAppKitRows[index]
+            row.isExpanded = isExpanded
+            row.contentRevision &+= 1
+            updatingDisclosureRow = true
+            cachedAppKitRows[index] = row
+            if let timelineIndex = cachedChecklistDock.timelineIndexByRowID[row.id] {
+                cachedChecklistDock.timelineRows[timelineIndex] = row
+            }
+            updatingDisclosureRow = false
+            return
+        }
+
         // Rebuild the immutable native row projection with a new content
         // revision so NSTableView remeasures only the expanded process row.
         cachedAppKitRows = preparedAppKitRows(cachedDisplayEntries,
@@ -932,6 +1079,7 @@ struct SessionConversationSurface: View {
     private func loadEarlierMessages(preservingLatestFollow: Bool) {
         guard let detail = displayedDetail,
               let session = selectedSession else { return }
+        if preservingLatestFollow, detail.items.count >= ResidentTimelineWindow.itemBudget { return }
         let visibleWeight = cachedDisplayEntries.reduce(0) { $0 + $1.displayWeight }
         let hiddenCount = max(0, cachedTotalDisplayEntryCount - visibleWeight)
         viewportState.prepareForHistoryPrepend(preservingLatestFollow: preservingLatestFollow)
@@ -951,7 +1099,8 @@ struct SessionConversationSurface: View {
                 let selectionGeneration = backendClient.selectionGenerationToken(for: sessionId)
                 let result = await backendClient.loadEarlierMessages(
                     for: session,
-                    expectedSelectionGeneration: selectionGeneration
+                    expectedSelectionGeneration: selectionGeneration,
+                    protectsHistoryWindow: !preservingLatestFollow
                 )
                 if case .failed = result {
                     visibleMessageLimit = previousVisibleMessageLimit
@@ -959,6 +1108,39 @@ struct SessionConversationSurface: View {
                         updateCachedDisplayEntries(for: current)
                     }
                 }
+            }
+        }
+    }
+
+    private func navigateToUserMessage(_ messageID: String) {
+        pendingNavigationMessageID = messageID
+        guard navigationTask == nil else { return }
+        navigationEpoch &+= 1
+        let epoch = navigationEpoch
+        navigationTask = Task { @MainActor in
+            defer { if navigationEpoch == epoch { navigationTask = nil } }
+            while let requested = pendingNavigationMessageID {
+                pendingNavigationMessageID = nil
+                guard !Task.isCancelled, navigationEpoch == epoch, acceptsPresentationUpdates,
+                      let session = selectedSession, session.id == sessionId,
+                      let generation = backendClient.selectionGenerationToken(for: sessionId) else { return }
+                let rowID = "message:" + requested
+                let result = await backendClient.loadTimelineWindow(for: session, anchorRowID: rowID,
+                    expectedSelectionGeneration: generation, retainedTailLimit: 240,
+                    acceptsResult: { navigationEpoch == epoch && pendingNavigationMessageID == nil && acceptsPresentationUpdates && !Task.isCancelled })
+                guard !Task.isCancelled, acceptsPresentationUpdates,
+                      backendClient.selectedSession?.id == sessionId else { return }
+                // Coalesce rapid clicks: an older load must not move the viewport.
+                if pendingNavigationMessageID != nil { continue }
+                guard result == .found, let detail = displayedDetail else {
+                    navigationError = result == .missing ? "这条消息已不存在。" : "暂时无法定位这条消息，请重试。"
+                    continue
+                }
+                timelineRestorationIntent.reset(initialPosition: .init(rowID: rowID, offset: 0,
+                    absoluteScrollY: 0, followsLatest: false))
+                updateCachedDisplayEntries(for: detail)
+                navigationRowID = rowID
+                navigationRevision &+= 1
             }
         }
     }
@@ -1084,7 +1266,8 @@ struct SessionConversationSurface: View {
                 totalDisplayEntryCount: incremental.totalCount,
                 visibleMessageLimit: visibleMessageLimit,
                 signature: incremental.signature,
-                sourceSignature: incremental.sourceSignature
+                sourceSignature: incremental.sourceSignature,
+                isPresentationPrepared: true
             ))
             return
         }
@@ -1114,16 +1297,20 @@ struct SessionConversationSurface: View {
         ChatPerformanceRecorder.shared.increment(.displayProjectionRequests)
 
         displayProjectionTask = Task { @MainActor in
-            let cache = await Task.detached(priority: .userInitiated) {
+            let worker = Task.detached(priority: .userInitiated) {
                 ChatPerformanceTrace.measure("timeline.display.project.background") {
                     makeDetailDisplayCache(
                         for: detail,
                         sessionId: requestedSessionID,
                         visibleMessageLimit: requestedLimit,
-                        restorationAnchorRowID: requestedAnchorRowID
+                        restorationAnchorRowID: requestedAnchorRowID,
+                        preparedSourceSignature: sourceSignature
                     )
                 }
-            }.value
+            }
+            let cache = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: { worker.cancel() }
             guard request.isCurrent(
                 sessionID: sessionId,
                 sourceSignature: cache.sourceSignature,
@@ -1143,25 +1330,9 @@ struct SessionConversationSurface: View {
     private func commitDisplayCache(_ sourceDisplay: DetailDisplayCache) {
         guard acceptsPresentationUpdates else { return }
         ChatPerformanceRecorder.shared.increment(.displayRebuilds)
-        let projectedDisplay = sourceDisplay.projectingReplyProgress()
-        let uniqueEntries = uniquedChatDisplayEntries(projectedDisplay.displayEntries)
-        let removedDisplayWeight = projectedDisplay.displayEntries.reduce(0) { $0 + $1.displayWeight }
-            - uniqueEntries.reduce(0) { $0 + $1.displayWeight }
-        let preparedDisplay = uniqueEntries.count == projectedDisplay.displayEntries.count
-            ? projectedDisplay
-            : DetailDisplayCache(
-                sessionId: projectedDisplay.sessionId,
-                displayItems: projectedDisplay.displayItems,
-                displayEntries: uniqueEntries,
-                totalDisplayEntryCount: max(
-                    uniqueEntries.reduce(0) { $0 + $1.displayWeight },
-                    projectedDisplay.totalDisplayEntryCount - removedDisplayWeight
-                ),
-                visibleMessageLimit: projectedDisplay.visibleMessageLimit,
-                signature: projectedDisplay.signature,
-                sourceSignature: projectedDisplay.sourceSignature,
-                restorationAnchorRowID: projectedDisplay.restorationAnchorRowID
-            )
+        // Both production projection paths prepare once before submission.
+        // Compatibility callers can still normalize an unprepared value here.
+        let preparedDisplay = sourceDisplay.projectingReplyProgress()
         var transaction = Transaction()
         transaction.disablesAnimations = true
         let nextAppKitRows = PerfStopwatch.measure("会话切换.makeCachedAppKitRows") {
@@ -1243,7 +1414,8 @@ struct SessionConversationSurface: View {
             cachedVisibleMessageLimit: cachedVisibleMessageLimit,
             cachedItemsSignature: cachedItemsSignature
         ).project(for: detail, sessionId: sessionId, visibleMessageLimit: visibleMessageLimit,
-                  requestedRestorationAnchorRowID: requestedRestorationAnchorRowID)
+                  requestedRestorationAnchorRowID: requestedRestorationAnchorRowID,
+                  preparedSourceSignature: appKitDetailRevision)
     }
 
     private func updateCachedSourceTail(from items: [CodexThreadItem]) {
@@ -1253,6 +1425,8 @@ struct SessionConversationSurface: View {
     }
 
     private var shouldRenderDetailMessages: Bool {
+        // A pending restore must not unmount already displayed same-Session content.
+        if hasPreparedDisplayCacheForCurrentSession && !cachedDisplayEntries.isEmpty { return true }
         if let anchorRowID = requestedRestorationAnchorRowID,
            !cachedDisplayEntries.contains(where: { $0.id == anchorRowID }) {
             return false
@@ -1359,55 +1533,9 @@ struct SessionConversationSurface: View {
         cachedDetailSourceSignature = ""
     }
 
-    private func detailSourceSignature(for detail: CodexThreadDetail) -> String {
-        makeDetailSourceSignature(
-            for: detail,
-            visibleMessageLimit: visibleMessageLimit,
-            restorationAnchorRowID: requestedRestorationAnchorRowID
-        )
+    private func detailSourceSignature(for _: CodexThreadDetail) -> String {
+        appKitDetailRevision
     }
 
 
-}
-
-enum ConversationChromeElement: Hashable {
-    case viewport
-    case header
-    case composer
-}
-
-struct ConversationChromeFramePreferenceKey: PreferenceKey {
-    static let coordinateSpace = "conversation.chrome"
-    static let defaultValue: [ConversationChromeElement: CGRect] = [:]
-
-    static func reduce(
-        value: inout [ConversationChromeElement: CGRect],
-        nextValue: () -> [ConversationChromeElement: CGRect]
-    ) {
-        value.merge(nextValue()) { _, next in next }
-    }
-}
-
-struct ConversationChromeClearances {
-    let top: CGFloat
-    let bottom: CGFloat
-
-    init?(frames: [ConversationChromeElement: CGRect]) {
-        guard let viewport = frames[.viewport] else { return nil }
-        let headerOverlap = frames[.header].map { max(0, $0.maxY - viewport.minY) } ?? 0
-        let composerOverlap = frames[.composer].map { max(0, viewport.maxY - $0.minY) } ?? 0
-        top = headerOverlap > 0 ? headerOverlap + 10 : 0
-        bottom = composerOverlap > 0 ? composerOverlap + 10 : 0
-    }
-}
-
-private extension SessionConversationSurface {
-    func conversationChromeFrame(_ element: ConversationChromeElement) -> some View {
-        GeometryReader { geometry in
-            Color.clear.preference(
-                key: ConversationChromeFramePreferenceKey.self,
-                value: [element: geometry.frame(in: .named(ConversationChromeFramePreferenceKey.coordinateSpace))]
-            )
-        }
-    }
 }

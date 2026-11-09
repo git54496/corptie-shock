@@ -1,3 +1,5 @@
+import { EXECUTION_CHECKLIST_INSTRUCTIONS } from "./executionChecklistInstructions.mjs";
+
 const VERDICTS = new Set(["passed", "failed", "unknown"]);
 
 function assertKnownKeys(value, allowed, path) {
@@ -31,6 +33,7 @@ export function acceptanceCriteriaList(value) {
 export function taskExecutionPrompt(task) {
   return [
     `请完成工作项「${task?.title ?? "未命名"}」。`,
+    EXECUTION_CHECKLIST_INSTRUCTIONS,
     task?.acceptance_criteria
       ? "\n请依据已注入的 Task 上下文执行与验证；只有在每条验收标准均有可复现证据时，才调用 corptie_task_report_acceptance。"
       : ""
@@ -208,6 +211,8 @@ export function presentTaskAcceptance(task, options = {}) {
     priority: task.priority,
     lifecycleState: task.lifecycle_state,
     autoTitleEnabled: task.auto_title_enabled !== 0,
+    coordinationEnabled: task.coordination_enabled === 1,
+    coordinationDispatches: options.coordinationDispatches ?? [],
     archived: Boolean(task.archived),
     mainAgentId: task.main_agent_id ?? null,
     currentSessionId: task.current_session_id ?? null,

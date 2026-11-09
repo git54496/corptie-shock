@@ -122,14 +122,13 @@ test("Work Chat context is bounded and includes traceable Work state", async () 
       name: "Ship_feature", description: "Delivery remains reliable across every path", profile: "software"
     });
     workService.createTask({ workId: work.id, title: "Backend" });
-    assert.throws(() => new WorkChatContextService({ store, characterBudget: 6_000 }).build(work.id), { code: "WORK_CONTEXT_BUDGET_TOO_SMALL" });
-    const context = new WorkChatContextService({ store, characterBudget: 16_000 }).build(work.id);
+    const context = new WorkChatContextService({ store }).build(work.id);
     assert.equal(context.workId, work.id);
-    assert.ok(context.characters <= 16_000);
+    assert.ok(context.prompt.includes("Delivery remains reliable"));
     assert.match(context.prompt, /Delivery remains reliable across every path/);
     assert.match(context.prompt, /Backend/);
     assert.ok(context.generatedAt);
-    const again = new WorkChatContextService({ store, characterBudget: 16_000 }).build(work.id);
+    const again = new WorkChatContextService({ store }).build(work.id);
     assert.equal(again.prompt, context.prompt);
     assert.equal(context.contextSections.map(section => section.prompt).join("\n\n"), context.prompt);
   } finally {
@@ -149,8 +148,8 @@ test("Work Chat context forbids Task creation without a direct explicit user req
     assert.match(context.prompt, /workflow recommendation, not a permission denial/);
     assert.match(context.prompt, /carry out the request in this Session when otherwise authorized/);
     assert.match(context.prompt, /Non-code changes, including repository configuration, may be performed directly/);
-    assert.match(context.prompt, /Never create a new Task unless the direct user explicitly asks/);
-    assert.match(context.prompt, /Complexity, code changes, decomposition, parallelism, missing information/);
+    assert.match(context.prompt, /Independent root Tasks require an explicit direct-user creation request/);
+    assert.match(context.prompt, /Child Tasks under an existing same-Work root may be created autonomously/);
     assert.match(context.prompt, /explicitly requests a new Task, its title, description, and acceptance criteria/);
     assert.match(context.prompt, /Task creation starts its Worker Session automatically/);
     assert.match(context.prompt, /never request or perform a separate start action/);

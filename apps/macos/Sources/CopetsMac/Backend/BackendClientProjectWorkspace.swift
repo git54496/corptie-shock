@@ -57,9 +57,9 @@ extension BackendClient {
 
     func integrateCompletedWorktrees() { projectWorkspaceCommandController.integrateCompletedWorktrees() }
 
-    func createIntegrationConflictCorptieTask(runId: String, agentId: String, title: String? = nil) {
+    func createIntegrationConflictCorptieTask(runId: String, roleId: String, title: String? = nil) {
         projectWorkspaceCommandController.createIntegrationConflictCorptieTask(
-            runId: runId, agentId: agentId, title: title
+            runId: runId, roleId: roleId, title: title
         )
     }
 
@@ -117,13 +117,12 @@ extension BackendClient {
     func operateProjectWorktree(
         _ worktree: ProjectWorktreeStatus, mergeIntoMain: Bool, synchronizeWithMain: Bool,
         deleteWorktree: Bool, deleteSessions: Bool, restartService: Bool,
-        forceDeleteUnmerged: Bool = false, confirmedBranchName: String? = nil
+        forceDeleteUnmerged: Bool = false
     ) {
         projectWorkspaceCommandController.operateProjectWorktree(
             worktree, mergeIntoMain: mergeIntoMain, synchronizeWithMain: synchronizeWithMain,
             deleteWorktree: deleteWorktree, deleteSessions: deleteSessions,
-            restartService: restartService, forceDeleteUnmerged: forceDeleteUnmerged,
-            confirmedBranchName: confirmedBranchName
+            restartService: restartService, forceDeleteUnmerged: forceDeleteUnmerged
         )
     }
 

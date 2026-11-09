@@ -70,7 +70,7 @@ export class ToolHostMaterializationCoordinator {
       desiredDomains: domainRecords,
       exposureContractHash: plan.exposureContractHash
     });
-    if (compatibleDefinitionOnly(record, binding, capability, plan, desiredVersion)) {
+    if (compatibleDefinitionOnly(record, binding, capability, plan, desiredVersion, snapshot.catalogVersion)) {
       const installedDefinitionsHash = record.providerReceipt.providerDefinitionsHash;
       const compatiblePlan = {
         ...plan,
@@ -771,14 +771,16 @@ function matchesDesired(record, version, catalogVersion, domains, plan) {
     // Older generated-MCP replacement rows persisted `create`. Ownership
     // hashes are identical, but the observation protocol must still be repaired
     // through the normal desired-state CAS before waiting for tools/list.
-    && (plan.surface !== "generated_authenticated_mcp"
+    && (plan.refreshMode !== "generated_mcp_refresh"
       || record.exposurePlan?.refreshMode === plan.refreshMode);
 }
 
-function compatibleDefinitionOnly(record, binding, capability, plan, desiredVersion) {
+function compatibleDefinitionOnly(record, binding, capability, plan, desiredVersion, catalogVersion) {
   if (!record || !["applied", "error"].includes(record.status)) return false;
   if (record.status === "applied"
     && record.appliedVersion === desiredVersion
+    && record.desiredCatalogVersion === catalogVersion
+    && record.appliedCatalogVersion === catalogVersion
     && record.exposurePlan?.providerContractHash === plan.providerContractHash
     && record.exposurePlan?.providerDefinitionsHash === plan.providerDefinitionsHash) return false;
   const receipt = record.providerReceipt;

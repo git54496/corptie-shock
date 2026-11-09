@@ -1,9 +1,37 @@
+import AppKit
+import SwiftUI
 import Foundation
 import Testing
 @testable import CorptieMac
 
 @Suite(.serialized)
 struct WorktreeManagementLoadingTests {
+    @MainActor
+    @Test func completionEventRefreshesInventoryWhileMutationIsStillFinishing() async throws {
+        let recorder = RequestRecorder(details: ["repository:one": Self.detail(repositoryId: "repository:one",
+            worktrees: [Self.worktree("wt:main", branch: "main", isMain: true), Self.worktree("wt:feature", branch: "feature").replacingOccurrences(of: "\"mergedIntoMain\":true", with: "\"mergedIntoMain\":false")])])
+        let client = makeClient(recorder: recorder)
+        await client.loadRepositories()
+        let tree = try #require(client.detail?.project.worktrees.last)
+        let before = recorder.count(path: "/worktree-management/repositories/repository:one")
+        recorder.setDetail(Self.detail(repositoryId: "repository:one", worktrees: [
+            Self.worktree("wt:main", branch: "main", isMain: true), Self.worktree("wt:feature", branch: "feature")]), for: "repository:one")
+        recorder.setResponseDelay(0.4)
+        let mutation = Task { await client.cleanupMergedWorktrees([tree]) }
+        await Task.yield()
+        #expect(client.isMutating)
+        let event = #"{"payload":{"job":{"id":"job:completed","repositoryId":"repository:one","status":"completed","phase":"completed","planFingerprint":"f","createdAt":"now","updatedAt":"now","plan":{"repositoryId":"repository:one","mainWorktreeId":"wt:main","mainPath":"/tmp/one","inventoryVersion":"1","mergeOrder":[],"blockingRisks":[],"items":[]},"progress":{"completed":1,"total":1,"fraction":1},"audit":[]}}}"#
+        #expect(await client.receiveJobEvent(event))
+        await mutation.value
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while client.detail?.project.worktrees.last?.mergedIntoMain != true && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(recorder.count(path: "/worktree-management/repositories/repository:one") > before)
+        #expect(client.job?.status == "completed")
+        #expect(client.detail?.project.worktrees.last?.mergedIntoMain == true)
+    }
+
     @MainActor
     @Test func firstLoadPublishesTheUnchangedOrderedListAndSelection() async {
         let recorder = RequestRecorder(details: ["repository:one": Self.detail(
@@ -326,17 +354,87 @@ struct WorktreeManagementLoadingTests {
     }
 
     @MainActor
+    @Test func destructiveReviewCannotExecuteAgainstAChangedRepository() async throws {
+        let recorder = RequestRecorder(details: ["repository:one": Self.detail(repositoryId: "repository:one", worktrees: [Self.worktree("wt:feature", branch: "feature")])])
+        let client = makeClient(recorder: recorder)
+        await client.loadRepositories()
+        let tree = try #require(client.selectedWorktree)
+        let path = "/worktree-management/repositories/repository:one/worktrees/wt:feature/delete"
+        #expect(await client.deleteWorktree(tree, expectedRepositoryID: "repository:previous") == false)
+        await client.cleanupMergedWorktrees([tree], expectedRepositoryID: "repository:previous")
+        #expect(recorder.count(path: path) == 0)
+        #expect(client.isMutating == false)
+        #expect(client.cleanupResult == nil)
+    }
+
+    @MainActor
+    @Test func fixturePageRendersAtWideMediumAndCompactWidthsWithoutMutation() async throws {
+        let fixtureTrees = [
+            Self.worktree("wt:main", branch: "main", isMain: true),
+            Self.worktree("wt:feature", branch: "feature/a-long-branch-name-for-layout-validation", dirty: true)
+        ] + (2..<200).map { Self.worktree("wt:fixture-\($0)", branch: "feature/fixture-\($0)") }
+        let recorder = RequestRecorder(details: ["repository:one": Self.detail(repositoryId: "repository:one", worktrees: fixtureTrees)])
+        let client = makeClient(recorder: recorder)
+        await client.loadRepositories()
+        let router = AppTabRouter()
+        let sidebar = TabSidebarState(tab: .worktrees)
+        let view = WorktreeManagementView(client: client).environmentObject(router).environmentObject(sidebar)
+        let host = NSHostingView(rootView: view)
+        host.sizingOptions = []
+        let window = NSWindow(contentRect: NSRect(x: -3000, y: -3000, width: 1300, height: 850), styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        window.contentView = host
+        defer { window.orderOut(nil); window.contentView = nil }
+        for (name, width, height, appearance) in [("wide-light", 1300.0, 850.0, NSAppearance.Name.aqua), ("short-light", 1000.0, 500.0, .aqua), ("medium-light", 850.0, 1000.0, .aqua), ("compact-dark", 600.0, 650.0, .darkAqua)] {
+            window.appearance = NSAppearance(named: appearance)
+            window.setContentSize(NSSize(width: width, height: height))
+            host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+            try await Task.sleep(for: .milliseconds(250))
+            host.layoutSubtreeIfNeeded()
+            #expect(abs(host.bounds.width - width) < 1)
+            #expect(abs(host.bounds.height - height) < 1)
+            #expect(client.detail?.project.worktrees.count == 200)
+            #expect(client.selection.repositoryId == "repository:one")
+            #expect(client.selection.worktreeId == "wt:main")
+            #expect(window.defaultButtonCell == nil)
+            if width > 1000 {
+                func scrollViews(in view: NSView) -> [NSScrollView] {
+                    (view as? NSScrollView).map { [$0] } ?? view.subviews.flatMap { scrollViews(in: $0) }
+                }
+                let scroll = try #require(scrollViews(in: host).first { ($0.documentView?.bounds.height ?? 0) > $0.contentView.bounds.height + 50 })
+                let initialOrigin = scroll.contentView.bounds.origin
+                let target = min(initialOrigin.y + 300, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
+                scroll.contentView.scroll(to: NSPoint(x: initialOrigin.x, y: target))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                #expect(scroll.contentView.bounds.origin.y > 0)
+                scroll.contentView.scroll(to: initialOrigin)
+                scroll.reflectScrolledClipView(scroll.contentView)
+                try await Task.sleep(for: .milliseconds(60))
+            }
+            if let directory = ProcessInfo.processInfo.environment["CORPTIE_UI_EVIDENCE_DIR"] {
+                let url = URL(fileURLWithPath: directory, isDirectory: true)
+                #expect(!url.path.hasPrefix(FileManager.default.currentDirectoryPath + "/"))
+                let bitmap = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                let png = try #require(bitmap.representation(using: .png, properties: [:]))
+                try png.write(to: url.appendingPathComponent(name + ".png"))
+            }
+        }
+        #expect(recorder.count(path: "/worktree-management/repositories/repository:one/worktrees/wt:main/delete") == 0)
+    }
+
+    @MainActor
     private func makeClient(
         recorder: RequestRecorder,
         cacheLifetime: TimeInterval = 60,
         automaticRefreshInterval: TimeInterval = 60,
         now: @escaping () -> Date = Date.init
     ) -> WorktreeManagementClient {
-        WorktreeLoadingURLProtocol.recorder = recorder
+        let host = "fixture-" + UUID().uuidString.lowercased() + ".invalid"
+        WorktreeLoadingURLProtocol.register(recorder, host: host)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [WorktreeLoadingURLProtocol.self]
         return WorktreeManagementClient(
-            baseURL: URL(string: "http://127.0.0.1:9999")!,
+            baseURL: URL(string: "http://" + host)!,
             session: URLSession(configuration: configuration),
             cacheLifetime: cacheLifetime,
             automaticRefreshInterval: automaticRefreshInterval,
@@ -457,13 +555,19 @@ private final class RequestRecorder: @unchecked Sendable {
 }
 
 private final class WorktreeLoadingURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var recorder: RequestRecorder?
+    private static let registryLock = NSLock()
+    nonisolated(unsafe) private static var recorders: [String: RequestRecorder] = [:]
+
+    static func register(_ recorder: RequestRecorder, host: String) {
+        registryLock.withLock { recorders[host] = recorder }
+    }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        guard let recorder = Self.recorder, let url = request.url else {
+        guard let url = request.url,
+              let recorder = Self.registryLock.withLock({ Self.recorders[url.host ?? ""] }) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }

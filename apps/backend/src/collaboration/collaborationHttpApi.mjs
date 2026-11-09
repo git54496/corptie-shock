@@ -77,6 +77,25 @@ export function handleCollaborationHttpRequest({
         ) });
       }
 
+      if (request.method === "POST" && url.pathname === "/internal/collaboration/tasks/dispatch") {
+        if (!sessionCollaborationService?.taskCoordinationService) throw apiError("CAPABILITY_UNAVAILABLE", "Coordination is unavailable.", 503);
+        return sendJson(response, 202, sessionCollaborationService.taskCoordinationService.acceptDispatch(sessionMetadata, actorAgentId, await readJson(request)));
+      }
+      if (request.method === "POST" && url.pathname === "/internal/collaboration/tasks/dispatch/retry") {
+        const input = await readJson(request);
+        if (!sessionCollaborationService?.taskCoordinationService) throw apiError("CAPABILITY_UNAVAILABLE", "Coordination unavailable.", 503);
+        return sendJson(response, 202, sessionCollaborationService.taskCoordinationService.retryDispatch(sessionMetadata, actorAgentId, input.dispatchId));
+      }
+      if (request.method === "POST" && url.pathname === "/internal/collaboration/tasks/delete-child") {
+        return sendJson(response, 202, await sessionCollaborationService.deleteChildTask(sessionMetadata, actorAgentId, await readJson(request)));
+      }
+      if (request.method === "POST" && url.pathname === "/internal/collaboration/tasks/batch") {
+        if (!sessionCollaborationService) throw apiError("SESSION_COLLABORATION_UNAVAILABLE", "Scoped Task tools are unavailable.", 503);
+        return sendJson(response, 200, await sessionCollaborationService.createChildTasksBatch(
+          sessionMetadata, actorAgentId, await readJson(request)
+        ));
+      }
+
       if (request.method === "POST" && url.pathname === "/internal/collaboration/tasks") {
         if (!sessionCollaborationService) throw apiError("SESSION_COLLABORATION_UNAVAILABLE", "Scoped Task tools are unavailable.", 503);
         return sendJson(response, 201, await sessionCollaborationService.createTaskAndSession(
@@ -180,13 +199,13 @@ export function handleCollaborationHttpRequest({
         if (!onSearchSkills) throw apiError("SKILL_TOOLS_UNAVAILABLE", "Skill search is unavailable.", 503);
         const intent = String(url.searchParams.get("intent") ?? "").trim();
         if (!intent) throw apiError("INVALID_INPUT", "intent is required.", 400);
-        return sendJson(response, 200, await onSearchSkills(actorAgentId, intent));
+        return sendJson(response, 200, await onSearchSkills(actorAgentId, intent, sessionMetadata));
       }
 
       const skillLoadMatch = url.pathname.match(/^\/internal\/collaboration\/skills\/([^/]+)$/);
       if (request.method === "GET" && skillLoadMatch) {
         if (!onLoadSkill) throw apiError("SKILL_TOOLS_UNAVAILABLE", "Skill loading is unavailable.", 503);
-        return sendJson(response, 200, await onLoadSkill(actorAgentId, decodeURIComponent(skillLoadMatch[1])));
+        return sendJson(response, 200, await onLoadSkill(actorAgentId, decodeURIComponent(skillLoadMatch[1]), sessionMetadata));
       }
 
       if (request.method === "GET" && url.pathname === "/internal/collaboration/agents") {
@@ -264,8 +283,9 @@ export function handleCollaborationHttpRequest({
         if (!channel) throw apiError("CHANNEL_NOT_FOUND", "Channel was not found in this Session scope.", 404);
         return sendJson(response, 200, {
           channel,
-          messages: sessionChannelService.listMessages(channelId, sessionMetadata.sessionId, {
-            limit: url.searchParams.get("limit")
+          ...sessionChannelService.listMessagePage(channelId, sessionMetadata.sessionId, {
+            limit: url.searchParams.get("limit"),
+            beforeCursor: url.searchParams.get("beforeCursor"), afterCursor: url.searchParams.get("afterCursor")
           })
         });
       }
@@ -331,6 +351,9 @@ export function handleCollaborationHttpRequest({
           await onChannelMessageCreated?.(channelRequest);
           return sendJson(response, 201, { request: channelRequest });
         }
+        // An idempotent retry can return an already resolved request. It is
+        // never a new authorization prompt, nor permission to re-send it.
+        if (channelRequest.status !== "pending") return sendJson(response, 201, { request: channelRequest });
         try {
           await onChannelRequestStaged?.(channelRequest);
         } catch (error) {
@@ -657,7 +680,10 @@ async function handleProductRequest({ request, response, url, core, sessionChann
     if (!channel) throw apiError("CHANNEL_NOT_FOUND", "Channel was not found.", 404);
     return sendJson(response, 200, {
       channel,
-      messages: sessionChannelService.listMessages(channelId, channel.sessionAId, { limit: 500 })
+      ...sessionChannelService.listMessagePage(channelId, channel.sessionAId, {
+        limit: url.searchParams.get("limit") ?? 100,
+        beforeCursor: url.searchParams.get("beforeCursor"), afterCursor: url.searchParams.get("afterCursor")
+      })
     });
   }
 

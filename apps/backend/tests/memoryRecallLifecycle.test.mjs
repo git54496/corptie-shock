@@ -328,7 +328,7 @@ test("confirmed Memory reaches a Provider turn and its Session Detail audit", as
     }, {
       send: async (_reference, _message, context) => {
         providerContext = context.sessionContext;
-        return { accepted: true };
+        return { turnId: "turn:memory", delivery: "accepted" };
       }
     })]);
     const reference = { sessionId, providerId: "test-provider",
@@ -393,7 +393,7 @@ test("user-saved Global preferences reach existing Sessions across Works on unre
       capabilities: [AGENT_PROVIDER_CAPABILITIES.CONVERSATION_SEND]
     }, { send: async (reference, _message, context) => {
       delivered.push({ sessionId: reference.sessionId, prompt: context.sessionContext.prompt });
-      return { accepted: true };
+      return { turnId: "turn:memory", delivery: "accepted" };
     } })]);
     for (const session of sessions) {
       if (session.id !== "session:existing-a") f.store.createSession({
@@ -408,7 +408,8 @@ test("user-saved Global preferences reach existing Sessions across Works on unre
         sessionBindingRepository: { resolve: () => reference },
         assertForkDispatchAllowed: () => {}, assertSessionRecoveryMessageBoundary: () => {},
         memoryRecallService: recallService,
-        memoryTopicService: { update: async () => ({ topics: ["programming"], contexts: ["development"] }) },
+        memoryTopicService: { profileForMessage: () => ({ topics: ["programming"], contexts: ["development"] }),
+          requestUpdate() {} },
         workChatContextService: { build: () => ({ prompt: "Work context" }) },
         resolveContextReferences: async () => null,
         mcpAssignmentRevisionForAgent: () => null, emitEvent: () => {} });

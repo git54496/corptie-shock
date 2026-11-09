@@ -9,6 +9,7 @@ import {
   presentJob
 } from "../src/application/worktreeIntegrationJobService.mjs";
 import { CorptieStore } from "../src/store/corptieStore.mjs";
+import { worktreeDispatchBlocker } from "../src/application/worktreeExecutionBarrier.mjs";
 
 function memoryFixture({
   conflictOnce = false,
@@ -116,9 +117,6 @@ function memoryFixture({
         }
         return structuredClone(existing);
       }
-      const active = [...jobs.values()].find((job) => job.repositoryId === input.repositoryId
-        && ["queued", "running", "paused", "cancellation_requested", "replanning"].includes(job.status));
-      if (active) throw Object.assign(new Error("active"), { code: "INTEGRATION_JOB_ACTIVE" });
       return this.createWorktreeIntegrationJob(input);
     },
     getSession: (id) => id?.startsWith("session:conflict")
@@ -307,6 +305,8 @@ function memoryFixture({
         branchName: input.workspace.branchName
       };
     },
+    inspectMainIntegrationCompletion: async input => ({ mainWorktreeId: input.targetWorktreeId,
+      mainHead: input.expectedTargetHead, verifiedHeads: input.requiredHeads }),
     launchConflictResolution: async (input) => {
       calls.push(`launch-agent:${input.item.worktreeId}`);
       const launchError = launchConflictErrors.shift();
@@ -408,6 +408,142 @@ test("Git operation recovery is bound to the freshly inspected Worktree state", 
   );
 });
 
+test("main verification failure preserves a paused Job instead of reporting completion", async () => {
+  const { service, calls } = memoryFixture({ featureDirty: false });
+  let checks = 0;
+  service.inspectMainIntegrationCompletion = async input => {
+    checks++;
+    assert.equal(input.targetWorktreeId, "wt:main");
+    assert.ok(input.requiredHeads.includes("feature:1"));
+    throw Object.assign(new Error("Source feature:1 is missing from main"), { code: "INTEGRATION_RESULT_MISSING" });
+  };
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  const paused = await waitForJob(service, plan.id, "paused");
+  assert.equal(checks, 1);
+  assert.equal(paused.completedAt, null);
+  assert.equal(paused.completionEvidence, undefined);
+  assert.match(paused.error, /missing from main/);
+  assert.ok(calls.some(call => call.startsWith("merge:")));
+});
+
+test("completion proof is persisted only after matching main verification", async () => {
+  const { service, store } = memoryFixture({ featureDirty: false });
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  const completed = await waitForJob(service, plan.id, "completed");
+  assert.equal(completed.completionEvidence.schemaVersion, 1);
+  assert.equal(completed.completionEvidence.mainWorktreeId, "wt:main");
+  assert.ok(completed.completionEvidence.verifiedHeads.includes("feature:1"));
+  assert.deepEqual(store.getWorktreeIntegrationJob(plan.id).details.completionEvidence, completed.completionEvidence);
+});
+
+test("canceling a completed Job returns completion without Git or persistence writes", async () => {
+  const { service, store, calls } = memoryFixture({ featureDirty: false });
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  const completed = await waitForJob(service, plan.id, "completed");
+  const stored = structuredClone(store.getWorktreeIntegrationJob(plan.id));
+  const previousCalls = [...calls];
+  const result = await service.cancel(plan.id, { replan: false });
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.completionEvidence, completed.completionEvidence);
+  assert.deepEqual(store.getWorktreeIntegrationJob(plan.id), stored);
+  assert.deepEqual(calls, previousCalls);
+  await assert.rejects(service.cancel(plan.id, { replan: true }), { code: "JOB_NOT_CANCELABLE" });
+});
+
+test("wrapped HEAD drift keeps exact diagnostics and requires a fresh plan instead of an ineffective retry", async () => {
+  const failure = Object.assign(new Error("target HEAD changed"), {
+    code: "MAIN_HEAD_CHANGED", recoverable: false, expectedHead: "expected-head", actualHead: "actual-head"
+  });
+  const { service } = memoryFixture({ featureDirty: false, mergeErrors: [failure] });
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  const paused = await waitForJob(service, plan.id, "paused");
+  assert.equal(paused.failureDiagnostic.rootCauseCode, "MAIN_HEAD_CHANGED");
+  assert.equal(paused.failureDiagnostic.actualHead, "actual-head");
+  assert.match(paused.diagnosticText, /Expected HEAD: expected-head/);
+  assert.match(paused.diagnosticText, /Actual HEAD: actual-head/);
+  assert.deepEqual(paused.availableActions,["retry","cancel"]);
+  service.retry(plan.id);
+  assert.equal((await waitForJob(service,plan.id,"completed")).status,"completed");
+});
+
+test("a cancellation during final verification is preserved instead of being overwritten by completion", async () => {
+  const { service } = memoryFixture({ featureDirty: false });
+  let release, admitted;
+  const entered = new Promise(resolve => { admitted = resolve; });
+  service.inspectMainIntegrationCompletion = async input => {
+    admitted();
+    await new Promise(resolve => { release = resolve; });
+    return { mainWorktreeId: input.targetWorktreeId, mainHead: input.expectedTargetHead, verifiedHeads: input.requiredHeads };
+  };
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  await entered;
+  assert.equal((await service.cancel(plan.id)).status, "cancellation_requested");
+  release();
+  const canceled = await waitForJob(service, plan.id, "canceled");
+  assert.equal(canceled.completionEvidence, undefined);
+});
+
+test("failure diagnostics retain complete redacted command output and causes in the stored Job", async () => {
+  const cause = Object.assign(new Error("underlying Git failure"), { code: 128, stderr: "deep detail\nLAST_CAUSE_DETAIL" });
+  const failure = Object.assign(new Error("merge failed", { cause }), {
+    code: "MERGE_FAILED", recoverable: false, stderr: "line\n".repeat(3_000) + "password=private-value\n\"api_key\": \"json-private\"\nANTHROPIC_API_KEY=env-private\nLAST_STDERR_DETAIL"
+  });
+  const { service, store } = memoryFixture({ featureDirty: false, mergeErrors: [failure] });
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  const paused = await waitForJob(service, plan.id, "paused");
+  const diagnostic = store.getWorktreeIntegrationJob(plan.id).details.failureDiagnostic;
+  assert.match(JSON.stringify(diagnostic), /LAST_STDERR_DETAIL/);
+  assert.match(paused.diagnosticText, /LAST_STDERR_DETAIL/);
+  assert.match(paused.diagnosticText, /LAST_CAUSE_DETAIL/);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /private-value|json-private|env-private/);
+});
+
+test("graph cancellation clears its owned conflict and preserves completed commits and resolution references", async () => {
+  const { service, store } = memoryFixture({ featureDirty: false });
+  const plan = await service.preflight("repository:1");
+  const raw = store.getWorktreeIntegrationJob(plan.id);
+  store.updateWorktreeIntegrationJob(plan.id, { status: "paused", phase: "failed", details: {
+    ...raw.details, currentWorktreeId: "wt:feature", plan: { ...raw.details.plan,
+      orchestration: { version: 1, mainWorktreeId: "wt:main" },
+      items: raw.details.plan.items.map(item => item.isMain ? item : { ...item, mergeStatus: "conflict" }) },
+    conflictResolution: { sessionId: "session:resolved", status: "ready", workspace: { path: "/resolution" } }
+  } });
+  let aborts = 0;
+  service.abortMerge = async input => {
+    aborts++;
+    assert.equal(input.mainPath, "/repo");
+    assert.equal(input.sourceHead, "feature:1");
+    return { aborted: true, mainHead: "main:1" };
+  };
+  const canceled = await service.cancel(plan.id);
+  assert.equal(aborts, 1);
+  assert.equal(canceled.phase, "canceled");
+  assert.equal(canceled.cleanupResult.status, "completed");
+  assert.equal(canceled.cleanupResult.restoredHead, "main:1");
+  assert.equal(canceled.cleanupResult.expectedHead, "main:1");
+  assert.equal(canceled.cleanupResult.sourceHead, "feature:1");
+  assert.equal(service.get(plan.id).conflictResolution.workspace.path, "/resolution");
+});
+
+test("full error presentation preserves the last diagnostic line and redacts credentials", () => {
+  const message = "Git rejected the target\n" + "detail\n".repeat(2_000) + "Expected HEAD: old\nActual HEAD: new\npassword=hidden\nLAST_DIAGNOSTIC_LINE";
+  const job = presentJob({ id: "job", status: "paused", phase: "failed", error: message,
+    details: { plan: { targetBranchName: "parent", mainPath: "/parent", orchestration: {}, items: [] },
+      audit: [{ code: "MAIN_HEAD_CHANGED" }] } });
+  assert.deepEqual(job.availableActions, ["retry", "cancel"]);
+  assert.match(job.diagnosticText, /LAST_DIAGNOSTIC_LINE/);
+  assert.match(job.diagnosticText, /Expected HEAD: old\nActual HEAD: new/);
+  assert.match(job.diagnosticText, /Current target: parent/);
+  assert.doesNotMatch(job.diagnosticText, /hidden/);
+  assert.doesNotMatch(job.error, /hidden/);
+});
+
 async function waitForJob(service, id, status) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const job = service.get(id);
@@ -416,6 +552,118 @@ async function waitForJob(service, id, status) {
   }
   assert.fail(`job ${id} did not reach ${status}`);
 }
+
+function enableRollback(fixture) {
+  const { service, worktrees } = fixture;
+  service.inspectRollbackTarget = async ({ target }) => {
+    const tree = worktrees.find(tree => tree.worktreeId === target.worktreeId);
+    return { ...target, currentHead: tree.headOid, changedFiles: [], additionalCommits: [], published: false,
+      requiresPreservation: false, mode: tree.headOid === target.baselineHead ? "already_restored" : "restore_baseline",
+      reviewState: { head: tree.headOid } };
+  };
+  service.rollbackTarget = async ({ target }) => {
+    const tree = worktrees.find(tree => tree.worktreeId === target.worktreeId);
+    tree.headOid = target.baselineHead;
+    return { mainHead: tree.headOid, aborted: false };
+  };
+  return fixture;
+}
+
+test("cancel review stops the Job but does not reset Git until explicit confirmation", async () => {
+  const fixture = enableRollback(memoryFixture({ featureDirty: false, conflictOnce: true }));
+  const { service, worktrees } = fixture;
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  await waitForJob(service, plan.id, "paused");
+  const source = worktrees[1].headOid;
+  worktrees[0].headOid = "manually-resolved";
+  const review = await service.prepareRollback(plan.id);
+  assert.equal(review.job.phase, "rollback_review");
+  assert.equal(worktrees[0].headOid, "manually-resolved");
+  assert.ok(!JSON.stringify(review.rollback).includes("reviewState"));
+  assert.throws(() => service.retry(plan.id), { code: "JOB_ACTION_UNAVAILABLE" });
+  const canceled = await service.confirmRollback(plan.id, { confirmed: true, reviewId: review.rollback.id });
+  assert.equal(canceled.phase, "canceled_rolled_back");
+  assert.equal(worktrees[0].headOid, "main:1");
+  assert.equal(worktrees[1].headOid, source);
+  assert.equal((await service.confirmRollback(plan.id, { reviewId: review.rollback.id })).status, "canceled");
+});
+
+test("changed or lost rollback previews cannot reset a target", async () => {
+  const { service, worktrees } = enableRollback(memoryFixture({ featureDirty: false, conflictOnce: true }));
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  await waitForJob(service, plan.id, "paused");
+  const review = await service.prepareRollback(plan.id);
+  worktrees[0].headOid = "later-head";
+  await assert.rejects(service.confirmRollback(plan.id, { confirmed: true, reviewId: review.rollback.id }),
+    { code: "ROLLBACK_REVIEW_REQUIRED" });
+  assert.equal(worktrees[0].headOid, "later-head");
+  const replacement = await service.prepareRollback(plan.id);
+  service.rollbackReviews.clear(); // A process restart discards only the ephemeral review.
+  await assert.rejects(service.confirmRollback(plan.id, { confirmed: true, reviewId: replacement.rollback.id }),
+    { code: "ROLLBACK_REVIEW_REQUIRED" });
+  assert.equal(service.get(plan.id).phase, "rollback_review");
+  assert.equal(worktrees[0].headOid, "later-head");
+});
+
+test("a rollback review can explicitly return to integration without resetting branches", async () => {
+  const { service, worktrees } = enableRollback(memoryFixture({ featureDirty: false, conflictOnce: true }));
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  await waitForJob(service, plan.id, "paused");
+  await service.prepareRollback(plan.id);
+  const before = worktrees[0].headOid;
+  assert.equal(service.resumeRollbackReview(plan.id).status, "queued");
+  await waitForJob(service, plan.id, "completed");
+  assert.notEqual(worktrees[0].headOid, before);
+  assert.equal(service.get(plan.id).phase, "completed");
+});
+
+test("failed rollback names its target and a fresh review can finish it", async () => {
+  const { service, worktrees } = enableRollback(memoryFixture({ featureDirty: false, conflictOnce: true }));
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  await waitForJob(service, plan.id, "paused");
+  worktrees[0].headOid = "manually-resolved";
+  const preview = await service.prepareRollback(plan.id);
+  const reset = service.rollbackTarget;
+  service.rollbackTarget = async () => { throw Object.assign(new Error("permission failure with full details"), { code: "GIT_WRITE_FAILED" }); };
+  const failed = await service.confirmRollback(plan.id, { confirmed: true, reviewId: preview.rollback.id });
+  assert.equal(failed.status, "paused");
+  assert.equal(failed.cleanupResult.targetPath, "/repo");
+  assert.equal(failed.failureDiagnostic.targetPath, "/repo");
+  assert.match(failed.diagnosticText, /full details/);
+  assert.ok(failed.availableActions.includes("rollback"));
+  assert.equal(worktrees[0].headOid, "manually-resolved");
+  service.rollbackTarget = reset;
+  const retry = await service.prepareRollback(plan.id);
+  assert.equal((await service.confirmRollback(plan.id, { confirmed: true, reviewId: retry.rollback.id })).status, "canceled");
+});
+
+test("canceling an in-flight Git step drains it and waits for rollback review", async () => {
+  const { service, worktrees } = enableRollback(memoryFixture({ featureDirty: false }));
+  let release, entered;
+  const admitted = new Promise(resolve => { entered = resolve; });
+  service.mergeSource = async () => {
+    entered(); await new Promise(resolve => { release = resolve; });
+    worktrees[0].headOid = "just-merged";
+    return { mainHead: "just-merged", merged: true };
+  };
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  await admitted;
+  const pending = await service.prepareRollback(plan.id);
+  assert.equal(pending.job.phase, "rollback_stopping");
+  assert.equal(pending.rollback, null);
+  release();
+  await waitForJobWhere(service, plan.id, job => job.phase === "rollback_review");
+  assert.equal(worktrees[0].headOid, "just-merged");
+  const review = await service.prepareRollback(plan.id);
+  assert.equal(review.rollback.targets[0].baselineHead, "main:1");
+  assert.equal((await service.confirmRollback(plan.id, { confirmed: true, reviewId: review.rollback.id })).status, "canceled");
+  assert.equal(worktrees[0].headOid, "main:1");
+});
 
 test("dispatch safety coalesces inspections, fails closed and discards stale lifecycle results", async () => {
   const { service, store, worktrees } = memoryFixture({ featureDirty: false });
@@ -446,6 +694,78 @@ test("startup reconciles legacy paused reservations without replaying their Git 
   assert.equal(recovered.dispatchSafety.verifiedRevision, recovered.dispatchRevision);
   assert.deepEqual(calls, []);
 });
+
+test("canceled graph jobs inspect reservations outside the current step before releasing dispatch", async () => {
+  const { service, store, worktrees } = memoryFixture({ featureDirty: false });
+  const plan = await service.preflight("repository:1");
+  const job = store.getWorktreeIntegrationJob(plan.id);
+  store.updateWorktreeIntegrationJob(plan.id, { status: "canceled", phase: "canceled_conflict_preserved",
+    details: { ...job.details, plan: { ...job.details.plan,
+      items: job.details.plan.items.filter(item => item.isMain),
+      reservedWorktreeIds: ["wt:main", "wt:feature"] } } });
+  const requested = [];
+  service.inspectRepository = async (_, options) => {
+    requested.push(options.worktreeIds);
+    return { worktrees: structuredClone(worktrees.filter(tree => options.worktreeIds.includes(tree.worktreeId))) };
+  };
+  await service.reconcileDispatchSafety(plan.id);
+  assert.deepEqual(new Set(requested[0]), new Set(["wt:main", "wt:feature"]));
+  assert.ok(service.get(plan.id).dispatchSafety.safeWorktrees.some(tree => tree.worktreeId === "wt:feature"));
+  const feature = worktrees.find(tree => tree.worktreeId === "wt:feature");
+  feature.operationState = "merge";
+  feature.conflictFiles = ["conflict.txt"];
+  await service.reconcileDispatchSafety(plan.id);
+  assert.ok(service.get(plan.id).dispatchSafety.blockedWorktreeIds.includes("wt:feature"));
+});
+
+async function pausedAcceptanceFixture() {
+  const f = memoryFixture({ featureDirty: false });
+  const plan = await f.service.preflight("repository:1");
+  const job = f.store.getWorktreeIntegrationJob(plan.id);
+  f.store.updateWorktreeIntegrationJob(plan.id, { status: "paused", phase: "awaiting_integration_acceptance",
+    details: { ...job.details, plan: { ...job.details.plan,
+      orchestration: { version: 1, mainWorktreeId:"wt:main",requestedWorktreeIds:["wt:feature"],includedWorktreeIds:["wt:feature"],groups:[],steps:[] }, reservedWorktreeIds: ["wt:main", "wt:feature"] },
+    graphExecution: { index: 0, phase: "executing", reviewedItems: job.details.plan.items,
+      steps: [{id:"legacy:acceptance",kind:"acceptance",rootTaskId:"task:parent",targetWorktreeId:"wt:main",sourceWorktreeIds:[]},
+        {id:"legacy:merge",kind:"merge",rootTaskId:null,targetWorktreeId:"wt:main",sourceWorktreeIds:["wt:feature"]}] } } });
+  return { ...f, id: plan.id };
+}
+
+test("startup automatically resumes legacy acceptance gates without replaying completed steps", async () => {
+  const { service, store, id } = await pausedAcceptanceFixture();
+  await service.recover();
+  const completed=await waitForJob(service,id,"completed");
+  assert.equal(completed.status,"completed");
+  const state=store.getWorktreeIntegrationJob(id).details.graphExecution;
+  assert.equal(state.steps.find(step=>step.id==="legacy:acceptance").status,"skipped");
+  assert.equal(state.steps.find(step=>step.id==="legacy:acceptance").reason,"ACCEPTANCE_SEPARATE_FROM_GIT");
+});
+
+test("acceptance waits do not release a source with an unfinished Git operation", async () => {
+  const { service, store, worktrees, id } = await pausedAcceptanceFixture();
+  worktrees[1].operationState = "rebase";
+  await service.reconcileDispatchSafety(id);
+  const blocker = worktreeDispatchBlocker(store, { logicalSession: {
+    repositoryId: "repository:1", activeWorkspaceId: "wt:feature"
+  } });
+  assert.equal(blocker.reason, "WORKTREE_CONFLICT_OR_RECOVERY");
+});
+
+for (const change of ["commit", "uncommitted edit"]) {
+  test(`integration revalidates a released source after an acceptance wait: ${change}`, async () => {
+    const { service, store, worktrees, calls, id } = await pausedAcceptanceFixture();
+    await service.reconcileDispatchSafety(id);
+    const baseline = store.getWorktreeIntegrationJob(id).details.dispatchSafety;
+    if (change === "commit") worktrees[1].headOid = "feature:2";
+    else { worktrees[1].dirty = true; worktrees[1].statusSummary = " M feature.txt"; }
+    await service.reconcileDispatchSafety(id);
+    assert.deepEqual(store.getWorktreeIntegrationJob(id).details.dispatchSafety, baseline);
+    service.retry(id);
+    const resumed=await waitForJob(service,id,"completed");
+    assert.equal(resumed.resumeRequiresReplan,false);
+    assert.ok(calls.some(call=>call.startsWith("merge:")));
+  });
+}
 
 test("a resumed ordinary merge waits for already running target work before touching Git", async () => {
   const { service, store, calls } = memoryFixture({ featureDirty: false });
@@ -566,10 +886,6 @@ test("reviewed plan preserves main and commits each dirty task Worktree before d
   assert.deepEqual(plan.plan.items.map((item) => item.worktreeId), ["wt:main", "wt:feature"]);
   assert.deepEqual(plan.plan.mergeOrder, ["wt:feature"]);
   assert.equal(plan.status, "awaiting_confirmation");
-  await assert.rejects(() => service.confirm(plan.id, { confirmed: true, planFingerprint: "wrong" }), {
-    code: "EXPLICIT_CONFIRMATION_REQUIRED"
-  });
-
   await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
   const completed = await waitForJob(service, plan.id, "completed");
   assert.deepEqual(calls, ["commit:/repo-feature", "merge:feature:1:commit"]);
@@ -739,10 +1055,8 @@ test("automatic sync requires a persisted grant and checks it again at execution
   assert.deepEqual(calls, ["rebase:/repo-feature:main:1"]);
 });
 
-test("automatic sync never commits changes or touches a Session that becomes busy after confirm", async () => {
-  for (const mutate of [trees => { trees[1].dirty = true; trees[1].statusSummary = " M new.txt"; },
-    trees => { trees[1].sessions = [{ sessionId: "session:active", logicalSessionId: "logical:active" }]; },
-    trees => { trees[0].dirty = true; }]) {
+test("automatic sync preserves dirty inputs while active Session writes still wait", async () => {
+  for (const kind of ["dirty-source", "busy-source", "dirty-target"]) {
     const { service, calls, worktrees } = memoryFixture({ featureDirty: false });
     service.authorizeAutomaticFollow = () => true;
     const plan = await service.preflight("repository:1", {
@@ -750,10 +1064,12 @@ test("automatic sync never commits changes or touches a Session that becomes bus
     });
     await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint,
       automaticFollow: { worktreeId: "wt:feature", revision: 1 } });
-    mutate(worktrees);
-    const paused = await waitForJob(service, plan.id, "paused");
-    assert.match(paused.error, /no longer safe/);
-    assert.deepEqual(calls, []);
+    if(kind==="dirty-source") {worktrees[1].dirty=true;worktrees[1].statusSummary=" M new.txt";}
+    if(kind==="dirty-target") worktrees[0].dirty=true;
+    if(kind==="busy-source") worktrees[1].sessions=[{sessionId:"session:active",logicalSessionId:"logical:active"}];
+    const result=await waitForJob(service,plan.id,kind==="busy-source" ? "paused" : "completed");
+    if(kind==="busy-source") {assert.match(result.error,/Session|active|idle/i);assert.deepEqual(calls,[]);}
+    else {assert.ok(calls.some(call=>call.startsWith("rebase:/repo-feature:")));assert.ok(!calls.includes("commit:/repo-main"));}
   }
 });
 
@@ -779,51 +1095,13 @@ test("convergence merges all selected heads then fast-forwards every non-base br
   ]);
 });
 
-test("branch-operation candidate start is self-contained across candidate cache loss", async () => {
-  const { service } = memoryFixture({ featureDirty: false, conflictAttempts: [0, 0] });
-  const options = {
-    operationType: "merge",
-    sourceWorktreeIds: ["wt:feature-two", "wt:feature"],
-    targetWorktreeId: "wt:main"
-  };
-  const candidate = await service.createCandidate("repository:1", options);
-  assert.equal(candidate.operationType, "merge");
-  assert.deepEqual(candidate.sourceWorktreeIds, options.sourceWorktreeIds);
-  assert.equal(candidate.targetWorktreeId, "wt:main");
-  service.integrationCandidates.clear();
-
-  await assert.rejects(
-    () => service.startCandidate("repository:1", {
-      candidateId: candidate.id,
-      candidateFingerprint: candidate.planFingerprint,
-      idempotencyKey: "confirm:missing-operation"
-    }),
-    { code: "CANDIDATE_OPTIONS_REQUIRED", statusCode: 409 }
-  );
-  let refreshError;
-  try {
-    await service.startCandidate("repository:1", {
-      ...options,
-      candidateId: candidate.id,
-      candidateFingerprint: candidate.planFingerprint,
-      idempotencyKey: "confirm:self-contained-operation"
-    });
-  } catch (error) {
-    refreshError = error;
-  }
-  assert.equal(refreshError?.code, "PLAN_REFRESH_REQUIRED");
-  assert.equal(refreshError?.candidate?.operationType, "merge");
-  assert.deepEqual(refreshError?.candidate?.sourceWorktreeIds, options.sourceWorktreeIds);
-  assert.equal(refreshError?.candidate?.targetWorktreeId, "wt:main");
-  const refreshed = refreshError.candidate;
-  const started = await service.startCandidate("repository:1", {
-    ...options,
-    candidateId: refreshed.id,
-    candidateFingerprint: refreshed.planFingerprint,
-    idempotencyKey: "confirm:refreshed-operation"
-  });
-  assert.equal(started.plan.operationType, "merge");
-  assert.deepEqual(started.plan.mergeOrder, options.sourceWorktreeIds);
+test("branch operation survives candidate cache loss using its explicit source and target",async()=>{
+ const {service}=memoryFixture({featureDirty:false,conflictAttempts:[0,0]});
+ const options={operationType:"merge",sourceWorktreeIds:["wt:feature-two","wt:feature"],targetWorktreeId:"wt:main"};
+ const candidate=await service.createCandidate("repository:1",options);service.integrationCandidates.clear();
+ await assert.rejects(()=>service.startCandidate("repository:1",{candidateId:candidate.id,idempotencyKey:"missing-options"}),{code:"CANDIDATE_OPTIONS_REQUIRED"});
+ const job=await service.startCandidate("repository:1",{...options,candidateId:candidate.id,candidateFingerprint:candidate.planFingerprint,idempotencyKey:"current-options"});
+ assert.equal(job.status,"queued");assert.deepEqual(job.plan.mergeOrder,options.sourceWorktreeIds);
 });
 
 test("integration candidates are non-persistent and start one durable idempotent execution", async () => {
@@ -984,11 +1262,11 @@ test("candidate generation and serialized confirmation always request fresh insp
   assert.equal(store.listWorktreeIntegrationJobs("repository:1").length, 1);
   assert.deepEqual(inspectionOptions, [
     { forceFresh: true, reason: "integration_candidate_generation" },
-    { forceFresh: true, reason: "integration_candidate_confirmation" }
+    { forceFresh: true, reason: "integration_current_plan" }
   ]);
 });
 
-test("distinct concurrent confirmations fail fast instead of queuing per repository", async () => {
+test("distinct concurrent execution requests serialize admission without rejecting unrelated intent", async () => {
   const inspection = {
     repositoryId: "repository:1", inventoryVersion: "inventory:bounded", mainWorktreeId: "wt:main",
     mainPath: "/repo", mainHeadOid: "main:1", worktrees: [{
@@ -1020,95 +1298,31 @@ test("distinct concurrent confirmations fail fast instead of queuing per reposit
     idempotencyKey: "confirm:first"
   });
   await entered;
-  await assert.rejects(
-    () => service.startCandidate("repository:1", {
-      candidateId: candidate.id,
-      candidateFingerprint: candidate.planFingerprint,
-      idempotencyKey: "confirm:distinct"
-    }),
-    (error) => error.code === "INTEGRATION_CONFIRMATION_IN_PROGRESS"
-      && error.statusCode === 409
-      && error.retryable === true
-  );
+  const second=service.startCandidate("repository:1",{candidateId:candidate.id,candidateFingerprint:candidate.planFingerprint,idempotencyKey:"confirm:distinct"});
   releaseConfirmation();
-  await first;
-  assert.equal(inspections, 2);
+  const [one,two]=await Promise.all([first,second]);
+  assert.notEqual(one.id,two.id);assert.equal(inspections,3);
 });
 
-test("candidate confirmation rebuilds server state and returns deterministic PLAN_REFRESH_REQUIRED details", async () => {
-  const { service, store, calls, worktrees } = memoryFixture();
-  const candidate = await service.createCandidate("repository:1");
-  worktrees[1].statusSummary = " M feature.txt\n?? added-after-review.txt";
-  worktrees[1].changedFiles.push("added-after-review.txt");
-
-  let firstError;
-  try {
-    await service.startCandidate("repository:1", {
-      candidateId: candidate.id,
-      candidateFingerprint: candidate.planFingerprint,
-      idempotencyKey: "confirm:stale"
-    });
-  } catch (error) {
-    firstError = error;
-  }
-  assert.equal(firstError?.code, "PLAN_REFRESH_REQUIRED");
-  assert.equal(firstError?.statusCode, 409);
-  assert.match(firstError?.candidate?.id ?? "", /^integration_candidate:/);
-  assert.notEqual(firstError?.candidate?.planFingerprint, candidate.planFingerprint);
-  assert.deepEqual(firstError?.diff?.changedWorktrees.map((entry) => entry.worktreeId), ["wt:feature"]);
-  assert.deepEqual(firstError?.diff?.changedWorktrees[0].changes.map((change) => change.field), [
-    "statusSummary", "changedFiles"
-  ]);
-  assert.equal(firstError?.diff?.changed, true);
-  assert.deepEqual(store.listWorktreeIntegrationJobs("repository:1"), []);
-  assert.deepEqual(calls, []);
+test("starting an old candidate automatically builds the current input without another confirmation",async()=>{
+ const {service,worktrees}=memoryFixture();const candidate=await service.createCandidate("repository:1");
+ worktrees[1].statusSummary=" M feature.txt\n?? newly-added.txt";worktrees[1].changedFiles.push("newly-added.txt");
+ const job=await service.startCandidate("repository:1",{candidateId:candidate.id,candidateFingerprint:candidate.planFingerprint,idempotencyKey:"current-input"});
+ assert.equal(job.status,"queued");assert.ok(job.plan.items[1].changedFiles.includes("newly-added.txt"));
 });
 
-test("candidate diff reports plan context changes outside item and risk fields", async () => {
-  let inventoryVersion = "inventory:one";
-  const { service } = memoryFixture({
-    inspectRepository: async () => ({
-      repositoryId: "repository:1", inventoryVersion, mainWorktreeId: "wt:main",
-      mainPath: "/repo", mainHeadOid: "main:1", worktrees: [{
-        worktreeId: "wt:main", path: "/repo", isMain: true, availability: "available",
-        headOid: "main:1", branchName: "main", dirty: false, statusSummary: "", changedFiles: [],
-        aheadOfMain: 0, behindMain: 0, mergedIntoMain: true, isLocked: false, isPrunable: false,
-        isDetached: false, operationState: null, conflictFiles: [], sessions: []
-      }]
-    })
-  });
-  const candidate = await service.createCandidate("repository:1");
-  inventoryVersion = "inventory:two";
-  await assert.rejects(
-    () => service.startCandidate("repository:1", {
-      candidateId: candidate.id,
-      candidateFingerprint: candidate.planFingerprint,
-      idempotencyKey: "confirm:inventory-context"
-    }),
-    (error) => error.code === "PLAN_REFRESH_REQUIRED"
-      && error.diff.changed === true
-      && error.diff.contextChanges.some((change) => change.field === "inventoryVersion")
-  );
+test("a changed inventory version refreshes automatically even when no Git effect is needed",async()=>{
+ const {service}=memoryFixture({featureAlreadyMerged:true,featureDirty:false});
+ const candidate=await service.createCandidate("repository:1");
+ const job=await service.startCandidate("repository:1",{candidateId:candidate.id,candidateFingerprint:"old-inventory",idempotencyKey:"inventory-refresh"});
+ assert.equal(job.status,"completed");
 });
 
-test("expired candidates return a fresh bounded-TTL candidate without creating a job", async () => {
-  let clock = Date.parse("2026-10-01T00:00:00.000Z");
-  const { service, store } = memoryFixture({ candidateTtlMs: 1_000, now: () => clock });
-  const candidate = await service.createCandidate("repository:1");
-  assert.equal(candidate.ttlMs, 1_000);
-  clock += 1_001;
-
-  await assert.rejects(
-    () => service.startCandidate("repository:1", {
-      candidateId: candidate.id,
-      candidateFingerprint: candidate.planFingerprint,
-      idempotencyKey: "confirm:expired"
-    }),
-    (error) => error.code === "PLAN_REFRESH_REQUIRED"
-      && error.candidate.id !== candidate.id
-      && error.diff.changed === false
-  );
-  assert.deepEqual(store.listWorktreeIntegrationJobs("repository:1"), []);
+test("expired candidates execute the authorized current request without a refresh prompt",async()=>{
+ let clock=10000;const {service,store}=memoryFixture({candidateTtlMs:1000,now:()=>clock});
+ const candidate=await service.createCandidate("repository:1");clock+=2000;
+ const job=await service.startCandidate("repository:1",{candidateId:candidate.id,candidateFingerprint:candidate.planFingerprint,idempotencyKey:"expired-current"});
+ assert.equal(job.status,"queued");assert.equal(store.listWorktreeIntegrationJobs("repository:1").length,1);
 });
 
 test("candidate cache keeps at most eight entries per repository", async () => {
@@ -1128,9 +1342,8 @@ test("an awaiting-confirmation plan prevents duplicate preflight jobs", async ()
   const { service } = memoryFixture();
   const plan = await service.preflight("repository:1");
 
-  await assert.rejects(() => service.preflight("repository:1"), {
-    code: "INTEGRATION_JOB_ACTIVE"
-  });
+  const another=await service.preflight("repository:1");
+  assert.notEqual(another.id,plan.id);
   assert.equal(service.get(plan.id).id, plan.id);
 });
 
@@ -1178,10 +1391,9 @@ test("confirmation revalidates the reviewed plan before queuing any Git operatio
     planFingerprint: plan.planFingerprint
   });
 
-  assert.equal(stale.status, "awaiting_confirmation");
-  assert.equal(stale.phase, "plan_stale");
-  assert.equal(stale.audit.at(-1).code, "PLAN_STALE");
-  assert.deepEqual(calls, []);
+  assert.equal(stale.status,"queued");
+  assert.ok(stale.plan.items[1].changedFiles.includes("added-after-review.txt"));
+  await waitForJob(service,plan.id,"completed");
 });
 
 test("main changes introduced after review produce a recoverable stale plan without Git operations", async () => {
@@ -1196,11 +1408,9 @@ test("main changes introduced after review produce a recoverable stale plan with
     planFingerprint: plan.planFingerprint
   });
 
-  assert.equal(stale.status, "awaiting_confirmation");
-  assert.equal(stale.phase, "plan_stale");
-  assert.equal(stale.audit.at(-1).code, "MAIN_DIRTY");
-  assert.match(stale.error, /Nothing was changed/);
-  assert.deepEqual(calls, []);
+  assert.equal(stale.status,"queued");
+  await waitForJob(service,plan.id,"completed");
+  assert.equal(calls.includes("commit:/repo"),false);
 });
 
 test("a running task stops at the next safe boundary and automatically creates a fresh plan", async () => {
@@ -1685,7 +1895,7 @@ test("Markdown tracking approval during a main merge resumes the merge without i
 
   assert.equal(paused.phase, "awaiting_commit_policy_resolution");
   assert.equal(paused.commitPolicyBlocker.resumeStage, "merge_source");
-  assert.equal(paused.commitPolicyBlocker.decisionPath, "/repo");
+  assert.equal(paused.commitPolicyBlocker.decisionPath, "/repo-feature");
   assert.equal(paused.plan.items.find((item) => item.worktreeId === "wt:feature").commitStatus, "completed");
   assert.equal(paused.plan.items.find((item) => item.worktreeId === "wt:feature").mergeStatus, "blocked");
 
@@ -1696,7 +1906,7 @@ test("Markdown tracking approval during a main merge resumes the merge without i
   });
   const completed = await waitForJob(service, plan.id, "completed");
 
-  assert.equal(calls.filter((call) => call === "commit:/repo-feature").length, 1);
+  assert.equal(calls.filter((call) => call === "commit:/repo-feature").length, 2);
   assert.equal(calls.filter((call) => call.startsWith("merge:")).length, 2);
   assert.ok(calls.includes("track:docs/merge-report.md"));
   assert.equal(worktrees[0].dirty, false);
@@ -1826,8 +2036,8 @@ test("recoverable commit retry revalidates the protected-path digest", async () 
 
   assert.ok(paused.audit.some((entry) =>
     entry.event === "execution_paused" && entry.code === "PLAN_STALE"));
-  assert.equal(calls.filter((call) => call === "commit:/repo-feature").length, 1);
-  assert.equal(protectionInspections, 3);
+  assert.equal(calls.filter((call) => call === "commit:/repo-feature").length, 0);
+  assert.equal(protectionInspections, 4);
 });
 
 test("an unrelated Agent completion signal does not change a paused conflict task", async () => {
@@ -1849,7 +2059,42 @@ test("retry is rejected while the conflict Agent is still running", async () => 
   await service.resolveConflictWithAgent(plan.id);
 
   assert.throws(() => service.retry(plan.id), { code: "CONFLICT_AGENT_RUNNING" });
+  assert.ok(service.get(plan.id).availableActions.includes("cancel"));
   assert.equal(calls.filter((call) => call.startsWith("merge:")).length, 1);
+});
+
+test("a missing conflict Session exposes recovery instead of remaining running forever", async () => {
+  const { service, store } = memoryFixture({ conflictOnce: true, conflictSessionStatus: "running" });
+  const plan = await service.preflight("repository:1");
+  await service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint });
+  await waitForJob(service, plan.id, "paused");
+  await service.resolveConflictWithAgent(plan.id);
+  store.getSession = () => null;
+  const recovered = service.get(plan.id);
+  assert.equal(recovered.conflictResolution.status, "failed");
+  assert.equal(recovered.conflictResolution.failureCode, "CONFLICT_SESSION_MISSING");
+  assert.ok(recovered.availableActions.includes("resolve_conflict_with_agent"));
+  assert.ok(recovered.availableActions.includes("cancel"));
+});
+
+test("dispatch safety uses live Git conflicts after an external resolution", async () => {
+  const { service, store, worktrees } = memoryFixture({ featureDirty: false });
+  const plan = await service.preflight("repository:1");
+  const raw = store.getWorktreeIntegrationJob(plan.id);
+  store.updateWorktreeIntegrationJob(plan.id, { status: "paused", details: {
+    ...raw.details, plan: { ...raw.details.plan, items: raw.details.plan.items.map(item =>
+      item.isMain ? item : { ...item, mergeStatus: "conflict" }) }
+  } });
+  worktrees[0].operationState = "merge";
+  worktrees[0].conflictFiles = ["shared.txt"];
+  await service.reconcileDispatchSafety(plan.id);
+  assert.ok(service.get(plan.id).dispatchSafety.blockedWorktreeIds.includes("wt:main"));
+  worktrees[0].operationState = null;
+  worktrees[0].conflictFiles = [];
+  worktrees[0].headOid = "externally-resolved";
+  await service.reconcileDispatchSafety(plan.id);
+  assert.ok(!service.get(plan.id).dispatchSafety.blockedWorktreeIds.includes("wt:main"));
+  assert.ok(service.get(plan.id).dispatchSafety.safeWorktrees.some(tree => tree.worktreeId === "wt:main"));
 });
 
 test("one Agent trigger resolves successive conflicting Worktrees across the complete plan", async () => {
@@ -1967,16 +2212,20 @@ test("idle Session without a successful instruction and Turn does not promote an
   assert.equal(calls.some(call => call.startsWith("merge:integration:")), false);
 });
 
-test("presentation normalizes legacy numeric audit codes for strict clients", () => {
-  const presented = presentJob({
+test("presentation normalizes legacy numeric audit and conflict codes without rewriting stored history", () => {
+  const stored = {
     id: "worktree_integration:legacy-audit",
     status: "paused",
     phase: "failed",
     details: {
       audit: [{ at: "2026-10-14T08:02:57.000Z", event: "execution_paused", code: 128 }],
-      plan: { items: [] }
+      plan: { items: [] },
+      conflictAutomation: { status: "blocked", failureCode: 128, failureReason: "index lock" }
     }
-  });
+  };
+  const presented = presentJob(stored);
+  assert.equal(presented.conflictAutomation.failureCode, "PROCESS_EXIT_128");
+  assert.equal(stored.details.conflictAutomation.failureCode, 128);
   assert.equal(presented.audit[0].code, "PROCESS_EXIT_128");
   assert.doesNotThrow(() => JSON.stringify(presented));
 });
@@ -1997,14 +2246,10 @@ test("an externally resolved conflict is detected and the paused job resumes ide
   assert.ok(completed.audit.some((entry) => entry.event === "external_conflict_resolution_detected"));
 });
 
-test("blocking preflight risks cannot be confirmed", async () => {
-  const { service } = memoryFixture({ blockingRisk: true });
-  const plan = await service.preflight("repository:1");
-  assert.equal(plan.plan.blockingRisks[0].code, "WORKTREE_LOCKED");
-  await assert.rejects(
-    () => service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint }),
-    { code: "PREFLIGHT_RISKS_UNRESOLVED" }
-  );
+test("a Worktree lock marker alone does not block authorized Git integration",async()=>{
+ const {service}=memoryFixture({blockingRisk:true});const plan=await service.preflight("repository:1");
+ assert.equal(plan.plan.blockingRisks.length,0);await service.confirm(plan.id,{});
+ assert.equal((await waitForJob(service,plan.id,"completed")).status,"completed");
 });
 
 test("active Sessions block integration until their run stops", async () => {
@@ -2056,23 +2301,11 @@ test("preflight completes when all task Worktrees are already integrated and mai
   assert.equal(plan.status, "completed");
 });
 
-test("dirty main is detected as a read-only blocker and is never committed", async () => {
-  const { service, calls, worktrees } = memoryFixture({ mainDirty: true });
-  const before = structuredClone(worktrees[0]);
-  const plan = await service.preflight("repository:1");
-  const main = plan.plan.items.find((item) => item.isMain);
-
-  assert.equal(plan.status, "awaiting_confirmation");
-  assert.equal(main.dirty, true);
-  assert.equal(main.commitStatus, "not_needed");
-  assert.equal(main.commitMessage, null);
-  assert.equal(plan.plan.blockingRisks.some((risk) => risk.code === "MAIN_UNCOMMITTED_CHANGES"), true);
-  await assert.rejects(
-    () => service.confirm(plan.id, { confirmed: true, planFingerprint: plan.planFingerprint }),
-    { code: "PREFLIGHT_RISKS_UNRESOLVED" }
-  );
-  assert.deepEqual(calls, []);
-  assert.deepEqual(worktrees[0], before);
+test("dirty main uses the Git preservation path without an automatic source commit on main",async()=>{
+ const {service,calls}=memoryFixture({mainDirty:true});const plan=await service.preflight("repository:1");
+ assert.equal(plan.plan.items[0].commitStatus,"not_needed");assert.equal(plan.plan.blockingRisks.length,0);
+ await service.confirm(plan.id,{});await waitForJob(service,plan.id,"completed");
+ assert.equal(calls.includes("commit:/repo"),false);
 });
 
 test("task conflicts and dirty main are reported together without mutating either workspace", async () => {
@@ -2081,7 +2314,7 @@ test("task conflicts and dirty main are reported together without mutating eithe
   const plan = await service.preflight("repository:1");
   const codes = new Set(plan.plan.blockingRisks.map((risk) => risk.code));
 
-  assert.equal(codes.has("MAIN_UNCOMMITTED_CHANGES"), true);
+  assert.equal(codes.has("MAIN_UNCOMMITTED_CHANGES"), false);
   assert.equal(codes.has("UNRESOLVED_CONFLICTS"), true);
   assert.equal(codes.has("GIT_OPERATION_IN_PROGRESS"), true);
   const canceled = await service.cancel(plan.id);
@@ -2249,6 +2482,17 @@ test("integration job, per-item state, and audit survive Store restart", async (
       details: { plan: { items: [{ worktreeId: "wt:1", mergeStatus: "conflict" }] }, audit: [{ event: "paused" }] }
     });
     store.updateWorktreeIntegrationJob(created.id, { status: "queued", phase: "recovery_queued" });
+    const records = { completionEvidence: { schemaVersion: 1, mainWorktreeId: "wt:main", mainHead: "verified-head",
+      verifiedAt: "now", verifiedHeads: ["source-head"] },
+      cleanupResult: { schemaVersion: 1, status: "completed", restoredHead: "restored-head" },
+      failureDiagnostic: { schemaVersion: 1, message: "last diagnostic\n".repeat(1_000) + "FINAL_LINE" } };
+    store.updateWorktreeIntegrationJob(created.id, { details: { ...created.details, ...records } });
+    assert.throws(() => store.runInTransaction(() => {
+      store.updateWorktreeIntegrationJob(created.id, { status: "completed", details: { ...created.details, completionEvidence: null } });
+      throw new Error("rollback completion write");
+    }), /rollback completion write/);
+    assert.equal(store.getWorktreeIntegrationJob(created.id).status, "queued");
+    assert.deepEqual(store.getWorktreeIntegrationJob(created.id).details.completionEvidence, records.completionEvidence);
     const stopping = store.createWorktreeIntegrationJob({
       repositoryId: "repository:stopping", planFingerprint: "stopping-fingerprint",
       details: { plan: { items: [] }, replanAfterCancel: true, audit: [{ event: "cancellation_requested" }] }
@@ -2281,6 +2525,9 @@ test("integration job, per-item state, and audit survive Store restart", async (
     const recoveredAutomatic = recovered.find((job) => job.id === automatic.id);
     assert.equal(recoveredQueued.details.plan.items[0].mergeStatus, "conflict");
     assert.equal(recoveredQueued.idempotencyKey, "confirm:persisted");
+    assert.deepEqual(recoveredQueued.details.completionEvidence, records.completionEvidence);
+    assert.deepEqual(recoveredQueued.details.cleanupResult, records.cleanupResult);
+    assert.equal(recoveredQueued.details.failureDiagnostic.message, records.failureDiagnostic.message);
     assert.deepEqual(recoveredQueued.details.audit, [{ event: "paused" }]);
     assert.equal(recoveredStopping.details.replanAfterCancel, true);
     assert.equal(recoveredAutomatic.details.conflictAutomation.status, "running");
@@ -2291,4 +2538,22 @@ test("integration job, per-item state, and audit survive Store restart", async (
     await store.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("stale cleanup requires its explicit action and stays outside merged cleanup", async () => {
+  const { service, worktrees, calls } = memoryFixture({ featureAlreadyMerged: true, featureDirty: false });
+  Object.assign(worktrees[1], { availability: "missing", isPrunable: true, dirty: null, mergedIntoMain: null,
+    isDetached: true, branchName: null, cleanupAction: { kind: "remove_stale_registration", available: true } });
+  service.removeStaleRegistration = async input => { calls.push(`registration:${input.worktreeId}`); return { registrationOnly: true, branchDeleted: false }; };
+  const detail = await service.repository("repository:1");
+  assert.equal(detail.project.worktrees[1].cleanupAction.available, true);
+  await assert.rejects(service.deleteWorktree("repository:1", "wt:feature"), { code: "WORKTREE_SCOPE_CHANGED" });
+  const batch = await service.cleanupMergedWorktrees("repository:1", { worktreeIds: ["wt:feature"] });
+  assert.equal(batch.counts.removed, 0);
+  const result = await service.deleteWorktree("repository:1", "wt:feature", { action: "remove_stale_registration" });
+  assert.equal(result.removal.branchDeleted, false);
+  assert.deepEqual(calls, ["registration:wt:feature"]);
+  Object.assign(worktrees[1], { availability: "available", isPrunable: false, dirty: false, mergedIntoMain: true,
+    isDetached: false, branchName: "feature", cleanupAction: null });
+  await assert.rejects(service.deleteWorktree("repository:1", "wt:feature", { action: "remove_stale_registration" }), { code: "WORKTREE_SCOPE_CHANGED" });
 });

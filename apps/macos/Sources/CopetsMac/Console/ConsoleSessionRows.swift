@@ -8,6 +8,11 @@ struct WorkRailUnreadSummary: Equatable {
     let hasUnreadAssistantSessions: Bool
     let workIDs: Set<String>
 
+    init(hasUnreadAssistantSessions: Bool, workIDs: Set<String>) {
+        self.hasUnreadAssistantSessions = hasUnreadAssistantSessions
+        self.workIDs = workIDs
+    }
+
     init(sessions: [TaskSession]) {
         var hasUnreadAssistantSessions = false
         var workIDs = Set<String>()
@@ -74,6 +79,8 @@ struct SessionSidebarFunctionBarGlassModifier: ViewModifier {
 /// so switching between the two groups does not change navigation density. It
 /// observes the stable row model directly so content-only patches stay local.
 struct ConsoleSessionRow: View {
+    var showsHoverFeedback = true
+    var isActive = true
     @ObservedObject var row: SessionRowModel
     @EnvironmentObject private var backendClient: BackendClient
     @State private var isRenaming = false
@@ -85,17 +92,24 @@ struct ConsoleSessionRow: View {
             selectionRequested(session)
         } label: {
             HStack(spacing: 9) {
-                Circle()
-                    .fill(session.executionTaskStatus.color)
-                    .frame(width: 7, height: 7)
-                    .accessibilityLabel(session.executionTaskStatus.label)
-                Text(row.listTitle)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(row.listTitle)
+                        .font(WorkbenchTypography.font(for: .navigation))
+                        .lineLimit(1)
+                }
                 Spacer(minLength: 0)
+                if (session.mailboxPendingCount ?? 0) > 0 {
+                    Image(systemName: "envelope.badge").font(.caption2).foregroundStyle(.secondary)
+                        .accessibilityLabel("信箱有待处理消息")
+                }
+                if [.running, .blocked, .failed].contains(session.executionTaskStatus) {
+                    TaskActivityIndicator(activity: .resolve(hasBinding: true,
+                        sessionExecutionStatus: session.executionTaskStatus.rawValue, taskExecutionStatus: nil),
+                        isActive: isActive)
+                }
                 if isSessionUnread(session) {
                     Circle()
-                        .fill(Color.red)
+                        .fill(Color.accentColor)
                         .frame(width: 8, height: 8)
                         .accessibilityLabel(L10n("Unread Session"))
                         .help(L10n("Unread Session"))
@@ -104,7 +118,8 @@ struct ConsoleSessionRow: View {
             .padding(.vertical, 4)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SessionSelectionPressStyle())
+        .consoleHoverFeedback(enabled: showsHoverFeedback)
         .contextMenu {
             SessionContextMenuContent(session: session, isRenaming: $isRenaming)
         }
@@ -117,6 +132,8 @@ struct ConsoleSessionRow: View {
 }
 
 struct ConsoleWorkChatRowContent: View {
+    var isActive = true
+    var showsHoverFeedback = true
     @ObservedObject var row: SessionRowModel
     let isSelected: Bool
     let onSelect: () -> Void
@@ -125,17 +142,24 @@ struct ConsoleWorkChatRowContent: View {
         let session = row.session
         Button(action: onSelect) {
             HStack(spacing: 9) {
-                Circle()
-                    .fill(session.executionTaskStatus.color)
-                    .frame(width: 7, height: 7)
-                    .accessibilityLabel(session.executionTaskStatus.label)
-                Text(row.listTitle)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
+                HStack(spacing: 7) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.system(size: 13))
+                        .frame(width: 18)
+                        .foregroundStyle(.secondary)
+                    Text(L10n("Work Chat"))
+                        .font(WorkbenchTypography.font(for: .navigation))
+                        .lineLimit(1)
+                }
                 Spacer(minLength: 0)
+                if [.running, .blocked, .failed].contains(session.executionTaskStatus) {
+                    TaskActivityIndicator(activity: .resolve(hasBinding: true,
+                        sessionExecutionStatus: session.executionTaskStatus.rawValue, taskExecutionStatus: nil),
+                        isActive: isActive)
+                }
                 if isSessionUnread(session) {
                     Circle()
-                        .fill(Color.red)
+                        .fill(Color.accentColor)
                         .frame(width: 8, height: 8)
                         .accessibilityLabel(L10n("Unread Session"))
                         .help(L10n("Unread Session"))
@@ -144,37 +168,44 @@ struct ConsoleWorkChatRowContent: View {
             .padding(.vertical, 4)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .accessibilityLabel(L10n("Open Work Chat"))
+        .accessibilityIdentifier("console.work-chat." + (session.workId ?? session.id))
+        .buttonStyle(SessionSelectionPressStyle())
+        .consoleHoverFeedback(enabled: showsHoverFeedback)
         .listRowBackground(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.09) : Color.clear)
+                .fill(isSelected ? Color.primary.opacity(0.055) : Color.clear)
                 .padding(.horizontal, 8)
         )
     }
 }
 
 struct ConsoleTaskRowContent: View {
+    var showsHoverFeedback = true
     let task: CorptieTask
     let sessionActivity: TaskSessionActivity
+    var session: TaskSession? = nil
     let isSelected: Bool
     let isUnread: Bool
+    var isActive = true
     let onOpen: () -> Void
 
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: 9) {
-                TaskActivityIndicator(
-                    activity: sessionActivity,
-                    lifecycleState: task.lifecycleState,
-                    label: L10nFormat("Session: %@", sessionActivity.label)
-                )
-                Text(task.title)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(task.title)
+                        .font(WorkbenchTypography.font(for: .navigation))
+                        .lineLimit(1)
+                }
                 if task.hasPendingScheduledWake == true {
                     ConsoleScheduledWakeIcon()
                 }
                 Spacer(minLength: 0)
+                if [.processing, .waitingForInput, .paused, .failed].contains(sessionActivity) {
+                    TaskActivityIndicator(activity: sessionActivity, lifecycleState: task.lifecycleState,
+                        label: L10nFormat("Session: %@", sessionActivity.label), isActive: isActive)
+                }
                 if task.deletionStatus == "deleting" {
                     ProgressView()
                         .controlSize(.mini)
@@ -182,7 +213,7 @@ struct ConsoleTaskRowContent: View {
                 }
                 if isUnread {
                     Circle()
-                        .fill(Color.red)
+                        .fill(Color.accentColor)
                         .frame(width: 8, height: 8)
                         .accessibilityLabel(L10n("Unread Session"))
                         .help(L10n("Unread Session"))
@@ -191,11 +222,13 @@ struct ConsoleTaskRowContent: View {
             .padding(.vertical, 4)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SessionSelectionPressStyle())
+        .consoleHoverFeedback(enabled: showsHoverFeedback)
         .disabled(task.deletionStatus == "deleting")
+        .help([task.title, sessionActivity.label, session?.external?.provider].compactMap { $0 }.joined(separator: " · "))
         .listRowBackground(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.09) : Color.clear)
+                .fill(isSelected ? Color.primary.opacity(0.055) : Color.clear)
                 .padding(.horizontal, 8)
         )
     }

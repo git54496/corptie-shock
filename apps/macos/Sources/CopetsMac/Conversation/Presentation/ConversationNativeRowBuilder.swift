@@ -32,7 +32,7 @@ struct ConversationNativeRowBuilder {
                     activeTurnID = nil
                     continue
                 }
-                guard (kind == .agentMessage || item.isStandaloneImage), item.messageOrigin != "scheduled_task" else { continue }
+                guard kind == .agentMessage, item.messageOrigin != "scheduled_task" else { continue }
             case .process: break
             }
             let newTurn = !hasReply || (!turnID.isEmpty && activeTurnID != nil && activeTurnID != turnID)
@@ -84,11 +84,14 @@ struct ConversationNativeRowBuilder {
         var scheduledTrigger: ScheduledTriggerPresentation?
         switch entry.kind {
         case .message(let item):
-            messageStatus = item.type == "userMessage" ? UserMessageStatusPresentation(
+            let presentationKind = ConversationPresentationKind.resolve(type: item.type, presentationRole: item.presentationRole)
+            let isCollaborationMessage = presentationKind == .collaborationMessage || presentationKind == .collaborationConfirmation
+            messageStatus = presentationKind == .userMessage ? UserMessageStatusPresentation(
                 authoritativeStatus: item.userMessageStatus,
                 legacyStatus: item.status,
                 queuePosition: item.queuePosition,
-                processingError: item.processingError
+                processingError: item.processingError,
+                showsPendingAsProcessing: true
             ) : nil
             images = (item.images ?? []).map { image in
                 ChatTimelineImage(
@@ -108,7 +111,7 @@ struct ConversationNativeRowBuilder {
                 let id = ScheduledTriggerPresentation.expansionID(for: item.id)
                 scheduledTrigger = .init(text: specialEvent.messageText, isExpanded: expandedTurnIds.contains(id), expansionID: id)
             }
-            style = collaboration == nil && specialEvent == nil && item.type == "userMessage" ? .user : .agent
+            style = !isCollaborationMessage && specialEvent == nil && item.type == "userMessage" ? .user : .agent
             copyText = item.type == "userInput" && item.userInput?.schemaVersion == 1
                 ? item.userInput.map(userInputCopyText) ?? ChatTimelineRowRouting.copyText(for: item)
                 : collaboration?.messageText ?? specialEvent?.messageText
@@ -134,14 +137,13 @@ struct ConversationNativeRowBuilder {
                 )
             })
             text = ClickableMessageText.markdown(
-                from: item.isStandaloneImage ? "" :
-                    MessageImageGalleryLayout.bodyText(ConversationMessageImageReference.removing(
+                from: MessageImageGalleryLayout.bodyText(ConversationMessageImageReference.removing(
                         parsedImages.filter { markdownImageSources.contains($0.source) },
                         from: presentedText), hasImages: !images.isEmpty),
                 baseDirectory: workingDirectory
             )
-            let isOrdinaryMessage = collaboration == nil && specialEvent == nil
-                && (item.type == "userMessage" || item.type == "agentMessage" || item.isStandaloneImage)
+            let isOrdinaryMessage = !isCollaborationMessage && specialEvent == nil
+                && (item.type == "userMessage" || item.type == "agentMessage")
             let scheduledSource = item.messageOrigin == "scheduled_task"
                 ? ConversationEventText(languageCode: AppLanguageController.shared.languageCode).messageSource(name: item.automationName) : nil
             title = scheduledSource ?? collaboration?.title ?? specialEvent?.title ?? (isOrdinaryMessage ? "" : item.title)
@@ -151,8 +153,12 @@ struct ConversationNativeRowBuilder {
             messageDate = isOrdinaryMessage
                 ? item.createdAt.flatMap(ISO8601DateFormatter.corptieThreadItemDate(from:))
                 : nil
-            expandableTurnId = scheduledTrigger?.expansionID
-            isExpanded = false
+            // Reuse the existing per-message disclosure key and revision path;
+            // its historical helper name does not change checklist semantics.
+            let checklistDisclosureID = item.executionPlan?.taskId == nil ? nil
+                : ScheduledTriggerPresentation.expansionID(for: item.id)
+            expandableTurnId = scheduledTrigger?.expansionID ?? checklistDisclosureID
+            isExpanded = checklistDisclosureID.map { expandedTurnIds.contains($0) } ?? false
             processCount = nil
             processDuration = nil
             processStartedAt = nil
@@ -162,12 +168,12 @@ struct ConversationNativeRowBuilder {
             showsCollaborationSentStatus = collaboration != nil
                 && (item.collaborationConfirmationStatus ?? item.status ?? "").lowercased() == "confirmed"
             rawStatusText = ""
-            isCollaboration = collaboration != nil
+            isCollaboration = isCollaborationMessage
             collaborationRoute = collaboration?.route
         case .process(let turnId, let items):
             messageStatus = nil
             processPlan = items.compactMap(\.executionPlan).last(where: { $0.schemaVersion == 1 })
-            images = items.flatMap { item in
+            images = items.filter { $0.type != "imageView" }.flatMap { item in
                 (item.images ?? []).map { image in
                     ChatTimelineImage(
                         managedPath: image.managedPath,
@@ -214,6 +220,8 @@ struct ConversationNativeRowBuilder {
                 } else {
                     processCurrentStepTitle = L10n(NativeExecutionTimelineProjection.title(for: last))
                 }
+            } else if processState == .failed {
+                processCurrentStepTitle = L10n("展开查看失败原因与诊断")
             }
             showsHeader = false
             contextTimestamp = ""
@@ -253,6 +261,10 @@ struct ConversationNativeRowBuilder {
             messageStatus: messageStatus,
             images: images
         )
+        if case .message(let item) = entry.kind, let progress = item.coordinationProgress {
+            row.coordinationProgress = progress
+            row.contentRevision = progress.revision
+        }
         row.forkItemID = forkItemID(for: entry)
         row.scheduledTrigger = scheduledTrigger
         if case .message(let item) = entry.kind, item.messageOrigin == "scheduled_task" {
@@ -279,7 +291,7 @@ struct ConversationNativeRowBuilder {
                 row.userInput = item.userInput
                 row.userInputItemID = item.id
                 row.userInputStatus = item.status
-            } else if (item.type == "executionPlan" || item.type == "plan"),
+            } else if (item.type == "executionPlan" || item.type == "plan" || item.type == "executionChecklist"),
                       let plan = item.executionPlan, plan.schemaVersion == 1 {
                 row.executionPlan = plan
             }
@@ -371,7 +383,8 @@ struct ConversationNativeRowBuilder {
         if ConversationPresentationKind.resolve(
             type: item.type, presentationRole: item.presentationRole) == .collaborationConfirmation,
            (item.collaborationConfirmationStatus ?? item.status ?? "pending").lowercased() == "pending",
-           let confirmationID = item.collaborationConfirmationId {
+           let confirmationID = item.collaborationConfirmationId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !confirmationID.isEmpty {
             return [
                 .init(
                     id: "\(item.id):confirm",

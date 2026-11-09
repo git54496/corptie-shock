@@ -42,6 +42,7 @@ final class WorktreeManagementClient: ObservableObject {
     private var repositoryListMilliseconds = 0
     private var lastAutomaticRefreshAt: Date?
     private var gitHubPushInspectionTask: Task<Void, Never>?
+    private var eventRecoveryInFlight = false
     private let logger = Logger(subsystem: "com.corptie.mac", category: "WorktreeLoad")
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -114,6 +115,7 @@ final class WorktreeManagementClient: ObservableObject {
             }
             lastAutomaticRefreshAt = now()
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.loadRepositories")
             guard !Self.isCancellation(error) else { return }
             errorMessage = error.localizedDescription
             if detail == nil { listLoadState = .failed(error.localizedDescription) }
@@ -146,6 +148,43 @@ final class WorktreeManagementClient: ObservableObject {
             return
         }
         await loadRepository(repositoryId, force: true)
+    }
+
+    /// The existing event stream owns live updates, including paused Jobs.
+    /// Decode once off the UI thread and reuse the result for notifications.
+    func receiveJobEvent(_ data: String) async -> Bool {
+        let next = await Task.detached(priority: .utility) {
+            struct Envelope: Decodable { let payload: WorktreeIntegrationJobEnvelope }
+            guard let bytes = data.data(using: .utf8) else { return nil as WorktreeIntegrationJob? }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try? decoder.decode(Envelope.self, from: bytes).payload.job
+        }.value
+        guard let next else { return false }
+        if let notification = next.notification { OperationNotificationManager.shared.observe(notification) }
+        detailCache.removeValue(forKey: next.repositoryId)
+        guard selection.repositoryId == next.repositoryId else { return true }
+        guard !rejectsJobSnapshot(next) else { return true }
+        let becameTerminal = ["completed", "canceled"].contains(next.status)
+            && (job?.id != next.id || job?.status != next.status)
+        if job != next { applyJob(next) }
+        if becameTerminal, detail != nil {
+            // Publish completion before asynchronously refreshing Git inventory.
+            Task { [weak self] in
+                guard let self, self.selection.repositoryId == next.repositoryId else { return }
+                // Terminal events must not be dropped while a user action is
+                // still unwinding. Read fresh inventory without blocking UI.
+                await self.loadRepository(next.repositoryId, force: true, presentsLoadingState: false)
+            }
+        }
+        return true
+    }
+
+    func recoverAfterEventGap() async {
+        guard selection.repositoryId != nil, !isMutating, !eventRecoveryInFlight else { return }
+        eventRecoveryInFlight = true
+        defer { eventRecoveryInFlight = false }
+        await refreshSelected()
     }
 
     @discardableResult
@@ -211,6 +250,7 @@ final class WorktreeManagementClient: ObservableObject {
             }
             return false
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.navigate")
             guard !Self.isCancellation(error) else { return false }
             errorMessage = error.localizedDescription
             if detail == nil { listLoadState = .failed(error.localizedDescription) }
@@ -261,6 +301,7 @@ final class WorktreeManagementClient: ObservableObject {
             }
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.handleGitOperation")
             errorMessage = error.localizedDescription
             detailCache.removeValue(forKey: repositoryId)
             await loadRepository(repositoryId, force: true)
@@ -295,40 +336,44 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             await loadRepository(repositoryId, force: true)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.pushWorktreeToGitHub")
             OperationNotificationManager.shared.complete(.init(category: .gitPush, outcome: OperationNotificationOutcome.errorOutcome(error), name: "Git push", summary: worktree.branchName ?? "", repositoryID: repositoryId, worktreeID: worktree.worktreeId))
             errorMessage = error.localizedDescription
         }
     }
 
     @discardableResult
-    func deleteWorktree(_ worktree: ManagedWorktree) async -> Bool {
-        guard let repositoryId = selection.repositoryId else { return false }
+    func deleteWorktree(_ worktree: ManagedWorktree, expectedRepositoryID: String? = nil) async -> Bool {
+        guard !isMutating, let repositoryId = selection.repositoryId,
+              expectedRepositoryID == nil || repositoryId == expectedRepositoryID else { return false }
         operationNotice = nil
         isMutating = true
         defer { isMutating = false }
         do {
             let envelope: WorktreeDeletionResultEnvelope = try await post(
                 "worktree-management/repositories/\(repositoryId)/worktrees/\(worktree.worktreeId)/delete",
-                body: [:]
+                body: ["action": worktree.isStaleRegistration ? "remove_stale_registration" : "remove_worktree"]
             )
-            operationNoticeTitle = "Worktree deleted"
-            operationNotice = L10nFormat(
+            operationNoticeTitle = worktree.isStaleRegistration ? "Stale registration cleaned" : "Worktree deleted"
+            operationNotice = worktree.isStaleRegistration ? L10n("The stale Git registration was removed. Local branches were retained.") : L10nFormat(
                 "Removed %@ and its local branch.",
                 envelope.result.branchName ?? envelope.result.path
             )
             OperationNotificationManager.shared.complete(.init(category: .worktree, outcome: .succeeded, name: "Worktree cleanup", repositoryID: repositoryId))
             errorMessage = nil
-            await loadRepository(repositoryId)
+            await loadRepository(repositoryId, force: true)
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.deleteWorktree")
             OperationNotificationManager.shared.complete(.init(category: .worktree, outcome: OperationNotificationOutcome.errorOutcome(error), name: "Worktree cleanup", repositoryID: repositoryId))
             errorMessage = error.localizedDescription
             return false
         }
     }
 
-    func cleanupMergedWorktrees(_ worktrees: [ManagedWorktree]) async {
-        guard let repositoryId = selection.repositoryId,
+    func cleanupMergedWorktrees(_ worktrees: [ManagedWorktree], expectedRepositoryID: String? = nil) async {
+        guard !isMutating, let repositoryId = selection.repositoryId,
+              expectedRepositoryID == nil || repositoryId == expectedRepositoryID,
               let project = detail?.project,
               !worktrees.isEmpty else { return }
         cleanupResult = nil
@@ -365,10 +410,11 @@ final class WorktreeManagementClient: ObservableObject {
             do {
                 let envelope: WorktreeDeletionResultEnvelope = try await post(
                     "worktree-management/repositories/\(repositoryId)/worktrees/\(worktree.worktreeId)/delete",
-                    body: [:]
+                    body: ["action": worktree.isStaleRegistration ? "remove_stale_registration" : "remove_worktree"]
                 )
                 removed.append(envelope.result)
             } catch {
+                ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.cleanupMergedWorktrees")
                 let clientError = error as? WorktreeManagementClientError
                 let code = clientError?.code ?? "WORKTREE_DELETE_FAILED"
                 let result = WorktreeDeletionResult(
@@ -423,6 +469,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             return preparation.result.value
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.prepareIndividualOperation")
             individualPreparationError = error.localizedDescription
             errorMessage = nil
             return nil
@@ -439,6 +486,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             return message.result.commitMessage
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.generateIndividualCommitMessage")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -487,6 +535,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.executeIndividualOperation")
             let operationError = error.localizedDescription
             if !Self.isCancellation(error) {
                 OperationNotificationManager.shared.complete(.init(category: .worktree,
@@ -539,6 +588,7 @@ final class WorktreeManagementClient: ObservableObject {
             await loadRepository(repositoryId, force: true)
             return .completed
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.commitMainWorktreeChanges")
             errorMessage = nil
             let clientError = error as? WorktreeManagementClientError
             let requiresReview = ["COMMIT_REVIEW_CHANGED", "COMMIT_REVIEW_EXPIRED", "COMMIT_REQUEST_CHANGED", "COMMIT_REVIEW_SCOPE_MISMATCH", "COMMIT_OUTCOME_UNKNOWN", "COMMIT_POLICY_STAGED_CONTENT_CHANGED"].contains(clientError?.code ?? "")
@@ -592,10 +642,12 @@ final class WorktreeManagementClient: ObservableObject {
 
     func prepareHierarchyOperation(_ tree: ManagedWorktree, action: String, receiptID: String? = nil) async {
         guard let h=tree.hierarchy, let project=detail?.project else { return }
-        let children=project.worktrees.filter { $0.hierarchy?.parentTaskId == h.rootTaskId }.map(\.worktreeId)
-        let sources = ["merge_children","sync_children"].contains(action) ? (h.role == "child" ? [tree.worktreeId] : children) : [tree.worktreeId]
-        let target = ["merge_children","sync_children"].contains(action) ? (h.parentWorktreeId ?? tree.worktreeId) : project.mainWorktreeId
-        await prepareBranchOperation(operationType: ["sync_children","sync_main"].contains(action) ? "sync" : "merge",
+        let own = action == "merge_own_children" || action == "sync_own_children"
+        let normalized = action.replacingOccurrences(of: "_own_", with: "_")
+        let children=project.worktrees.filter { $0.hierarchy?.parentTaskId == (own ? h.taskId : h.rootTaskId) }.map(\.worktreeId)
+        let sources = ["merge_children","sync_children"].contains(normalized) ? (!own && h.role == "child" ? [tree.worktreeId] : children) : [tree.worktreeId]
+        let target = ["merge_children","sync_children"].contains(normalized) ? (own ? tree.worktreeId : h.parentWorktreeId ?? tree.worktreeId) : project.mainWorktreeId
+        await prepareBranchOperation(operationType: ["sync_children","sync_main"].contains(normalized) ? "sync" : "merge",
             sourceWorktreeIds:sources,targetWorktreeId:target,taskScope:h.scope(action,receiptId:receiptID),syncStrategy:action == "sync_main" ? "merge" : nil)
     }
 
@@ -692,6 +744,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             return false
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.confirmPlan")
             errorMessage = error.localizedDescription
             return false
         }
@@ -727,6 +780,7 @@ final class WorktreeManagementClient: ObservableObject {
                 wasRefreshed: false
             ))
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.prepareCandidate")
             guard planPreparationId == preparationId else { return }
             let message = error.localizedDescription
             setCandidateReview(WorktreeIntegrationCandidateReviewState(
@@ -744,19 +798,120 @@ final class WorktreeManagementClient: ObservableObject {
         candidateReview = review
     }
 
-    func cancelIntegration() async {
-        guard let job, job.canCancel else { return }
-        await mutate {
-            let envelope: WorktreeIntegrationJobEnvelope = try await self.post(
-                "worktree-management/jobs/\(job.id)/cancel",
-                body: ["replan": false]
-            )
-            self.applyJob(envelope.job)
+    func prepareRollbackReview(expectedJobID: String) async throws -> (ClientWorktreeRollbackPreview?, Bool) {
+        guard let current = job, current.id == expectedJobID else {
+            throw WorktreeManagementClientError(message: "任务已变化，请返回当前任务。", code: "JOB_STATE_CHANGED")
+        }
+        struct Envelope: Decodable { let job: WorktreeIntegrationJob; let rollback: ClientWorktreeRollbackPreview? }
+        let result: Envelope = try await post("worktree-management/jobs/\(expectedJobID)/cancel-preview", body: [:])
+        guard selection.repositoryId == current.repositoryId, job?.id == expectedJobID else {
+            throw WorktreeManagementClientError(message: "仓库或任务已变化，请返回当前任务。", code: "JOB_STATE_CHANGED")
+        }
+        detailCache.removeValue(forKey: current.repositoryId)
+        applyJob(result.job)
+        return (result.rollback, !["completed", "canceled"].contains(result.job.status))
+    }
+
+    func resumeRollbackReview(expectedJobID: String) async throws {
+        guard job?.id == expectedJobID, !isMutating else {
+            throw WorktreeManagementClientError(message: "任务已变化，请返回当前任务。", code: "JOB_STATE_CHANGED")
+        }
+        isMutating = true
+        defer { isMutating = false }
+        do {
+            let result: WorktreeIntegrationJobEnvelope = try await post("worktree-management/jobs/\(expectedJobID)/resume", body: [:])
+            guard job?.id == expectedJobID else { return }
+            detailCache.removeValue(forKey: result.job.repositoryId)
+            applyJob(result.job)
+            errorMessage = nil
+        } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.resumeRollbackReview")
+            errorMessage = error.localizedDescription
+            throw error
+        }
+    }
+
+    func confirmRollback(expectedJobID: String, reviewID: String, discardChanges: Bool,
+                         includeAdditionalCommits: Bool) async throws {
+        guard job?.id == expectedJobID, !isMutating else {
+            throw WorktreeManagementClientError(message: "任务已变化，请刷新回滚范围。", code: "JOB_STATE_CHANGED")
+        }
+        isMutating = true
+        defer { isMutating = false }
+        let result: WorktreeIntegrationJobEnvelope = try await post("worktree-management/jobs/\(expectedJobID)/rollback",
+            body: ["confirmed": true, "reviewId": reviewID, "discardChanges": discardChanges,
+                   "includeAdditionalCommits": includeAdditionalCommits])
+        guard job?.id == expectedJobID else { return }
+        detailCache.removeValue(forKey: result.job.repositoryId)
+        applyJob(result.job)
+        if result.job.status != "canceled" {
+            throw WorktreeManagementClientError(message: result.job.diagnosticText ?? result.job.error ?? "回滚未完成，请重新核对范围。", code: nil)
+        }
+        operationNotice = "本次合并已取消并回滚，来源 Worktree 的提交已保留。"
+        await refreshSelected()
+    }
+
+    func cancelIntegration(expectedJobID: String) async {
+        guard !isMutating else {
+            errorMessage = L10n("正在处理另一个 Worktree 操作，请稍后重试。")
+            return
+        }
+        guard let current = job, current.id == expectedJobID else {
+            errorMessage = L10n("任务状态已变化，请刷新并使用当前可用操作。")
+            return
+        }
+        if ["completed", "canceled"].contains(current.status) {
+            detailCache.removeValue(forKey: current.repositoryId)
+            errorMessage = nil
+            operationNoticeTitle = "Worktree operation completed"
+            operationNotice = L10n(current.status == "completed" ? "合并已完成，无需取消。" : "合并已取消。")
+            return
+        }
+        guard current.canCancel else {
+            errorMessage = current.recovery?.message ?? L10n("任务状态已变化，请刷新并使用当前可用操作。")
+            return
+        }
+        let repositoryID = selection.repositoryId
+        isMutating = true
+        errorMessage = nil
+        defer { isMutating = false }
+        do {
+            let envelope: WorktreeIntegrationJobEnvelope
+            var rejection: WorktreeManagementClientError?
+            do {
+                envelope = try await post("worktree-management/jobs/\(current.id)/cancel", body: ["replan": false])
+            } catch let failure as WorktreeManagementClientError where failure.code == "JOB_NOT_CANCELABLE" {
+                // Older backends reject a stale completed-job cancellation.
+                // Reconcile only that exact Job; do not rescan Git or retry a
+                // mutation against whichever Job has since become current.
+                envelope = try await get("worktree-management/jobs/\(current.id)")
+                if !["completed", "canceled"].contains(envelope.job.status) { rejection = failure }
+            }
+            guard selection.repositoryId == repositoryID, job?.id == current.id else { return }
+            guard envelope.job.id == current.id else {
+                errorMessage = L10n("任务状态已变化，请刷新并使用当前可用操作。")
+                return
+            }
+            detailCache.removeValue(forKey: current.repositoryId)
+            applyJob(envelope.job)
+            if let rejection { throw rejection }
+            if ["completed", "canceled"].contains(envelope.job.status) {
+                operationNoticeTitle = "Worktree operation completed"
+                operationNotice = L10n(envelope.job.status == "completed" ? "合并已完成，无需取消。" : "合并已取消。")
+            }
+        } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.cancelIntegration")
+            guard selection.repositoryId == repositoryID, job?.id == current.id else { return }
+            errorMessage = error.localizedDescription
         }
     }
 
     func retryJob() async {
-        guard let job, job.status == "paused", job.supports("retry") else { return }
+        guard let job else { return }
+        guard job.status == "paused", job.supports("retry") else {
+            errorMessage = job.recovery?.message ?? L10n("任务状态已变化，请刷新并使用当前可用操作。")
+            return
+        }
         await mutate {
             let envelope: WorktreeIntegrationJobEnvelope = try await self.post(
                 "worktree-management/jobs/\(job.id)/retry",
@@ -781,6 +936,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             return envelope.job.status == "canceled"
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.finishJobForFreshPreflight")
             errorMessage = error.localizedDescription
             await refreshSelected()
             return false
@@ -802,6 +958,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             return envelope.job.isWaitingForCommitPolicyDecision
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.prepareCommitPolicyResolution")
             errorMessage = error.localizedDescription
             await refreshSelected()
             return false
@@ -835,6 +992,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.resolveBlockedMarkdownAndContinue")
             errorMessage = error.localizedDescription
             await refreshSelected()
             return false
@@ -866,6 +1024,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.resolveCommitPolicyResidue")
             errorMessage = error.localizedDescription
             await refreshSelected()
             return false
@@ -886,6 +1045,7 @@ final class WorktreeManagementClient: ObservableObject {
             errorMessage = nil
             await AppStateSyncController.shared.refreshSnapshot()
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.resolveConflictWithAgent")
             errorMessage = error.localizedDescription
             await refreshSelected()
         }
@@ -904,6 +1064,7 @@ final class WorktreeManagementClient: ObservableObject {
             if current.shouldPoll && !envelope.job.shouldPoll { await refreshSelected() }
             return changed
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.pollJob")
             errorMessage = error.localizedDescription
             return false
         }
@@ -950,11 +1111,14 @@ final class WorktreeManagementClient: ObservableObject {
                 queryItems: force ? [URLQueryItem(name: "forceFresh", value: "true")] : []
             )
             async let serviceRequest: ProjectDevelopmentServiceStatus? = try? get("projects/\(id)/development-service")
-            let response = try await detailRequest
+            var response = try await detailRequest
             let detailMilliseconds = milliseconds(since: startedAt)
             guard generation == detailGeneration, selection.repositoryId == id else { return }
-            detail = response
             applyJob(response.latestJob)
+            // An earlier inventory read must not cache an older Job over a
+            // terminal event that arrived while that read was in flight.
+            response = ManagedRepositoryDetail(repository: response.repository, project: response.project, latestJob: job)
+            detail = response
             selection.reconcile(repositories: repositories, worktrees: response.project.worktrees)
             listLoadState = .loaded
             errorMessage = nil
@@ -988,6 +1152,7 @@ final class WorktreeManagementClient: ObservableObject {
             lastLoadMetrics = metrics
             log(metrics)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.loadRepository")
             guard !Self.isCancellation(error) else { return }
             guard generation == detailGeneration else { return }
             if detail?.repository.id != id {
@@ -1013,10 +1178,21 @@ final class WorktreeManagementClient: ObservableObject {
     }
 
     private func applyJob(_ nextJob: WorktreeIntegrationJob?) {
+        guard !rejectsJobSnapshot(nextJob) else { return }
         let shouldRestartPolling = nextJob?.shouldPoll == true
             && (job?.id != nextJob?.id || job?.shouldPoll != true)
         job = nextJob
         if shouldRestartPolling { jobPollingGeneration &+= 1 }
+    }
+
+    private func rejectsJobSnapshot(_ next: WorktreeIntegrationJob?) -> Bool {
+        guard let current = job, current.repositoryId == selection.repositoryId else { return false }
+        guard let next else { return true }
+        guard current.repositoryId == next.repositoryId else { return false }
+        if current.id != next.id { return current.createdAt > next.createdAt }
+        return current.updatedAt > next.updatedAt
+            || (["completed", "canceled"].contains(current.status)
+                && !["completed", "canceled"].contains(next.status))
     }
 
     private func scheduleGitHubPushInspection() {
@@ -1054,10 +1230,8 @@ final class WorktreeManagementClient: ObservableObject {
                 )
             }
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.loadGitHubPushStatus")
             guard !Self.isCancellation(error) else { return }
-            logger.error(
-                "GitHub push inspection failed repository=\(repositoryId, privacy: .public) worktree=\(worktreeId, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
-            )
         }
     }
 
@@ -1079,6 +1253,7 @@ final class WorktreeManagementClient: ObservableObject {
             if let category { OperationNotificationManager.shared.complete(.init(category: category, outcome: .succeeded, name: name, repositoryID: repositoryID)) }
             errorMessage = nil
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "WorktreeManagementClient.mutate")
             if let category, !Self.isCancellation(error) { OperationNotificationManager.shared.complete(.init(category: category, outcome: OperationNotificationOutcome.errorOutcome(error), name: name, repositoryID: repositoryID)) }
             errorMessage = error.localizedDescription
         }
@@ -1121,7 +1296,7 @@ final class WorktreeManagementClient: ObservableObject {
             let code = envelope?.code
             let message = code.flatMap {
                 ClientWorktreeBusyContext.failureMessage(code: $0, context: envelope?.busyContext, localize: L10n)
-            } ?? envelope?.error ?? "HTTP \(http.statusCode)"
+            } ?? envelope?.error ?? L10nFormat("本地服务暂时无法完成请求（HTTP %lld）。请刷新状态后再检查。", Int64(http.statusCode))
             throw WorktreeManagementClientError(
                 message: message,
                 code: code,

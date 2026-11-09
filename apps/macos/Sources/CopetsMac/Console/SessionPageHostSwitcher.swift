@@ -46,7 +46,7 @@ struct ResidentSessionPageSwitcher<Fallback: View>: NSViewControllerRepresentabl
 }
 
 struct ResidentSessionPageRoot: View {
-    @State private var showsDetailColumn = true
+    @AppStorage("ui.conversation.showDetails", store: CorptieAppEnvironment.userDefaults) private var showsDetailColumn = false
     let inputs: SessionPageRenderInputs
     let backend: BackendClient
     let cache: SessionPresentationCache
@@ -63,30 +63,31 @@ struct ResidentSessionPageRoot: View {
         }
     }
     private var page: some View {
-        HStack(spacing: 0) {
-            VStack(spacing: 6) {
-                SearchMessageNavigationSurface(sessionID: inputs.scope.sessionID,
-                    target: inputs.searchTarget, matches: inputs.searchMatches) { delta in
-                    guard inputs.actionSession(generation: inputs.activity.generation) != nil else { return }
-                    UnifiedSearchNavigation.shared.step(delta)
-                }
-                SessionConversationSurface(sessionId: inputs.scope.sessionID, presentationCache: cache,
-                    composerDraftRepository: drafts, backendClient: backend,
-                    initialTimelinePosition: viewport.position(for: inputs.scope.sessionID),
-                    onTimelinePositionChange: { viewport.store($0, for: inputs.scope.sessionID) }, renderInputs: inputs)
-                    .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .top)
-            }
-            // Keep the legacy conversation viewport without changing the
-            // Detail rail's native scroll insets or adding another observer.
-            .padding(.top, -inputs.conversationTopInset)
+        AdaptiveConversationColumns(isVisible: Binding(
+            get: { showsDetailColumn && inputs.activity.isActive },
+            set: { if inputs.activity.isActive { showsDetailColumn = $0 } }
+        )) {
+            SessionConversationSurface(sessionId: inputs.scope.sessionID, presentationCache: cache,
+                composerDraftRepository: drafts, backendClient: backend,
+                initialTimelinePosition: viewport.position(for: inputs.scope.sessionID),
+                onTimelinePositionChange: { viewport.store($0, for: inputs.scope.sessionID) },
+                showsHeader: false, renderInputs: inputs)
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .top)
             .modifier(ConversationColumnSurface(.transcript))
+        } detail: {
             SessionDetailPanel(session: inputs.session, railWidth: ConversationDetailWidgetMetrics.railWidth,
                 activity: inputs.activity, detailPresentation: detailPresentation)
                 .frame(maxHeight: .infinity)
-                .modifier(ConsoleDetailColumnVisibility(isVisible: showsDetailColumn))
+        } header: {
+            ResidentSessionPageHeader(inputs: inputs, backend: backend)
+                .padding(.bottom, 8)
         }
-        .padding(MainWindowPageLayoutMetrics.outerPadding)
-        .modifier(ConsoleDetailColumnBackground(isVisible: showsDetailColumn))
+        .padding(.horizontal, MainWindowPageLayoutMetrics.outerPadding)
+        .padding(.bottom, MainWindowPageLayoutMetrics.outerPadding)
+        .padding(.top, 2)
+        // Both columns share the full-height viewport. Compensating only the
+        // transcript leaves Detail's clip edge below the floating controls.
+        .ignoresSafeArea(.container, edges: .top)
         .environment(\.detailColumnVisibility, $showsDetailColumn)
         .modifier(ConversationSkinHost())
         .environmentObject(layout)
@@ -94,18 +95,16 @@ struct ResidentSessionPageRoot: View {
     }
 }
 
-private struct SessionPageLayoutStamp: Equatable {
-    let scale: CGFloat
-    let topInset: CGFloat
-    let appearance: NSAppearance.Name
-    let language: String
-    let direction: NSUserInterfaceLayoutDirection
-    @MainActor init(_ view: NSView) {
-        scale = view.window?.backingScaleFactor ?? 1
-        topInset = view.safeAreaInsets.top
-        appearance = view.effectiveAppearance.name
-        language = AppLanguageController.shared.languageCode
-        direction = view.userInterfaceLayoutDirection
+/// Observe header data here rather than invalidating the whole page for it.
+private struct ResidentSessionPageHeader: View {
+    let inputs: SessionPageRenderInputs
+    let backend: BackendClient
+    var body: some View {
+        SessionConversationHeaderSurface(session: inputs.session, historicalWorkspacePath: inputs.detail?.cwd,
+            backendClient: backend, projectStatus: inputs.projectStatus,
+            showsHistoricalThread: inputs.historicalThreadID != nil,
+            hasPendingScheduledWake: inputs.tasks.first { $0.id == inputs.session.taskId }?.hasPendingScheduledWake == true,
+            providers: inputs.providers, renderInputs: inputs)
     }
 }
 
@@ -116,19 +115,17 @@ private struct SessionPageLayoutStamp: Equatable {
         let surface: NSView
         var lastUsed: UInt64 = 0
         var layoutSize: NSSize = .zero
-        var eligibleForWarmPresentation = false
-        fileprivate var layoutStamp: SessionPageLayoutStamp?
         init(inputs: SessionPageRenderInputs, root: Root) {
             self.inputs = inputs; host = NSHostingController(rootView: root); host.sizingOptions = []
+            (host.view as? NSHostingView<Root>)?.safeAreaRegions = []
             let surface = SessionPageSurfaceView()
             surface.wantsLayer = true; surface.isHidden = true; surface.alphaValue = 0
-            surface.content = host.view; surface.addSubview(host.view)
+            host.view.autoresizingMask = [.width, .height]
+            surface.addSubview(host.view)
             self.surface = surface
             surface.onCompletedLayout = { [weak self] size in
                 guard let self else { return }
-                let stamp = SessionPageLayoutStamp(self.surface)
-                if self.layoutSize != size || self.layoutStamp != stamp { self.eligibleForWarmPresentation = false }
-                self.layoutSize = size; self.layoutStamp = stamp
+                self.layoutSize = size
             }
         }
     }
@@ -137,59 +134,38 @@ private struct SessionPageLayoutStamp: Equatable {
     private let root: (SessionPageRenderInputs) -> Root
     private var fallbackRoot: ConsolePaneContent<Fallback>
     private var fallbackHost: NSHostingController<ConsolePaneContent<Fallback>>?
-    private let gate: SessionPresentationFrameGate
-    private let contentGate: SessionPresentationFrameGate
-    private let cleanupGate: SessionPresentationFrameGate
-    private let readinessGate: SessionPresentationFrameGate
+    private var cleanupWork: DispatchWorkItem?
     private(set) var entries: [Entry] = []
     private(set) weak var current: Entry?
     private(set) weak var visiblePage: Entry?
     private(set) var pendingSessionID: String?
-    var settledSessionID: String? { pendingSessionID == nil && current?.inputs.hasValidBinding() == true ? current?.inputs.scope.sessionID : nil }
+    var settledSessionID: String? { pendingSessionID == nil && current?.inputs.retired == false ? current?.inputs.scope.sessionID : nil }
     private var selectedSessionID: String?
     private var sequence: UInt64 = 0
     private var epoch: UInt64 = 0
     private var isActive = true
-    private var capacity = 3
+    private(set) var capacity = SessionSwitchingPreferences.maximumResidentPages
     private var pressure: (any DispatchSourceMemoryPressure)?
     private var observations: [NSObjectProtocol] = []
 
-    init(fallback: ConsolePaneContent<Fallback>, gate: SessionPresentationFrameGate = SessionPresentationFrameGate(),
-         contentGate: SessionPresentationFrameGate = SessionPresentationFrameGate(),
-         cleanupGate: SessionPresentationFrameGate = SessionPresentationFrameGate(),
-         readinessGate: SessionPresentationFrameGate = SessionPresentationFrameGate(),
+    init(fallback: ConsolePaneContent<Fallback>,
          isVisible: @escaping @MainActor (NSView) -> Bool = {
              !$0.isHiddenOrHasHiddenAncestor && $0.window?.isVisible == true
                  && $0.window?.occlusionState.contains(.visible) == true
          },
          makeInputs: @escaping (String) -> SessionPageRenderInputs?, root: @escaping (SessionPageRenderInputs) -> Root) {
-        fallbackRoot = fallback; self.gate = gate; self.contentGate = contentGate; self.cleanupGate = cleanupGate; self.readinessGate = readinessGate; self.isVisible = isVisible
+        fallbackRoot = fallback; self.isVisible = isVisible
         self.makeInputs = makeInputs; self.root = root
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     isolated deinit {
+        cleanupWork?.cancel()
         pressure?.cancel()
         for token in observations { NotificationCenter.default.removeObserver(token) }
     }
     override func loadView() {
         let container = SessionPageContainerView()
-        container.layoutChildren = { [weak self] bounds in
-            guard let self else { return }
-            self.fallbackHost?.view.frame = bounds
-            // Hidden pages retain their layout until they are selected again.
-            if let current = self.current, !current.surface.isHidden {
-                if current.surface.frame != bounds { current.surface.frame = bounds }
-                let inset = current.host.view.safeAreaInsets.top
-                if current.inputs.conversationTopInset != inset {
-                    DispatchQueue.main.async { [weak self, weak current] in
-                        guard let self, let current, self.current === current else { return }
-                        current.inputs.setConversationTopInset(inset)
-                    }
-                }
-            }
-        }
-        container.onDraw = { [weak self] in self?.gate.nativeDrawPrepared() }
         view = container
         for name in [NSWindow.didMiniaturizeNotification, NSWindow.willCloseNotification, NSWindow.didChangeOcclusionStateNotification] {
             observations.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
@@ -215,54 +191,43 @@ private struct SessionPageLayoutStamp: Equatable {
     }
 
     func handleMemoryPressure(_ event: DispatchSource.MemoryPressureEvent) {
-        capacity = event.contains(.normal) ? 3 : 1
-        guard pendingSessionID == nil else { return }
-        cleanupGate.arm(view: view) { [weak self] _ in self?.trim(to: self?.capacity ?? 1) }
+        capacity = SessionSwitchingPreferences.maximumResidentPages
+        SessionSwitchTrace.shared.recordPagePool(sessionID: current?.inputs.scope.sessionID,
+            count: entries.count, capacity: capacity, reason: event.contains(.critical) ? "critical" : event.contains(.warning) ? "warning" : "normal")
+        scheduleCleanup()
     }
 
     @discardableResult
     func presentOpeningPage(sessionID: String, title: String,
-                            activate: @escaping @MainActor (SessionPresentationFrameGate.Outcome) -> Void) -> Bool {
+                            activate: @escaping @MainActor () -> Void) -> Bool {
         loadViewIfNeeded()
-        guard isActive, isVisible(view), let window = view.window else { return false }
-        // Consume a refused IME/modal switch. Returning false here would let
-        // the legacy caller perform the very selection AppKit refused.
-        if window.attachedSheet != nil { return true }
+        guard isActive, isVisible(view), view.window != nil else { return false }
         cancelPendingPresentation()
-        let previous = current
-        previous?.inputs.suspendActions()
-        guard previous?.inputs.finishEditingForSwitch() ?? true else { previous?.inputs.resume(); return true }
-        if let responder = window.firstResponder as? NSView, responder.isDescendant(of: view),
-           !window.makeFirstResponder(nil) { previous?.inputs.resume(); return true }
-        previous?.inputs.suspendEditorPresentation()
-        gate.cancel(); contentGate.cancel(); cleanupGate.cancel(); readinessGate.cancel(); epoch &+= 1
         let request = epoch
         pendingSessionID = sessionID
-        // At most three value-key checks. No projection, new host, table bind,
-        // root assignment, row apply or editor text reset on the warm path.
-        let warm = entries.first {
-            $0.inputs.scope.sessionID == sessionID && $0.inputs.hasValidBinding()
-                && $0.inputs.historicalThreadID == nil
+        if current?.inputs.scope.sessionID != sessionID {
+            // Finish the old editor's normal AppKit focus handoff. Its return
+            // value is not a prerequisite for displaying another Session.
+            _ = current?.inputs.finishEditingForSwitch()
+            current?.inputs.freeze()
         }
-        if let warm {
-            current = warm
-            if warm.surface.frame != view.bounds { warm.surface.frame = view.bounds }
-            reveal(warm)
-            SessionSwitchTrace.shared.mark(.pageHostReused, sessionID: sessionID)
+        let warm = entries.first { $0.inputs.scope.sessionID == sessionID && !$0.inputs.retired }
+        SessionSwitchTrace.shared.recordPagePool(sessionID: sessionID, count: entries.count,
+            capacity: capacity, reason: warm == nil ? "miss" : "hit")
+        let materialized = materialize(sessionID, request: request, cached: warm)
+        guard epoch == request else { return true }
+        guard materialized, let current, current.inputs.scope.sessionID == sessionID else {
+            cancelPendingPresentation()
+            if let current { reveal(current); current.inputs.resume() }
+            else { showFallback() }
+            return false
         }
-        // A cache miss keeps the old content visible and inert. Never replace
-        // resident messages with an empty opening screen.
-        view.needsDisplay = true
-        let armed = gate.arm(view: view, afterNativeDraw: warm != nil, minimumRefreshIntervals: warm == nil ? 1 : 3) { [weak self] outcome in
-            guard let self, self.epoch == request else { return }
-            self.entries.forEach { $0.inputs.freeze() }
-            SessionSwitchTrace.shared.mark(outcome == .timedOut ? .presentationGateTimedOut : .presentationDeferredWorkAllowed, sessionID: sessionID)
-            activate(outcome)
-            guard self.epoch == request else { return }
-            self.selectedSessionID = sessionID
-            self.materialize(sessionID, request: request, alreadyVisible: warm)
-        }
-        if !armed { cancelPendingPresentation() }
+        activate()
+        guard epoch == request else { return true }
+        selectedSessionID = sessionID
+        pendingSessionID = nil
+        current.inputs.resume()
+        scheduleCleanup()
         return true
     }
 
@@ -270,113 +235,120 @@ private struct SessionPageLayoutStamp: Equatable {
         fallbackRoot = fallback; self.selectedSessionID = selectedSessionID; self.isActive = isActive
         loadViewIfNeeded()
         guard isActive else { cancelPendingPresentation(); entries.forEach { $0.inputs.freeze() }; return }
-        if pendingSessionID != nil { return }
-        if let current, current.inputs.scope.sessionID == selectedSessionID, current.inputs.hasValidBinding() {
-            current.inputs.resume(); prepareWarmReadiness(current); return
+        guard pendingSessionID == nil else { return }
+        if let current, current.inputs.scope.sessionID == selectedSessionID, !current.inputs.retired, current.inputs.hasValidBinding() {
+            current.inputs.resume(); return
         }
         if let selectedSessionID {
-            if presentOpeningPage(sessionID: selectedSessionID, title: "", activate: { _ in }) { return }
-            // Initial mounting can precede window attachment. Build only the
-            // authoritative initial page; user clicks still require the gate.
-            entries.forEach { $0.inputs.freeze(); $0.surface.isHidden = true }
-            materialize(selectedSessionID, request: epoch, alreadyVisible: nil)
+            if presentOpeningPage(sessionID: selectedSessionID, title: "", activate: {}) { return }
+            // Initial mounting may precede attachment to a window.
+            current?.inputs.freeze()
+            if !materialize(selectedSessionID, request: epoch, cached: nil) { showFallback() }
+            current?.inputs.resume()
         } else { showFallback() }
     }
-    private func materialize(_ sessionID: String, request: UInt64, alreadyVisible: Entry?) {
-        guard epoch == request else { return }
-        for invalid in entries.filter({ !$0.inputs.hasValidBinding() }) { dispose(invalid) }
+
+    @discardableResult
+    private func materialize(_ sessionID: String, request: UInt64, cached: Entry?) -> Bool {
+        guard epoch == request else { return false }
+        for invalid in entries.filter({ $0.inputs.retired || !$0.inputs.hasValidBinding() }) { dispose(invalid, reason: "retired") }
         let entry: Entry
-        if let cached = alreadyVisible ?? entries.first(where: { $0.inputs.scope.sessionID == sessionID }) {
+        // Initial attachment and offscreen selection also reach this path.
+        // Reuse by identity here so those paths cannot consume multiple slots
+        // with copies of the same Session.
+        if let cached = cached.flatMap({ $0.inputs.hasValidBinding() ? $0 : nil }) ?? entries.first(where: { $0.inputs.scope.sessionID == sessionID && !$0.inputs.retired }) {
             entry = cached
+            SessionSwitchTrace.shared.mark(.pageHostReused, sessionID: sessionID)
         } else {
-            // Preserve the visible page until the replacement has rendered.
-            // Pressure mode may overlap two pages during this handoff; the
-            // hard three-page bound still holds before allocation.
-            trim(to: min(2, max(1, capacity - 1)))
-            guard let inputs = makeInputs(sessionID), inputs.hasValidBinding() else { cancelPendingPresentation(); showFallback(); return }
+            // Free only the one slot needed before exceeding the page limit.
+            // Pressure-mode surplus is removed after the target is visible.
+            trim(to: min(SessionSwitchingPreferences.maximumResidentPages - 1, max(1, capacity - 1)))
+            guard let inputs = makeInputs(sessionID) else { return false }
             inputs.resume()
             entry = Entry(inputs: inputs, root: root(inputs))
             SessionSwitchTrace.shared.mark(.pageHostCreated, sessionID: sessionID)
             addChild(entry.host)
-            view.addSubview(entry.surface, positioned: .below, relativeTo: current?.surface)
+            // reveal() is the single attachment point; it also detaches every
+            // inactive page so the window only ever lays out one page tree.
             entries.append(entry)
         }
         current = entry; sequence &+= 1; entry.lastUsed = sequence
-        if alreadyVisible == nil { entry.eligibleForWarmPresentation = false }
-        entry.inputs.resume()
         if entry.surface.frame != view.bounds { entry.surface.frame = view.bounds }
-        if alreadyVisible == nil, entry.host.view.frame != entry.surface.bounds {
-            entry.host.view.frame = entry.surface.bounds
+        if entry.host.view.frame != entry.surface.bounds { entry.host.view.frame = entry.surface.bounds }
+        reveal(entry)
+        return true
+    }
+
+    private func scheduleCleanup() {
+        cleanupWork?.cancel()
+        guard entries.count > capacity else { cleanupWork = nil; return }
+        let request = epoch
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.epoch == request, self.pendingSessionID == nil else { return }
+            self.cleanupWork = nil
+            self.trim(to: self.capacity)
         }
-        entry.inputs.setConversationTopInset(entry.host.view.safeAreaInsets.top)
-        entry.surface.isHidden = false; entry.surface.setAccessibilityHidden(pendingSessionID != nil)
-        if alreadyVisible != nil || pendingSessionID == nil {
-            reveal(entry); pendingSessionID = nil; trim(to: capacity)
-            prepareWarmReadiness(entry)
-        } else {
-            let armed = contentGate.arm(view: view) { [weak self] outcome in
-                guard let self, self.epoch == request else { return }
-                SessionSwitchTrace.shared.mark(outcome == .timedOut ? .presentationContentGateTimedOut : .pageContentUncovered, sessionID: sessionID)
-                self.reveal(entry); self.pendingSessionID = nil; self.trim(to: self.capacity)
-                self.prepareWarmReadiness(entry)
-            }
-            if !armed {
-                reveal(entry); pendingSessionID = nil; trim(to: capacity)
-                prepareWarmReadiness(entry)
-            }
-        }
+        cleanupWork = work
+        DispatchQueue.main.async(execute: work)
     }
     private func reveal(_ entry: Entry) {
         SessionSwitchTrace.shared.mark(.nativePageVisibilityCommitted, sessionID: entry.inputs.scope.sessionID)
         visiblePage = entry
+        // Only the active page belongs in the window's view hierarchy. Hidden
+        // NSViews still take part in the window's layout pass; detaching them
+        // keeps switch-back instant without adding layout work per Session.
+        if entry.surface.superview !== view { view.addSubview(entry.surface) }
+        if entry.surface.frame != view.bounds { entry.surface.frame = view.bounds }
+        if entry.host.view.frame != entry.surface.bounds { entry.host.view.frame = entry.surface.bounds }
         for other in entries {
             let hidden = other !== entry
+            other.surface.autoresizingMask = hidden ? [] : [.width, .height]
             other.surface.isHidden = hidden
             other.surface.alphaValue = hidden ? 0 : 1
             other.surface.setAccessibilityHidden(hidden)
+            if hidden {
+                // Detach only. Freezing here would invalidate an already-warm
+                // page's binding; callers own the freeze/resume lifecycle.
+                other.surface.removeFromSuperview()
+            }
         }
+        fallbackHost?.view.autoresizingMask = []
         fallbackHost?.view.isHidden = true
     }
-    private func prepareWarmReadiness(_ entry: Entry) {
-        guard !entry.eligibleForWarmPresentation, !readinessGate.isArmed,
-              pendingSessionID == nil, current === entry else { return }
-        let request = epoch
-        readinessGate.arm(view: entry.surface) { [weak self, weak entry] outcome in
-            guard let self, let entry, self.epoch == request, self.current === entry,
-                  outcome == .displayOpportunity, entry.inputs.hasValidBinding() else { return }
-            entry.eligibleForWarmPresentation = true
-        }
-    }
     func cancelPendingPresentation() {
-        epoch &+= 1; gate.cancel(); contentGate.cancel(); cleanupGate.cancel(); readinessGate.cancel()
+        epoch &+= 1
+        cleanupWork?.cancel(); cleanupWork = nil
         pendingSessionID = nil
-        if let visiblePage { current = visiblePage; reveal(visiblePage) }
     }
     private func showFallback() {
         cancelPendingPresentation()
-        entries.forEach { $0.inputs.freeze(); $0.surface.isHidden = true; $0.surface.setAccessibilityHidden(true) }
+        entries.forEach { $0.inputs.freeze(); $0.surface.autoresizingMask = []; $0.surface.isHidden = true; $0.surface.setAccessibilityHidden(true); $0.surface.removeFromSuperview() }
         current = nil; visiblePage = nil
         if let fallbackHost { fallbackHost.rootView = fallbackRoot }
         else {
             let host = NSHostingController(rootView: fallbackRoot); host.sizingOptions = []
             fallbackHost = host; addChild(host); view.addSubview(host.view, positioned: .below, relativeTo: current?.surface)
         }
-        fallbackHost?.view.frame = view.bounds; fallbackHost?.view.isHidden = false
+        fallbackHost?.view.frame = view.bounds
+        fallbackHost?.view.autoresizingMask = [.width, .height]
+        fallbackHost?.view.isHidden = false
     }
     private func trim(to capacity: Int) {
         while entries.count > max(0, capacity) {
             guard let oldest = entries.filter({ $0 !== current }).min(by: { $0.lastUsed < $1.lastUsed }) else { break }
-            dispose(oldest)
+            dispose(oldest, reason: "capacity")
         }
     }
-    private func dispose(_ entry: Entry) {
+    private func dispose(_ entry: Entry, reason: String) {
+        SessionSwitchTrace.shared.recordPagePool(sessionID: entry.inputs.scope.sessionID,
+            count: entries.count, capacity: capacity, reason: reason)
         entry.inputs.retire(); entry.surface.removeFromSuperview(); entry.host.removeFromParent()
         if current === entry { current = nil }
         if visiblePage === entry { visiblePage = nil }
         entries.removeAll { $0 === entry }
         SessionSwitchTrace.shared.mark(.pageHostEvicted, sessionID: entry.inputs.scope.sessionID)
     }
-    func disposeAll() { cancelPendingPresentation(); for entry in entries { dispose(entry) } }
+    func disposeAll() { cancelPendingPresentation(); for entry in entries { dispose(entry, reason: "disposed") } }
 }
 
 /// One stable legacy host for the Development comparison path.
@@ -422,11 +394,10 @@ struct SessionPageHostSwitcher<Content: View>: NSViewControllerRepresentable {
 
     override func loadView() {
         let container = SessionPageContainerView()
-        container.layoutChildren = { [weak self] bounds in
-            self?.host.view.frame = bounds
-        }
         view = container
         addChild(host)
+        host.view.frame = view.bounds
+        host.view.autoresizingMask = [.width, .height]
         view.addSubview(host.view)
         for name in [NSWindow.didMiniaturizeNotification, NSWindow.willCloseNotification, NSWindow.didChangeOcclusionStateNotification] {
             observations.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
@@ -441,13 +412,10 @@ struct SessionPageHostSwitcher<Content: View>: NSViewControllerRepresentable {
 
     @discardableResult
     func presentOpeningPage(sessionID: String, title: String,
-                            activate: @escaping @MainActor (SessionPresentationFrameGate.Outcome) -> Void) -> Bool {
+                            activate: @escaping @MainActor () -> Void) -> Bool {
         loadViewIfNeeded()
         guard isActive, let window = view.window, window.isVisible,
               window.occlusionState.contains(.visible), !view.isHiddenOrHasHiddenAncestor else { return false }
-        if window.attachedSheet != nil { return true }
-        if let responder = window.firstResponder as? NSView, responder.isDescendant(of: host.view),
-           !window.makeFirstResponder(nil) { return true }
         // Returning false uses the ordinary direct selection path. There is
         // no placeholder display prerequisite for showing local messages.
         cancelPendingPresentation()
@@ -465,21 +433,15 @@ struct SessionPageHostSwitcher<Content: View>: NSViewControllerRepresentable {
 }
 
 @MainActor private final class SessionPageSurfaceView: NSView {
-    weak var content: NSView?
     var onCompletedLayout: ((NSSize) -> Void)?
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric) }
     override func layout() {
         super.layout()
-        if let content, content.frame != bounds { content.frame = bounds }
         onCompletedLayout?(bounds.size)
     }
 }
 
 @MainActor private final class SessionPageContainerView: NSView {
-    var onDraw: (() -> Void)?
-    override func draw(_ dirtyRect: NSRect) { onDraw?() }
-    var layoutChildren: ((NSRect) -> Void)?
     override var fittingSize: NSSize { NSSize(width: 1000, height: 700) }
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric) }
-    override func layout() { super.layout(); layoutChildren?(bounds) }
 }

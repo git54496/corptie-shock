@@ -99,6 +99,8 @@ struct ManagedWorktree: Identifiable, Decodable, Equatable, Sendable {
     let pendingIntegration: Bool
     let associations: [ManagedWorktreeAssociation]
     let deletionBlocker: ManagedWorktreeDeletionBlocker?
+    var cleanupAction: ClientWorktreeCleanupAction? = nil
+    var isStaleRegistration: Bool { cleanupAction?.kind == "remove_stale_registration" }
     var gitHubPush: GitHubPushStatus? = nil
 }
 
@@ -142,6 +144,7 @@ enum ManagedWorktreeDeletionPolicy {
         }
         if let deletionBlocker = worktree.deletionBlocker { return deletionBlocker }
         if worktree.isMain { return .init(code: "MAIN_WORKTREE", reason: "The main Worktree cannot be deleted.") }
+        if worktree.isStaleRegistration, worktree.cleanupAction?.available == true { return nil }
         if worktree.availability != "available" { return .init(code: "WORKTREE_UNAVAILABLE", reason: "This Worktree is unavailable and cannot be removed safely.") }
         if worktree.isLocked { return .init(code: "WORKTREE_LOCKED", reason: worktree.lockReason ?? "This Worktree is locked by another operation.") }
         if worktree.isPrunable == true { return .init(code: "WORKTREE_PRUNABLE", reason: worktree.pruneReason ?? "This Worktree has invalid or prunable Git metadata.") }
@@ -176,7 +179,7 @@ enum ManagedWorktreeDeletionPolicy {
     }
 
     static func eligibleWorktrees(from worktrees: [ManagedWorktree]) -> [ManagedWorktree] {
-        worktrees.filter { blocker(for: $0) == nil }
+        worktrees.filter { !$0.isStaleRegistration && blocker(for: $0) == nil }
     }
 
     private static func associationLabels(
@@ -462,6 +465,9 @@ struct WorktreeIntegrationJob: Identifiable, Decodable, Equatable, Sendable {
     let stagedTreeBlocker: WorktreeStagedTreeBlocker?
     let integrationPostconditionBlocker: WorktreeIntegrationPostconditionBlocker?
     let availableActions: [String]?
+    var diagnosticText: String? = nil
+    var errorSummary: String? = nil
+    var completionEvidence: ClientWorktreeCompletionEvidence? = nil
     let recovery: WorktreeIntegrationRecovery?
 
     func supports(_ action: String) -> Bool {
@@ -482,17 +488,16 @@ struct WorktreeIntegrationJob: Identifiable, Decodable, Equatable, Sendable {
             && hasMergeConflict
     }
     var shouldPoll: Bool {
-        isActive || isStartingConflictAgent || currentConflictResolution?.status == "running"
+        if ["completed", "canceled"].contains(status) { return false }
+        return isActive || isStartingConflictAgent || currentConflictResolution?.status == "running"
     }
     var requiresPlanRegeneration: Bool {
-        if plan.orchestration != nil, supports("repreflight") { return true }
+        if supports("repreflight") { return true }
         let code = audit.last(where: { $0.code != nil })?.code
         return WorktreeIntegrationRecoveryPolicy.requiresRepreflight(status: status, phase: phase, auditCode: code)
     }
     var canCancel: Bool {
-        availableActions?.contains("cancel")
-            ?? (["awaiting_confirmation", "queued", "running", "paused"].contains(status)
-                && currentConflictResolution?.status != "running")
+        supports("cancel")
     }
     var hasMergeConflict: Bool {
         status == "paused" && plan.operationType != "sync"
@@ -617,17 +622,38 @@ struct WorktreeConflictAutomation: Decodable, Equatable, Sendable {
     let taskId: String?
     let sessionId: String?
     let sessionName: String?
-    let agentId: String?
+    let roleId: String?
     let agentName: String?
     let workspaceId: String?
     let workspacePath: String?
     let currentWorktreeId: String?
     let blockedWorktreeId: String?
     let conflictFiles: [String]
-    let failureCode: String?
+    private let rawFailureCode: ClientWorktreeFailureCode?
+    var failureCode: String? { rawFailureCode?.value }
     let failureReason: String?
     let startedAt: String?
     let completedAt: String?
+    // Legacy transport names remain stable; business code uses Role.
+    enum CodingKeys: String, CodingKey {
+        case status
+        case scopeWorktreeIds
+        case completedWorktreeIds
+        case taskId
+        case sessionId
+        case sessionName
+        case roleId = "agentId"
+        case agentName
+        case workspaceId
+        case workspacePath
+        case currentWorktreeId
+        case blockedWorktreeId
+        case conflictFiles
+        case rawFailureCode = "failureCode"
+        case failureReason
+        case startedAt
+        case completedAt
+    }
 }
 
 enum WorktreeIntegrationRecoveryPolicy {
@@ -648,9 +674,21 @@ struct WorktreeConflictResolution: Decodable, Equatable, Sendable {
     let workspace: WorktreeConflictResolutionWorkspace
     let taskId: String?
     let sessionId: String?
-    let agentId: String?
+    let roleId: String?
     let agentName: String?
     let sessionStatus: String?
+    // Legacy transport names remain stable; business code uses Role.
+    enum CodingKeys: String, CodingKey {
+        case status
+        case worktreeId
+        case conflictKey
+        case workspace
+        case taskId
+        case sessionId
+        case roleId = "agentId"
+        case agentName
+        case sessionStatus
+    }
 }
 
 struct WorktreeConflictResolutionWorkspace: Decodable, Equatable, Sendable {

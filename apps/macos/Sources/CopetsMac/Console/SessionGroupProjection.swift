@@ -92,7 +92,7 @@ final class SessionGroupProjectionStore: ObservableObject {
 @MainActor
 func makeSessionGroups(
     rows: [SessionRowModel],
-    agents: [Agent],
+    roles: [Role],
     tasks: [CorptieTask],
     works: [Work],
     category: SessionCategory,
@@ -114,7 +114,7 @@ func makeSessionGroups(
         if left.timestamp != right.timestamp { return left.timestamp > right.timestamp }
         return left.row.id < right.row.id
     }
-    let agentsByID = Dictionary(uniqueKeysWithValues: agents.map { ($0.agentId, $0) })
+    let agentsByID = Dictionary(uniqueKeysWithValues: roles.map { ($0.roleId, $0) })
     let tasksByID = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0) })
     let worksByID = Dictionary(uniqueKeysWithValues: works.map { ($0.id, $0) })
     var assistantOrder: [String] = []
@@ -143,7 +143,7 @@ func makeSessionGroups(
         let session = candidate.session
         switch session.resolvedSessionKind {
         case .assistantChat:
-            let key = session.agentId ?? "__assistant_unbound__"
+            let key = session.roleId ?? "__assistant_unbound__"
             if assistantRows[key] == nil { assistantOrder.append(key) }
             assistantRows[key, default: []].append(row)
         case .workChat:
@@ -259,6 +259,12 @@ func isArchivedWorkerSession(_ session: TaskSession) -> Bool {
 
 enum SessionSelectionRecoveryPolicy {
     private static let historyLimit = 50
+
+    static func restoring(recentSessionIDs: [String], sessions: [TaskSession]) -> String? {
+        recentSessionIDs.first { id in
+            sessions.contains { $0.id == id && $0.archived != true && $0.hasValidProductClassification }
+        }
+    }
 
     static func recording(_ sessionID: String, in recentSessionIDs: [String]) -> [String] {
         var result = recentSessionIDs.filter { $0 != sessionID }

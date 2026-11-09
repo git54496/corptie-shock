@@ -1,3 +1,4 @@
+import { coordinationProgressFor } from './coordinationProgressService.mjs';
 import { randomUUID, createHash } from "node:crypto";
 import { ClientInspectorStream } from "./clientInspectorStream.mjs";
 import { validateDetailContract } from "./detailDocumentContract.mjs";
@@ -368,7 +369,8 @@ export class DetailDocumentService {
     return page;
   }
   #attachScoped(events, response, authenticate, id, request, options, profile) {
-    const initial = cacheScope(trustedIdentity(authenticate(), true), this.scope(id).logicalSessionId, profile.catalog, profile.clientCapabilities);
+    const scope = this.scope(id);
+    const initial = cacheScope(trustedIdentity(authenticate(), true), scope.logicalSessionId, profile.catalog, profile.clientCapabilities);
     // New consumers check current facts, including changes while no consumer was attached.
     this.markDirty({ sessionId: initial.sessionId });
     const guarded = () => {
@@ -384,7 +386,7 @@ export class DetailDocumentService {
     };
     this.#streamAttachments.get(events)(response, guarded, id, request, options);
     const client = [...events.clients].find(client => client.response === response);
-    if (client) client.detailCacheScope = initial;
+    if (client) { client.detailCacheScope = initial; client.detailResourceScope = resourceScope(scope); }
   }
   /** Internal async contract only; not mounted by any HTTP handler.
    * Promise<{state, revalidate}>. revalidate is synchronous and host-only;
@@ -479,7 +481,19 @@ export class DetailDocumentService {
   }
   invalidate(change) {
     this.markDirty(change);
-    this.events.invalidate(change); this.v2Events.invalidate(change); this.nativeEvents.invalidate(change);
+    for (const events of [this.events, this.v2Events, this.nativeEvents]) {
+      if (!change) { events.invalidate(); continue; }
+      // Keep business resource hints in projection caches; streams accept only
+      // route IDs. Match filters and aliases from retained scope without a read.
+      const ids = [...events.clients].filter(client => {
+        const scope = client.detailResourceScope;
+        if (change.sessionId && ![client.sessionId, scope?.session?.id, scope?.logicalSessionId].includes(change.sessionId)) return false;
+        if (change.taskId && scope?.task?.id !== change.taskId) return false;
+        if (change.workId && scope?.work?.id !== change.workId) return false;
+        return true;
+      }).map(client => client.sessionId);
+      events.invalidate(ids);
+    }
   }
   markDirty(change) {
     for (const entry of this.nativeEntries?.values() ?? []) {
@@ -794,11 +808,15 @@ export class DetailDocumentService {
     if (!session || session.archived || logical?.archived) throw failure("SESSION_NOT_FOUND", 404);
     this.businessInvalidation.observe(session);
     const logicalSessionId = logical?.logicalSessionId ?? this.store.getLogicalSessionByLegacySessionId?.(session.id)?.logicalSessionId ?? session.id;
-    const task = session.taskId ? this.store.getTask(session.taskId) : null;
+    const rawTask = session.taskId ? this.store.getTask(session.taskId) : null;
+    const task = rawTask ? { ...rawTask,
+      coordinationProgress: this.store.db && this.store.selectOne ? coordinationProgressFor(this.store).latest(rawTask.id) : null,
+      coordinationExecution: this.coordinationState?.(session.id) ?? null,
+      coordinationDispatches: this.store.listTaskCoordinationDispatches?.(rawTask.id) ?? [] } : null;
     const workId = task?.work_id ?? session.workId;
     const taskHierarchy = task ? this.store.hierarchySummaries?.([task.id]).get(task.id) ?? null : null;
     const parent = task?.parent_task_id ? this.store.getTask(task.parent_task_id) : null;
-    const parentSession = parent?.work_id === workId && parent.current_session_id ? this.store.getSession(parent.current_session_id) : null;
+    const parentSession = parent && parent.work_id === workId && parent.current_session_id ? this.store.getSession(parent.current_session_id) : null;
     const parentSessionId = parentSession && !parentSession.archived
       ? this.store.getLogicalSessionByLegacySessionId?.(parentSession.id)?.logicalSessionId ?? parentSession.id : null;
     return { session, logicalSessionId, task, taskHierarchy, parentSessionId, work: workId ? this.store.getWork(workId) : null };

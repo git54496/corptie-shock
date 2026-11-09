@@ -4,6 +4,84 @@ import Testing
 
 @MainActor
 struct SessionCollectionPatchTests {
+    @Test func assistantProcessingSummaryTracksMultipleSessionsAndMembershipChanges() {
+        let store = SessionIndexStore()
+        var first = makeSession(id: "first", sessionKind: .assistantChat, status: .running)
+        var second = makeSession(id: "second", sessionKind: .assistantChat, status: .running)
+        let worker = makeSession(id: "worker", sessionKind: .worker, status: .running)
+        store.replaceAll(with: [first, second, worker])
+        #expect(store.hasProcessingAssistantSessions)
+        first.executionStatus = "completed"
+        store.replaceAll(with: [first, second, worker])
+        #expect(store.hasProcessingAssistantSessions)
+        second = makeSession(id: "second", sessionKind: .assistantChat, status: .running, archived: true)
+        store.replaceAll(with: [first, second, worker])
+        #expect(!store.hasProcessingAssistantSessions)
+        second = makeSession(id: "second", sessionKind: .assistantChat, status: .running)
+        store.replaceAll(with: [first, second, worker])
+        #expect(store.hasProcessingAssistantSessions)
+        second.sessionKind = .workChat
+        second.workId = "work:other"
+        store.replaceAll(with: [first, second, worker])
+        #expect(!store.hasProcessingAssistantSessions)
+        first.executionStatus = "running"
+        store.replaceAll(with: [first, second, worker])
+        #expect(store.hasProcessingAssistantSessions)
+        store.replaceAll(with: [second, worker])
+        #expect(!store.hasProcessingAssistantSessions)
+        store.replaceAll(with: [])
+        #expect(!store.hasProcessingAssistantSessions)
+    }
+
+    @Test func outlineSummariesAndLookupsStayEquivalentAcrossContentStatusAndMembershipPatches() {
+        let store = SessionIndexStore()
+        var task = makeCorptieTask(id: "task:one", lifecycleState: "in_progress")
+        task.currentSessionId = "worker"
+        task.executionStatus = "idle"
+        store.updateWorkTasks([task])
+        var sessions = [
+            makeSession(id: "worker", sessionKind: .worker, taskId: task.id, workId: task.workId,
+                status: .running, lastAgentMessageSequence: 4, lastReadMessageSequence: 1),
+            makeSession(id: "chat", sessionKind: .workChat, workId: task.workId),
+            makeSession(id: "archive", sessionKind: .worker, taskId: task.id, workId: task.workId, archived: true),
+            makeSession(id: "assistant", sessionKind: .assistantChat, lastAgentMessageSequence: 7, lastReadMessageSequence: 1)
+        ]
+        func apply() {
+            store.replaceAll(with: sessions)
+            #expect(store.workUnreadSummary == WorkRailUnreadSummary(sessions: sessions))
+            #expect(store.processingWorkIDs == ConsoleWorkActivityPolicy.processingWorkIDs(tasks: [task], sessions: sessions))
+            #expect(store.taskSessionLookup.workChat(for: task.workId)?.id == sessions.first {
+                $0.resolvedSessionKind == .workChat && $0.workId == task.workId && $0.archived != true
+            }?.id)
+            #expect(store.taskSessionLookup.session(for: task)?.id == TaskSessionLookup(sessions: sessions).session(for: task)?.id)
+        }
+        apply()
+        let activityRevision = store.outlineActivityRevision
+        for index in 0..<20 {
+            sessions[0] = makeSession(id: "worker", summary: "Streaming summary \(index)", sessionKind: .worker,
+                taskId: task.id, workId: task.workId, status: .running,
+                lastAgentMessageSequence: 4, lastReadMessageSequence: 1)
+            apply()
+            #expect(store.taskSessionLookup.session(for: task)?.summary == sessions[0].summary)
+        }
+        #expect(store.outlineActivityRevision == activityRevision)
+        sessions[0].executionStatus = "completed"
+        apply()
+        sessions[0].lastReadMessageSequence = 4
+        apply()
+        sessions[1].workId = "work:other"
+        apply()
+        #expect(store.taskSessionLookup.workChat(for: "work:other")?.id == "chat")
+        sessions[1] = makeSession(id: "chat", sessionKind: .workChat, workId: "work:other", archived: true)
+        apply()
+        #expect(store.taskSessionLookup.workChat(for: "work:other") == nil)
+        sessions.removeFirst()
+        apply()
+        sessions = []
+        apply()
+        #expect(store.workUnreadSummary.workIDs.isEmpty)
+    }
+
     @Test func authoritativeExecutionCompletionInvalidatesOnlyTheChangedStatusRow() {
         let previous = makeSession(id: "status", status: .running)
         var completed = previous
@@ -239,9 +317,9 @@ struct SessionCollectionPatchTests {
 
     @Test
     func sessionDetailResolvesTheBoundAgentInsteadOfTheProviderLabel() {
-        let session = makeSession(id: "codex:thread", agentId: "research-agent")
-        let agent = Agent(
-            agentId: "research-agent",
+        let session = makeSession(id: "codex:thread", roleId: "research-agent")
+        let agent = Role(
+            roleId: "research-agent",
             name: "研究员",
             description: "",
             status: "active",
@@ -255,29 +333,29 @@ struct SessionCollectionPatchTests {
             updatedAt: "2026-08-12T00:00:00Z"
         )
 
-        #expect(sessionAgentDisplayName(session: session, agents: [agent]) == "研究员")
-        #expect(sessionAgentDisplayName(session: session, agents: []) == "research-agent")
-        #expect(sessionAgentDisplayName(session: makeSession(id: "unbound"), agents: [agent]) == "未挂载")
+        #expect(sessionAgentDisplayName(session: session, roles: [agent]) == "研究员")
+        #expect(sessionAgentDisplayName(session: session, roles: []) == "research-agent")
+        #expect(sessionAgentDisplayName(session: makeSession(id: "unbound"), roles: [agent]) == "未挂载")
     }
 
     @Test
     func assistantChatGroupingDoesNotDependOnAgentCache() {
         let assistant = SessionRowModel(session: makeSession(
             id: "assistant-chat",
-            agentId: "assistant",
+            roleId: "assistant",
             sessionKind: .assistantChat
         ))
         let worker = SessionRowModel(session: makeSession(
             id: "worker",
-            agentId: "contributor",
+            roleId: "contributor",
             sessionKind: .worker,
             taskId: "task:1"
         ))
-        let legacy = SessionRowModel(session: makeSession(id: "legacy", agentId: "unknown"))
+        let legacy = SessionRowModel(session: makeSession(id: "legacy", roleId: "unknown"))
 
         let groups = makeSessionGroups(
             rows: [worker, legacy, assistant],
-            agents: [],
+            roles: [],
             tasks: [],
             works: [],
             category: .assistant
@@ -293,18 +371,18 @@ struct SessionCollectionPatchTests {
     func workChatIsGroupedSeparatelyFromAssistantAndWorkerSessions() {
         let work = SessionRowModel(session: makeSession(
             id: "work-chat",
-            agentId: "assistant",
+            roleId: "assistant",
             sessionKind: .workChat,
             workId: "work:1"
         ))
         let assistant = SessionRowModel(session: makeSession(
             id: "assistant-chat",
-            agentId: "assistant",
+            roleId: "assistant",
             sessionKind: .assistantChat
         ))
         let groups = makeSessionGroups(
             rows: [work, assistant],
-            agents: [],
+            roles: [],
             tasks: [],
             works: [makeWork(id: "work:1", name: "Sessions UI")],
             category: .work
@@ -336,7 +414,7 @@ struct SessionCollectionPatchTests {
 
         let groups = makeSessionGroups(
             rows: [active, completed, orphaned],
-            agents: [],
+            roles: [],
             tasks: [
                 makeCorptieTask(id: "task:active", lifecycleState: "in_progress"),
                 makeCorptieTask(id: "task:completed", lifecycleState: "done")
@@ -366,7 +444,7 @@ struct SessionCollectionPatchTests {
 
         let groups = makeSessionGroups(
             rows: [first, second],
-            agents: [],
+            roles: [],
             tasks: [
                 makeCorptieTask(id: "task:first", lifecycleState: "in_progress"),
                 makeCorptieTask(id: "task:second", lifecycleState: "todo")
@@ -405,7 +483,7 @@ struct SessionCollectionPatchTests {
 
         let groups = makeSessionGroups(
             rows: [newestMetadata, newestMessage],
-            agents: [],
+            roles: [],
             tasks: [
                 makeCorptieTask(id: "task:newest", lifecycleState: "in_progress"),
                 makeCorptieTask(id: "task:metadata", lifecycleState: "in_progress")
@@ -434,7 +512,7 @@ struct SessionCollectionPatchTests {
 
         let groups = makeSessionGroups(
             rows: [active, completed],
-            agents: [],
+            roles: [],
             tasks: [
                 makeCorptieTask(id: "task:active", lifecycleState: "in_progress"),
                 makeCorptieTask(id: "task:completed", lifecycleState: "done")
@@ -695,7 +773,7 @@ struct SessionCollectionPatchTests {
 
         let groups = makeSessionGroups(
             rows: rows,
-            agents: [],
+            roles: [],
             tasks: [],
             works: [],
             category: .assistant
@@ -728,7 +806,7 @@ struct SessionCollectionPatchTests {
     @Test
     func sessionKindChangeInvalidatesGrouping() {
         let legacy = makeSession(id: "one")
-        let assistant = makeSession(id: "one", agentId: "assistant", sessionKind: .assistantChat)
+        let assistant = makeSession(id: "one", roleId: "assistant", sessionKind: .assistantChat)
         let patch = SessionCollectionDiffer.patch(from: [legacy], to: [assistant], revision: 2)
         let store = SessionIndexStore()
         store.apply(
@@ -785,7 +863,7 @@ struct SessionCollectionWirePatchTests {
 private func makeSession(
     id: String,
     summary: String = "Summary",
-    agentId: String? = nil,
+    roleId: String? = nil,
     sessionKind: SessionKind? = nil,
     taskId: String? = nil,
     workId: String? = nil,
@@ -803,7 +881,7 @@ private func makeSession(
         id: id,
         title: id,
         agent: "Codex",
-        agentId: agentId,
+        roleId: roleId,
         sessionKind: sessionKind,
         workId: workId,
         taskId: taskId,
@@ -833,7 +911,7 @@ private func emptyControlPlaneState(sessions: [TaskSession]) -> ControlPlaneStat
         sessions: sessions,
         tasks: [],
         works: [],
-        agents: [],
+        roles: [],
         skills: [],
         repositories: [],
         integrationRuns: []
@@ -849,7 +927,7 @@ private func makeWork(id: String, name: String) -> Work {
         status: "active",
         profile: "general",
         tags: [],
-        contributorAgentIds: [],
+        contributorRoleIds: [],
         createdAt: "2026-08-12T00:00:00Z",
         updatedAt: "2026-08-12T00:00:00Z"
     )
@@ -864,7 +942,7 @@ private func makeCorptieTask(id: String, lifecycleState: String) -> CorptieTask 
         acceptanceCriteria: "",
         priority: "medium",
         lifecycleState: lifecycleState,
-        mainAgentId: nil,
+        mainRoleId: nil,
         currentSessionId: nil,
         executionStatus: nil,
         acceptanceAssessment: nil,

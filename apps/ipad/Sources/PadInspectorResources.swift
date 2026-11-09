@@ -74,7 +74,7 @@ struct PadInspectorResources<Primary: View, Secondary: View>: View {
                         if store.snapshot?.workId != nil { artifacts; memories }
                         references
                     }
-                } else { ProgressView("正在同步详情…") }
+                } else { CorptieBrandProgress("正在同步详情…") }
             } else {
             connectionStatus
             if let providerManagementID {
@@ -87,6 +87,19 @@ struct PadInspectorResources<Primary: View, Secondary: View>: View {
                 }
             } else {
             primary
+            ConversationSessionAbilities(scope: "\(connection.serverID):\(sessionID)",
+                refreshKey: String(section("abilities")["resourceVersion"].number ?? -1), read: {
+                let api = ClientInspectorAPI(transport: try await connection.transport())
+                return try await api.read(sessionID: sessionID, resource: "abilities")
+            }, update: { fields, requestID in
+                let api = ClientInspectorAPI(transport: try await connection.transport())
+                let receipt = try await api.command(sessionID: sessionID, requestID: requestID,
+                    action: "abilities.update", fields: fields)
+                guard receipt.status == "completed" else {
+                    throw ClientServiceFailure(statusCode: 409, code: receipt.errorCode ?? "SESSION_ABILITY_OUTCOME_UNCONFIRMED")
+                }
+            }).id("abilities:\(connection.serverID):\(sessionID)")
+                .modifier(ConversationDetailModuleSurface())
             if richPresentation {
                 ConversationDetailResourceMenu(items: resourceItems)
             } else { nativeManagementContent }
@@ -157,7 +170,7 @@ struct PadInspectorResources<Primary: View, Secondary: View>: View {
     }
 
     @ViewBuilder private var connectionStatus: some View {
-        if store.snapshot == nil && store.error == nil { ProgressView("正在连接详情推送…") }
+        if store.snapshot == nil && store.error == nil { CorptieBrandProgress("正在连接详情推送…") }
         if !store.connected && store.snapshot != nil && store.error != nil {
             Label("详情连接中断，保留上次数据", systemImage: "wifi.slash").font(.footnote).foregroundStyle(.orange)
         }
@@ -178,7 +191,7 @@ struct PadInspectorResources<Primary: View, Secondary: View>: View {
             Menu {
                 Button("导入本机文件…") { importAsArtifact = false; importing = true }
                 ForEach([("localFile", "Mac 本地文件"), ("webURL", "网页链接"), ("work", "Work"),
-                         ("task", "Task"), ("agent", "Agent"), ("session", "其他会话")], id: \.0) { type, title in
+                         ("task", "Task"), ("agent", "角色"), ("session", "其他会话")], id: \.0) { type, title in
                     Button(title) { editor = referenceEditor(type: type, title: title) }
                 }
             } label: { ConversationDetailHeaderIcon(systemName: "plus") }
@@ -241,7 +254,7 @@ struct PadInspectorResources<Primary: View, Secondary: View>: View {
         case "work": choices = workspace.works.map { ($0.id, $0.name) }
         case "task": choices = workspace.tasks.map { ($0.id, $0.title) }
         case "session": choices = workspace.sessions.filter { $0.id != sessionID }.map { ($0.id, $0.title) }
-        case "agent": choices = workspace.directControlSnapshot?.agents.map { ($0.id, $0.name) } ?? []
+        case "agent": choices = workspace.directControlSnapshot?.roles.map { ($0.id, $0.name) } ?? []
         default: choices = []
         }
         return PadInspectorEdit(title: "添加\(title)", action: "reference.create",
@@ -369,7 +382,18 @@ struct PadInspectorResources<Primary: View, Secondary: View>: View {
                 onAutoTitleChange: { enabled in
                     Task { await store.command("task.update", fields: ["autoTitleEnabled": .bool(enabled)],
                         sessionID: sessionID, connection: connection) }
-                }, hierarchy: taskHierarchy(definition) ?? task?.hierarchy) {
+                }, coordinationEnabled: (definition?["parentTaskId"].text ?? task?.parentTaskId) == nil
+                    ? (definition?["coordinationEnabled"].flag ?? false) : nil,
+                coordinationUpdating: locked,
+                coordinationDispatches: task?.coordinationDispatches ?? [],
+                onCoordinationChange: { enabled in
+                    Task { await store.command("task.update", fields: ["coordinationEnabled": .bool(enabled)],
+                        sessionID: sessionID, connection: connection) }
+                }, hierarchy: taskHierarchy(definition) ?? task?.hierarchy,
+                deliveryTaskID:store.snapshot?.taskId ?? task?.id,
+                deliveryRefreshID:String(task?.resourceVersion ?? 0),deliveryAPI:{
+                    ClientTaskHierarchyAPI(transport:try await connection.transport(),surface:.pairedDevice)
+                }) {
                 if let parentID=definition?["parentTaskId"].text ?? task?.parentTaskId,
                    let parentSession=workspace.sessionIDByTaskID[parentID] {
                     Button { workspace.selection=parentSession } label: {
@@ -382,7 +406,7 @@ struct PadInspectorResources<Primary: View, Secondary: View>: View {
                             inputs: [.init(key: "title", label: "标题"), .init(key: "description", label: "描述", multiline: true),
                                      .init(key: "acceptanceCriteria", label: "验收标准", multiline: true),
                                      .init(key: "priority", label: "优先级", choices: ["low", "medium", "high", "urgent"].map { ($0, $0) }),
-                                     .init(key: "mainAgentId", label: "Agent", choices: definition["agents"].items.compactMap {
+                                     .init(key: "mainAgentId", label: "角色", choices: definition["agents"].items.compactMap {
                                          guard let id = $0["id"].text else { return nil }; return (id, $0["name"].text ?? id)
                                      })])
                         editor?.fields.removeValue(forKey: "summary"); editor?.fields.removeValue(forKey: "agents")

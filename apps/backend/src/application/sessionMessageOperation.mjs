@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { normalizeConversationMessage } from "./conversationMessage.mjs";
-import { AGENT_PROVIDER_CAPABILITIES } from "../agent-provider/contracts.mjs";
+import { AGENT_PROVIDER_CAPABILITIES, validateConversationSendReceipt } from "../agent-provider/contracts.mjs";
 import { assertAgentWorkSessionReference, shouldReportAgentWorkQueued } from "../utils/agentWorkQueue.mjs";
 import { normalizeSessionMessageLatencyTrace, logSessionMessageLatency } from "../utils/sessionMessageLatency.mjs";
 import { isClearCommand, parseSlashCommand } from "../commands/unifiedCommands.mjs";
@@ -18,7 +18,7 @@ export function createSessionMessageOperation({
   onTurnAccepted = () => {},
   ensureCollaborationAgentForSession, registerRuntimeQueuedWork,
   runtimeQueuePosition, publishProviderEventOutbox, scheduleAgentWorkDrain,
-  scheduleMemoryExtraction = null
+  scheduleMemoryExtraction = null, memoryTopicService = null
 }) {
 async function sendUnifiedSessionMessage(sessionId, input, source = { type: "desktop" }, options = {}) {
   const message = normalizeConversationMessage(input);
@@ -71,10 +71,17 @@ async function sendUnifiedSessionMessage(sessionId, input, source = { type: "des
   // generation. Reuse that proof until Provider restart, route replacement,
   // or a failed dispatch invalidates it; ordinary messages must not resume the
   // same Provider thread merely to rediscover that it is still present.
+  if (options.fromAgentWorkQueue === true) {
+    try { memoryTopicService?.requestUpdate(before, value, source.messageId ?? source.deliveryId ?? null); }
+    catch { console.warn("[memory-topic] optional scheduling unavailable"); }
+  }
+  const bindingStartedAt = Date.now();
+  logSessionMessageLatency(latencyTrace, "binding_verification_started");
   const bindingVerification = await sessionBindingReadinessProbe.verify(
     routedSessionId,
     { reuseReady: true }
   );
+  logSessionMessageLatency(latencyTrace, "binding_verification_completed", { durationMs: Date.now() - bindingStartedAt });
   if (bindingVerification.ready !== true) {
     const error = new Error(
       bindingVerification.readiness?.message ?? "The Provider Session is unavailable."
@@ -180,9 +187,9 @@ async function sendUnifiedSessionMessage(sessionId, input, source = { type: "des
   });
   let result;
   try {
-    result = await sessionApplicationService.sendMessage(
+    result = validateConversationSendReceipt(await sessionApplicationService.sendMessage(
       sessionId,
-      await resolvedConversationMessage(reference, message),
+      await resolvedConversationMessage(reference, message, latencyTrace),
       {
       before,
       latencyTrace,
@@ -191,24 +198,39 @@ async function sendUnifiedSessionMessage(sessionId, input, source = { type: "des
       submit: options.submit,
       idempotencyKey: deliveryId
       }
-    );
+    ));
+    const currentDelivery = delivery ? store.getMessageDelivery(deliveryId) ?? delivery : null;
+    if (currentDelivery && (["sessionId", "bindingId", "routingVersion", "providerId", "providerSessionId"]
+      .some(key => result[key] != null && result[key] !== currentDelivery[key])
+      || (currentDelivery.providerTurnId && currentDelivery.providerTurnId !== result.turnId))) {
+      throw Object.assign(new Error("The Provider send receipt conflicts with the Delivery correlation."), {
+        code: "PROVIDER_SEND_RECEIPT_CORRELATION_CONFLICT", dispatchState: "unknown", stage: "provider_dispatch"
+      });
+    }
   } catch (error) {
     // A failed Provider dispatch makes the last-known-ready proof suspect. The
     // next dispatch performs one real probe before retrying this Binding.
-    if (error.stage !== "context_assembly" && error.stage !== "context_delivery") {
+    if (!["context_assembly", "context_delivery", "attachment_resolution"].includes(error.stage)) {
       sessionBindingReadinessProbe.invalidateBinding(reference);
     }
     if (delivery) {
       const status = providerDeliveryFailureStatus(error);
-      store.updateMessageDelivery(deliveryId, {
-        status,
-        lastError: error.message
-      });
-      error.deliveryStatus = status;
+      const currentDelivery = store.getMessageDelivery(deliveryId) ?? delivery;
+      const provenTurn = currentDelivery.providerTurnId && store.getSessionTurn?.(
+        routedSessionId, currentDelivery.bindingId, currentDelivery.providerTurnId);
+      // A malformed/late acknowledgement cannot invalidate a Turn already
+      // proven by Provider events. Preserve that correlation and execution fact.
+      if (["running", "blocked", "completed", "failed", "cancelled"].includes(provenTurn?.execution_status)) {
+        error.deliveryStatus = store.settleMessageDeliveryFromTurn(deliveryId)?.status ?? currentDelivery.status;
+      } else {
+        store.updateMessageDelivery(deliveryId, { status, lastError: error.message });
+        error.deliveryStatus = status;
+      }
     }
     throw error;
   }
-  const providerTurnId = result?.turn?.id ?? result?.turnId ?? null;
+  const providerTurnId = result.turnId;
+  const dispatchAccepted = result.delivery === "accepted";
   const routedDelivery = delivery ? store.getMessageDelivery(deliveryId) ?? delivery : null;
   const dispatchBindingId = routedDelivery?.bindingId ?? reference.bindingId;
   const dispatchBinding = dispatchBindingId ? store.getAgentSessionBinding(dispatchBindingId) : null;
@@ -218,7 +240,7 @@ async function sendUnifiedSessionMessage(sessionId, input, source = { type: "des
   // Native events may already have won the race; never overwrite a settled Turn.
   // Recovery may have atomically rebound the durable Delivery while sendMessage
   // was in flight, so prefer that post-CAS binding over the pre-dispatch reference.
-  if (providerTurnId && dispatchBindingId
+  if (dispatchAccepted && dispatchBindingId
     && !store.getSessionTurn(routedSessionId, dispatchBindingId, providerTurnId)) {
     const timestamp = now();
     store.upsertSessionTurn({
@@ -251,34 +273,44 @@ async function sendUnifiedSessionMessage(sessionId, input, source = { type: "des
     const alreadySettledTurn = providerTurnId
       ? store.getSessionTurn(routedSessionId, routedDelivery.bindingId, providerTurnId)
       : null;
-    const acknowledgedStatus = alreadySettledTurn
-      ? ({ completed: "completed", failed: "failed", cancelled: "cancelled" }[alreadySettledTurn.execution_status]
-        ?? "accepted")
-      : "accepted";
+    const acknowledgedStatus = ({ completed: "completed", failed: "failed", cancelled: "cancelled",
+      running: "processing", blocked: "processing" }[alreadySettledTurn?.execution_status])
+      ?? (dispatchAccepted ? "accepted" : "delivery_unknown");
     store.updateMessageDelivery(deliveryId, {
       status: acknowledgedStatus,
       providerTurnId,
-      providerAcknowledgedAt: now(),
+      providerAcknowledgedAt: dispatchAccepted || alreadySettledTurn ? now() : null,
       lastError: null
     });
     store.settleMessageDeliveryFromTurn(deliveryId);
   }
   logSessionMessageLatency(latencyTrace, "provider_dispatch_completed", {
     providerId: reference.providerId,
-    turnId: result?.turn?.id ?? result?.turnId ?? null
+    turnId: providerTurnId
   });
-  logSessionMessageLatency(latencyTrace, "session_execution_started", {
+  if (!dispatchAccepted && !["running", "blocked", "completed", "failed", "cancelled"].includes(
+    dispatchBindingId ? store.getSessionTurn(routedSessionId, dispatchBindingId, providerTurnId)?.execution_status : null
+  )) {
+    // The queue must not announce running work based solely on a Turn ID that
+    // the Provider allocated before confirming admission.
+    throw Object.assign(new Error("Provider message delivery is unknown; do not resend automatically."), {
+      code: "DELIVERY_UNKNOWN", dispatchState: "unknown", deliveryStatus: "delivery_unknown"
+    });
+  }
+  if (dispatchAccepted) logSessionMessageLatency(latencyTrace, "session_execution_started", {
     providerId: reference.providerId,
-    turnId: result?.turn?.id ?? result?.turnId ?? null
+    turnId: providerTurnId
   });
 
-  emitEvent("SessionRunStarted", {
+  if (dispatchAccepted && !["completed", "failed", "cancelled"].includes(
+    dispatchBindingId ? store.getSessionTurn(routedSessionId, dispatchBindingId, providerTurnId)?.execution_status : null
+  )) emitEvent("SessionRunStarted", {
     sessionId: routedSessionId,
     logicalSessionId: reference.logicalSessionId,
     source
   }, { sessionId: routedSessionId, source });
   return {
-    accepted: true,
+    accepted: dispatchAccepted,
     cleared: false,
     sessionId: publicSessionId,
     legacySessionId: routedSessionId,
@@ -335,19 +367,30 @@ function collaborationConfirmationReply(value) {
 }
 
 
-async function resolvedConversationMessage(reference, input) {
+async function resolvedConversationMessage(reference, input, latencyTrace) {
   const message = normalizeConversationMessage(input);
-  const images = [];
-  for (const image of message.images) {
-    const stored = await chatResourceService.readImage(reference, image.managedPath);
-    images.push({
-      ...image,
-      absolutePath: stored.path,
-      mimeType: stored.mimeType,
-      byteLength: stored.byteLength,
-      ...(stored.pixelWidth && stored.pixelHeight ? { pixelWidth: stored.pixelWidth, pixelHeight: stored.pixelHeight } : {})
-    });
+  const startedAt = Date.now();
+  logSessionMessageLatency(latencyTrace, "attachments_started", { count: message.images.length });
+  const images = new Array(message.images.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(4, images.length) }, async () => {
+    while (next < message.images.length) {
+      const index = next++;
+      const image = message.images[index];
+      const stored = await chatResourceService.readImage(reference, image.managedPath);
+      images[index] = { ...image, absolutePath: stored.path, mimeType: stored.mimeType,
+        byteLength: stored.byteLength,
+        ...(stored.pixelWidth && stored.pixelHeight ? { pixelWidth: stored.pixelWidth, pixelHeight: stored.pixelHeight } : {}) };
+    }
+  });
+  // Settle every read before dispatch/error; a failed attachment never sends a partial message.
+  const results = await Promise.allSettled(workers);
+  const failed = results.find(result => result.status === "rejected");
+  if (failed) {
+    const error = failed.reason instanceof Error ? failed.reason : new Error("Required attachment could not be read.");
+    throw Object.assign(error, { stage: "attachment_resolution", dispatchState: "not_sent" });
   }
+  logSessionMessageLatency(latencyTrace, "attachments_completed", { count: images.length, durationMs: Date.now() - startedAt });
   return { text: message.text, images, ...(message.mentions ? { mentions: message.mentions } : {}) };
 }
 
@@ -391,6 +434,10 @@ function enqueueUserAgentWork(session, input, source, latencyTrace = null, refer
     source: persistedSource,
     createdAt: now()
   });
+  // In-memory only: a newly admitted message supersedes optional work even
+  // before its turn reaches context assembly. Never compromise durable admission.
+  try { memoryTopicService?.requestUpdate(session, message.text, messageId); }
+  catch { console.warn("[memory-topic] optional scheduling unavailable"); }
   delete persistedSource.clientReceipt;
   const task = created.task;
   registerRuntimeQueuedWork(session.id, task.taskId);

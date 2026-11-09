@@ -6,12 +6,14 @@ export function rejectDevelopmentPreviewWrite({ request, response, url, developm
       "/state/snapshot", "/state/changes", "/state/events", "/session-timelines/revisions",
       "/works", "/tasks", "/agents", "/workspaces", "/repositories", "/artifacts", "/resources", "/memories",
       "/automations", "/scheduled-tasks", "/scheduled-session-tasks"].includes(url.pathname)
-      || /^\/sessions\/[^/]+\/(stored-snapshot|history|timeline\/window|timeline\/changes|events|usage|quick-messages|context-references|images|resources|fork|worktree-detail)$/.test(url.pathname)
+      || /^\/sessions\/[^/]+\/(stored-snapshot|history|timeline\/window|timeline\/changes|events|usage|quick-messages|user-message-navigation|context-references|images|resources|fork|worktree-detail)$/.test(url.pathname)
+      || /^\/sessions\/[^/]+\/mailbox(?:\/messages\/[^/]+)?$/.test(url.pathname)
       || /^\/sessions\/[^/]+\/detail(?:\/(events|capabilities))?$/.test(url.pathname)
       || /^\/sessions\/[^/]+\/detail\/receipts\/[A-Za-z0-9_-]{8,128}$/.test(url.pathname)
       || /^\/works\/[^/]+(?:\/(tasks|artifacts|task-hierarchy|local-state))?$/.test(url.pathname)
       || /^\/worktree-management\/repositories\/[^/]+\/worktrees\/[^/]+\/local-state$/.test(url.pathname)
-      || /^\/tasks\/[^/]+(?:\/(sessions|snapshots|artifacts|integration-acceptance|startup-recovery))?$/.test(url.pathname)
+      || /^\/tasks\/[^/]+(?:\/(sessions|snapshots|artifacts|integration-acceptance|startup-recovery|child-delivery|child-deliveries))?$/.test(url.pathname)
+      || /^\/child-deliveries\/[^/]+$/.test(url.pathname)
       || /^\/artifacts\/[^/]+$/.test(url.pathname)
       || /^\/resources\/[^/]+(?:\/read)?$/.test(url.pathname)
       || url.pathname === "/scene-templates"

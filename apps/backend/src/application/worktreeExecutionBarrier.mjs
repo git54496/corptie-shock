@@ -3,10 +3,26 @@
 export function worktreeDispatchBlocker(store, reference) {
   const logical = reference.logicalSession ?? (reference.logicalSessionId ? store.getLogicalSession?.(reference.logicalSessionId) : null)
     ?? store.getLogicalSessionByLegacySessionId?.(reference.sessionId);
+  const taskId = logical?.taskId ?? store.getSession?.(logical?.legacySessionId ?? reference.sessionId)?.taskId;
+  if(taskId && store.selectOne?.("SELECT 1 FROM child_task_delivery_operations WHERE child_task_id=? AND state IN ('queued','running','waiting') LIMIT 1",[taskId])) {
+    return {reason:"CHILD_DELIVERY_IN_PROGRESS",worktreeId:logical?.activeWorkspaceId ?? null,message:"子任务已验收，正在自动交付和清理。"};
+  }
+  if (taskId && store.getTask?.(taskId)?.deletion_status === "deleting") return {
+    reason: "TASK_DELETION_IN_PROGRESS", worktreeId: logical?.activeWorkspaceId ?? null,
+    message: "任务正在删除，暂不启动新的执行。"
+  };
   if (!logical?.repositoryId || !logical.activeWorkspaceId) return null;
-  const job = store.getLatestWorktreeIntegrationJob?.(logical.repositoryId);
-  if (!job) return null;
-  const workspaceId = logical.activeWorkspaceId;
+  const workspaceId=logical.activeWorkspaceId;
+  const jobs=store.listWorktreeIntegrationJobsForWorktree?.(logical.repositoryId,workspaceId)
+    ?? [store.getLatestWorktreeIntegrationJob?.(logical.repositoryId)].filter(Boolean);
+  for(const job of jobs) {
+    const blocker=integrationDispatchBlocker(store,logical,workspaceId,job);
+    if(blocker) return blocker;
+  }
+  return null;
+}
+
+function integrationDispatchBlocker(store,logical,workspaceId,job) {
   const safety = job.details?.dispatchSafety;
   const safetyCurrent = (safety?.verifiedRevision ?? 0) === (job.details?.dispatchRevision ?? 0);
   const blocked = reason => ({ reason, jobId: job.id, worktreeId: workspaceId,
@@ -29,7 +45,7 @@ export function worktreeDispatchBlocker(store, reference) {
     if (job.status === "paused" && ["awaiting_integration_acceptance", "recovery_required"].includes(job.phase)
       && step?.kind === "acceptance" && workspaceId === step.targetWorktreeId
       && (logical.taskId ?? store.getSession?.(logical.legacySessionId)?.taskId) === step.rootTaskId) return null;
-    if (job.status === "paused" && job.phase !== "awaiting_integration_acceptance"
+    if (job.status === "paused"
       && safetyCurrent && safety?.safeWorktrees?.some(tree => tree.worktreeId === workspaceId)) return null;
     return plan.reservedWorktreeIds?.includes(workspaceId) ? blocked("WORKTREE_INTEGRATION_IN_PROGRESS") : null;
   }

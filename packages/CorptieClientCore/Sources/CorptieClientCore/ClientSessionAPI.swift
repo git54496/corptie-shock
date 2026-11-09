@@ -75,6 +75,7 @@ public struct ClientMessage: Codable, Sendable, Identifiable, Equatable {
     public var processEndedAt: String?
     /// Managed attachments (additive; older backends omit them). Bytes come from `ClientSessionAPI.image`.
     public let images: [ClientMessageImage]
+    public var coordinationProgress: ClientCoordinationProgress? = nil
     public let executionPlan: ConversationExecutionPlan?
     public let toolExecution: ConversationToolExecution?
     public let changeSet: ConversationChangeSet?
@@ -97,10 +98,11 @@ public struct ClientMessage: Codable, Sendable, Identifiable, Equatable {
         case messageOrigin, automationRunId, automationRunStatus, automationRunError
         case automationTriggerType, automationScheduleType, automationIntervalSeconds, automationConditionCheckIntervalSeconds, automationProcessPollIntervalSeconds
         case automationExpiresAt, systemEventKind, systemEventReason, systemEventSource
-        case processStartedAt, processEndedAt, images, executionPlan, toolExecution, changeSet, userInput, options
+        case coordinationProgress, processStartedAt, processEndedAt, images, executionPlan, toolExecution, changeSet, userInput, options
     }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        coordinationProgress = try? container.decodeIfPresent(ClientCoordinationProgress.self, forKey: .coordinationProgress)
         id = try container.decode(String.self, forKey: .id)
         turnId = try container.decodeIfPresent(String.self, forKey: .turnId)
         type = try container.decode(String.self, forKey: .type)
@@ -251,7 +253,9 @@ public struct ClientMessageImage: Codable, Sendable, Equatable, Identifiable {
     public var geometry: MessageImageGeometry? { .init(pixelWidth: pixelWidth, pixelHeight: pixelHeight) }
 }
 extension ClientMessage: ConversationExecutionItem {
+    public var timelineLegacyMessageStatus: String? { status }
     public var timelineHasImages: Bool { !images.isEmpty }
+    public var timelineMessageOrigin: String? { messageOrigin }
     public var executionTitle: String { title ?? "" }
     public var timelineTurnID: String { turnId ?? "" }
     public var timelineTurnStatus: String { turnStatus ?? "" }
@@ -512,6 +516,13 @@ public struct ClientSessionAPI: Sendable {
         request.httpMethod = "DELETE"
         let result: Result = try await read(request)
         guard result.status == "deleted", result.messageId == messageId else { throw ClientConnectionError.invalidResponse }
+    }
+    public func userMessageNavigation(sessionId: String, cursor: String? = nil, direction: String = "older") async throws -> ClientUserMessageNavigationPage {
+        let query = [URLQueryItem(name: "direction", value: direction)]
+            + (cursor.map { [URLQueryItem(name: "cursor", value: $0)] } ?? [])
+        let value: ClientUserMessageNavigationPage = try await read(transport.endpoint.request(
+            path: ["client", "v1", "sessions", sessionId, "user-message-navigation"], query: query))
+        return try value.validated()
     }
     public func quickMessages(sessionId: String) async throws -> ClientQuickMessageRecommendations {
         var request = try transport.endpoint.request(path: ["client", "v1", "sessions", sessionId, "quick-messages"])

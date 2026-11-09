@@ -1,3 +1,4 @@
+import { logError } from "../utils/errorDiagnostics.mjs";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
@@ -36,6 +37,10 @@ export class TimelineReadPool {
 
   readUnifiedSearch(input) {
     return this.#singleFlight("unifiedSearch", input);
+  }
+
+  readUserMessageNavigation(input) {
+    return this.#singleFlight("userMessageNavigation", input);
   }
 
   readQuickMessages(input) {
@@ -143,6 +148,8 @@ export class TimelineReadPool {
       try {
         request.resolve(JSON.parse(new TextDecoder().decode(message.payload)));
       } catch (error) {
+        // Parser messages may contain Timeline bytes; never log that payload.
+        logError("timeline-pool.response", { name: error.name, message: "Worker result decoding failed." }, { stage: "decode-worker-result" });
         request.reject(timelineReadError(
           `Timeline read Worker returned an invalid payload: ${error.message}`,
           "TIMELINE_READ_PAYLOAD_INVALID",

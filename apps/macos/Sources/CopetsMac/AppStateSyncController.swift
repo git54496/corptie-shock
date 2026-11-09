@@ -1,4 +1,5 @@
 import Foundation
+import CorptieClientCore
 
 enum StateStreamLivenessPolicy {
     // Backend emits a heartbeat every 15 seconds. Two missed heartbeats plus a
@@ -15,31 +16,72 @@ enum StateStreamLivenessPolicy {
     }
 }
 
+/// Decode on a dedicated serial executor; only typed, Sendable values cross
+/// back to the main actor that owns AppStateStore.
+actor StateStreamDecoder {
+    enum Frame: Sendable {
+        case snapshot(StateSnapshotEnvelope)
+        case changes(StateChangeSetEnvelope)
+        case ignored
+    }
+    private let decoder: JSONDecoder = {
+        let value = JSONDecoder()
+        value.keyDecodingStrategy = .convertFromSnakeCase
+        return value
+    }()
+    func decodeSnapshot(_ data: Data) throws -> StateSnapshotEnvelope {
+        try decoder.decode(StateSnapshotEnvelope.self, from: data)
+    }
+    func decodeFrame(name: String, data: String) throws -> Frame {
+        guard let bytes = data.data(using: .utf8), !bytes.isEmpty else { return .ignored }
+        switch name {
+        case "state-snapshot": return .snapshot(try decodeSnapshot(bytes))
+        case "state-change-set": return .changes(try decoder.decode(StateChangeSetEnvelope.self, from: bytes))
+        default: return .ignored
+        }
+    }
+}
+
 @MainActor
 final class AppStateSyncController {
     static let shared = AppStateSyncController()
 
-    private let store = AppStateStore.shared
-    private let baseURL = CorptieAppEnvironment.backendBaseURL
-    private let transport = CorptieAppEnvironment.backendTransport
+    private let store: AppStateStore
+    private let baseURL: URL
+    private let transport: BackendTransport
+    private let artifactsChanged: () -> Void
+    private let decoder = StateStreamDecoder()
     private var streamTask: Task<Void, Never>?
     private var streamWatchdogTask: Task<Void, Never>?
     private var streamGeneration: UInt64 = 0
     private var streamLastActivityAt = Date()
     private var snapshotRequestGeneration: UInt64 = 0
     private var backgroundActivity: NSObjectProtocol?
-    private let decoder: JSONDecoder = {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return decoder
-    }()
+    private var snapshotTask: Task<Void, Never>?
+    private var snapshotMinimumRevision: Int64 = 0
+    private var processingGeneration: UInt64?
 
-    private init() {}
+    /// State change-sets arriving inside this window are applied as a single
+    /// `@Published state` publication. The backend already coalesces at 20ms,
+    /// but several server paths bypass that timer; applying each frame on its
+    /// own invalidated every `$state` subscriber during Agent streaming.
+    private static let changeSetBatchWindow = Duration.milliseconds(40)
+    private var pendingChangeSets: [StateChangeSetEnvelope] = []
+    private var pendingChangeSetGeneration: UInt64?
+    private var changeSetFlushTask: Task<Void, Never>?
+
+    init(store: AppStateStore = .shared, baseURL: URL = CorptieAppEnvironment.backendBaseURL,
+         transport: BackendTransport = CorptieAppEnvironment.backendTransport,
+         artifactsChanged: @escaping () -> Void = { ArtifactAPIClient.shared.refreshLoadedCollectionsAfterExternalChange() }) {
+        self.store = store; self.baseURL = baseURL; self.transport = transport
+        self.artifactsChanged = artifactsChanged
+    }
+
+    var isProcessingEvents: Bool { processingGeneration == streamGeneration || snapshotTask != nil }
 
     func start() {
         guard streamTask == nil else { return }
         beginBackgroundActivityIfNeeded()
-        snapshotRequestGeneration &+= 1
         restartStream(refreshSnapshotFirst: true)
     }
 
@@ -52,7 +94,7 @@ final class AppStateSyncController {
             start()
             return
         }
-        guard StateStreamLivenessPolicy.hasExpired(
+        guard !isProcessingEvents, StateStreamLivenessPolicy.hasExpired(
             lastActivityAt: streamLastActivityAt,
             now: now
         ) else { return }
@@ -70,26 +112,58 @@ final class AppStateSyncController {
         streamWatchdogTask?.cancel()
         streamWatchdogTask = nil
         streamGeneration &+= 1
-        snapshotRequestGeneration &+= 1
+        cancelSnapshotRefresh()
+        discardPendingChangeSets()
+        processingGeneration = nil
         if let backgroundActivity {
             ProcessInfo.processInfo.endActivity(backgroundActivity)
             self.backgroundActivity = nil
         }
     }
 
-    func refreshSnapshot() async {
+    private func cancelSnapshotRefresh() {
+        snapshotRequestGeneration &+= 1
+        snapshotTask?.cancel(); snapshotTask = nil
+        snapshotMinimumRevision = 0
+    }
+
+    func refreshSnapshot(minimumRevision: Int64 = 0) async {
+        guard ChatTimelineFeatureFlags.current.fixtureMode == .disabled, !Task.isCancelled else { return }
+        snapshotMinimumRevision = max(snapshotMinimumRevision, minimumRevision)
+        if let snapshotTask { await snapshotTask.value; return }
         snapshotRequestGeneration &+= 1
         let requestGeneration = snapshotRequestGeneration
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.loadSnapshot(requestGeneration: requestGeneration)
+        }
+        snapshotTask = task
+        await task.value
+    }
+
+    private func loadSnapshot(requestGeneration: UInt64) async {
+        defer {
+            if requestGeneration == snapshotRequestGeneration {
+                snapshotTask = nil
+                snapshotMinimumRevision = 0
+            }
+        }
         do {
-            let (data, response) = try await transport.data(for:
-                URLRequest(url: baseURL.appending(path: "state/snapshot")))
-            try Self.requireSuccess(response)
-            let snapshot = try decoder.decode(StateSnapshotEnvelope.self, from: data)
-            guard requestGeneration == snapshotRequestGeneration else { return }
-            store.apply(snapshot: snapshot)
-            ArtifactAPIClient.shared.refreshLoadedCollectionsAfterExternalChange()
+            // At most one follow-up if a newer gap arrives during the first read.
+            // A persistently stale backend must not create a tight recovery loop.
+            for _ in 0..<2 {
+                try Task.checkCancellation()
+                let (data, response) = try await transport.data(for:
+                    URLRequest(url: baseURL.appending(path: "state/snapshot")))
+                try Self.requireSuccess(response)
+                let snapshot = try await decoder.decodeSnapshot(data)
+                guard !Task.isCancelled, requestGeneration == snapshotRequestGeneration else { return }
+                if case .applied = store.apply(snapshot: snapshot) { artifactsChanged() }
+                if store.revision >= snapshotMinimumRevision { return }
+            }
+            store.reportSyncError("State snapshot has not reached the required revision.")
         } catch {
-            guard requestGeneration == snapshotRequestGeneration else { return }
+            guard !Task.isCancelled, requestGeneration == snapshotRequestGeneration else { return }
             store.reportSyncError(Self.syncErrorMessage(error))
         }
     }
@@ -101,9 +175,13 @@ final class AppStateSyncController {
     }
 
     private func restartStream(refreshSnapshotFirst: Bool) {
+        guard ChatTimelineFeatureFlags.current.fixtureMode == .disabled else { return }
         beginBackgroundActivityIfNeeded()
         streamTask?.cancel()
         streamWatchdogTask?.cancel()
+        cancelSnapshotRefresh()
+        discardPendingChangeSets()
+        processingGeneration = nil
         streamGeneration &+= 1
         let generation = streamGeneration
         streamLastActivityAt = Date()
@@ -111,6 +189,8 @@ final class AppStateSyncController {
         streamTask = Task { [weak self] in
             guard let self else { return }
             if refreshSnapshotFirst { await refreshSnapshot() }
+            guard !Task.isCancelled, generation == streamGeneration else { return }
+            streamLastActivityAt = Date()
             while !Task.isCancelled, generation == streamGeneration {
                 await consumeStream(generation: generation)
                 guard !Task.isCancelled, generation == streamGeneration else { return }
@@ -121,7 +201,8 @@ final class AppStateSyncController {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled, let self, generation == self.streamGeneration else { return }
-                guard StateStreamLivenessPolicy.hasExpired(lastActivityAt: self.streamLastActivityAt) else {
+                guard !self.isProcessingEvents,
+                      StateStreamLivenessPolicy.hasExpired(lastActivityAt: self.streamLastActivityAt) else {
                     continue
                 }
                 self.store.reportSyncError("Session state stream stopped receiving heartbeats.")
@@ -157,36 +238,90 @@ final class AppStateSyncController {
                 guard !Task.isCancelled, generation == streamGeneration else { return }
                 streamLastActivityAt = Date()
                 if event.isComment { continue }
-                await applyFrame(eventName: event.name, data: event.data)
+                guard await processFrame(event, generation: generation) else { return }
             }
+            // A clean stream close still has to commit the final batch.
+            _ = await flushPendingChangeSets(generation: generation)
         } catch {
-            guard !Task.isCancelled else { return }
+            discardPendingChangeSets()
+            guard !Task.isCancelled, generation == streamGeneration else { return }
             store.reportSyncError(Self.syncErrorMessage(error))
         }
     }
 
-    private func applyFrame(eventName: String, data: String) async {
-        guard let payload = data.data(using: .utf8), !payload.isEmpty else { return }
+    private func discardPendingChangeSets() {
+        changeSetFlushTask?.cancel()
+        changeSetFlushTask = nil
+        pendingChangeSets.removeAll(keepingCapacity: true)
+        pendingChangeSetGeneration = nil
+    }
+
+    private func enqueueChangeSet(_ changes: StateChangeSetEnvelope, generation: UInt64) {
+        if pendingChangeSetGeneration != generation {
+            changeSetFlushTask?.cancel()
+            changeSetFlushTask = nil
+            pendingChangeSets.removeAll(keepingCapacity: true)
+            pendingChangeSetGeneration = generation
+        }
+        pendingChangeSets.append(changes)
+        guard changeSetFlushTask == nil else { return }
+        changeSetFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.changeSetBatchWindow)
+            guard let self, !Task.isCancelled else { return }
+            _ = await self.flushPendingChangeSets(generation: generation)
+        }
+    }
+
+    @discardableResult
+    private func flushPendingChangeSets(generation: UInt64) async -> Bool {
+        changeSetFlushTask?.cancel()
+        changeSetFlushTask = nil
+        guard generation == streamGeneration else {
+            pendingChangeSets.removeAll(keepingCapacity: true)
+            pendingChangeSetGeneration = nil
+            return false
+        }
+        guard pendingChangeSetGeneration == generation, !pendingChangeSets.isEmpty else { return true }
+        let batch = pendingChangeSets
+        pendingChangeSets.removeAll(keepingCapacity: true)
+        let result = store.apply(changeSets: batch)
+        if result.hasArtifactInvalidations { artifactsChanged() }
+        guard let gapRevision = result.gapRevision else { return true }
+        await refreshSnapshot(minimumRevision: gapRevision)
+        return !Task.isCancelled && generation == streamGeneration && store.revision >= gapRevision
+    }
+
+    private func processFrame(_ event: ServerSentEvent, generation: UInt64) async -> Bool {
+        processingGeneration = generation
+        defer {
+            if processingGeneration == generation { processingGeneration = nil }
+            if generation == streamGeneration { streamLastActivityAt = Date() }
+        }
+        return await applyFrame(eventName: event.name, data: event.data, generation: generation)
+    }
+
+    private func applyFrame(eventName: String, data: String, generation: UInt64) async -> Bool {
         do {
-            switch eventName {
-            case "state-snapshot":
-                store.apply(snapshot: try decoder.decode(StateSnapshotEnvelope.self, from: payload))
-                ArtifactAPIClient.shared.refreshLoadedCollectionsAfterExternalChange()
-            case "state-change-set":
-                let changes = try decoder.decode(StateChangeSetEnvelope.self, from: payload)
-                let result = store.apply(changeSet: changes)
-                if !changes.artifactInvalidations.orEmpty.isEmpty, result == .applied {
-                    ArtifactAPIClient.shared.refreshLoadedCollectionsAfterExternalChange()
-                }
-                if case .revisionGap = result {
-                    await refreshSnapshot()
-                }
-            default:
-                break
+            let frame = try await decoder.decodeFrame(name: eventName, data: data)
+            guard !Task.isCancelled, generation == streamGeneration else { return false }
+            switch frame {
+            case .snapshot(let snapshot):
+                // Snapshots supersede the stream revision, so drain any pending
+                // change-sets first instead of silently dropping them.
+                guard await flushPendingChangeSets(generation: generation) else { return false }
+                if case .applied = store.apply(snapshot: snapshot) { artifactsChanged() }
+            case .changes(let changes):
+                enqueueChangeSet(changes, generation: generation)
+            case .ignored: break
             }
+            return true
         } catch {
+            discardPendingChangeSets()
+            guard !Task.isCancelled, generation == streamGeneration else { return false }
             store.reportSyncError(Self.syncErrorMessage(error))
             await refreshSnapshot()
+            // Reopen from the durable Store revision after repairing malformed input.
+            return false
         }
     }
 
@@ -217,8 +352,4 @@ final class AppStateSyncController {
             throw URLError(.badServerResponse)
         }
     }
-}
-
-private extension Optional where Wrapped == [String] {
-    var orEmpty: [String] { self ?? [] }
 }

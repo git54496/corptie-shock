@@ -1,3 +1,5 @@
+import { executionChecklistDynamicTools, callExecutionChecklistTool } from "./executionChecklistDynamicTools.mjs";
+import { sessionMailboxDynamicTools, callSessionMailboxTool } from "./sessionMailboxDynamicTools.mjs";
 import { HostToolCatalog } from "./hostToolCatalog.mjs";
 import { memoryDynamicTools, callMemoryDynamicTool } from "./memoryDynamicTools.mjs";
 import { artifactDynamicTools, authorizeArtifactDynamicTool, callArtifactDynamicTool } from "./artifactDynamicTools.mjs";
@@ -16,16 +18,22 @@ import { contextReadDynamicTools, callContextReadDynamicTool } from "./contextRe
 import { integrationRegistryDynamicTools, callIntegrationRegistryDynamicTool } from "./integrationRegistryDynamicTools.mjs";
 
 export function createHostToolCatalog({
-  memoryOperationService, artifactService, callWorkspaceDynamicTool,
+  executionChecklistService, memoryOperationService, artifactService, callWorkspaceDynamicTool,
   validateProjectCodeHostRoute, getProjectCodeApplicationService,
   sessionCollaborationV2Enabled, port, skillRegistryService,
   scheduledSessionTaskService, getBoundTaskForAgent,
   reportTaskAcceptanceForAgent, completeTaskForSession, captureTaskIntegrationForAgent,
   reviseTaskForSession, sceneService,
   getToolMaterializationPort, getPlatformOperationService,
-  getWorkChatOperationService, contextReadService, mcpRegistryService, onIntegrationChanged
+  getWorkChatOperationService, getSessionMailboxService, contextReadService, mcpRegistryService, onIntegrationChanged
 }) {
   return new HostToolCatalog([
+    { id: "execution-checklist", tools: executionChecklistDynamicTools,
+      authorize: ({ metadata }) => Boolean(metadata?.sessionId && metadata?.taskId),
+      execute: input => callExecutionChecklistTool(executionChecklistService, input) },
+    { id: "mailbox", tools: sessionMailboxDynamicTools,
+      authorize: ({ actorId, metadata }) => Boolean(actorId && metadata?.sessionId),
+      execute: input => callSessionMailboxTool(getSessionMailboxService(), input) },
     {
       id: "integration-registry",
       tools: integrationRegistryDynamicTools,
@@ -58,7 +66,7 @@ export function createHostToolCatalog({
     }),
     {
       id: "collaboration",
-      domainRevision: "2",
+      domainRevision: "3",
       tools: sessionCollaborationV2Enabled
         ? collaborationDynamicTools
         : collaborationDynamicTools.filter((tool) => !tool.name.startsWith("corptie_sessions_")

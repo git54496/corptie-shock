@@ -14,6 +14,16 @@ function check(guard, path, method = "GET", overrides = {}) {
   return { blocked, response: responses[0] };
 }
 
+test("child delivery preview reads never permit acceptance or retry writes",()=>{
+  for(const path of ["/tasks/id/child-delivery","/tasks/id/child-deliveries?limit=5","/child-deliveries/id"]) {
+    assert.equal(check(rejectDevelopmentPreviewWrite,path).blocked,false);
+    assert.equal(check(rejectDevelopmentPreviewWrite,path,"POST").blocked,true);
+  }
+  for(const path of ["/tasks/id/completion-intents","/tasks/id/confirm-completion","/child-deliveries/id/retry"]) {
+    assert.equal(check(rejectDevelopmentPreviewWrite,path,"POST").blocked,true);
+  }
+});
+
 test("startup recovery status is preview-readable while retries remain forbidden", () => {
   assert.equal(check(rejectDevelopmentPreviewWrite, "/tasks/task:one/startup-recovery", "GET").blocked, false);
   assert.equal(check(rejectDevelopmentPreviewWrite, "/tasks/task:one/startup-recovery", "POST").blocked, true);
@@ -100,4 +110,16 @@ test("main loopback router delegates the closed client surface to the device gat
     sendJson: () => assert.fail("gateway is available")
   });
   assert.deepEqual(calls, [{ receivedRequest: request, receivedResponse: response }]);
+});
+
+test("preview permits inbox reads but denies processing and settings commands", () => {
+  for (const [method, path, blocked] of [
+    ["GET", "/sessions/session%3Aone/mailbox", false],
+    ["GET", "/sessions/session%3Aone/mailbox/messages/mailbox%3Aone", false],
+    ["POST", "/sessions/session%3Aone/mailbox/settings", true],
+    ["POST", "/sessions/session%3Aone/mailbox/messages/mailbox%3Aone/process", true]
+  ]) {
+    assert.equal(rejectDevelopmentPreviewWrite({ request: { method }, response: {},
+      url: new URL(path, "http://localhost"), developmentPreview: true, sendJson() {} }), blocked);
+  }
 });

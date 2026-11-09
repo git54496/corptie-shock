@@ -2,6 +2,8 @@
 // has no Session route to recover, so it can go straight to the validating,
 // idempotent Worktree ensure operation. Existing Sessions still require a full
 // inventory because their previous logical route may be reusable or repairable.
+import { measureStartup } from "../utils/startupTiming.mjs";
+
 export class TaskWorkspaceService {
   constructor(options = {}) {
     this.store = options.store;
@@ -20,7 +22,10 @@ export class TaskWorkspaceService {
     }
   }
 
-  async ensure({ task, session = null, baseContext = null }) {
+  async ensure({ task, session = null, baseContext = null, startupTiming = null }) {
+    if (task.parent_task_id && !session?.id) {
+      return { ...(await this.ensureWorktree({ taskId: task.id, startupTiming })), requiresSessionTransition: false };
+    }
     const context = this.store.getTaskWorkspaceContext(task);
     if (!context?.workspace) throw workspaceRequiredError();
     const repositoryId = context.repository?.id ?? "";
@@ -28,13 +33,13 @@ export class TaskWorkspaceService {
 
     let project;
     try {
-      project = await this.requireProject(repositoryId);
+      project = await measureStartup(startupTiming, "workspace.require-project", () => this.requireProject(repositoryId));
     } catch (error) {
       if (error?.code !== "PROJECT_NOT_FOUND") throw error;
       throw workspaceBindingInvalidError(repositoryId);
     }
     try {
-      await this.accessWorkspace(project.mainPath);
+      await measureStartup(startupTiming, "workspace.access-main", () => this.accessWorkspace(project.mainPath));
     } catch (error) {
       throw workspaceUnavailableError(project.mainPath, error);
     }
@@ -45,18 +50,20 @@ export class TaskWorkspaceService {
     // first-execution decision and previously duplicated that Git work.
     if (!session?.id) {
       return {
-        ...(await this.ensureWorktree({
+        ...(await measureStartup(startupTiming, "workspace.ensure-task-worktree", span => this.ensureWorktree({
           repositoryId,
           workingDirectory: project.mainPath,
-          taskId: task.id,
+          taskId: task.id, ...(span ? { startupTiming: span } : {}),
           ...(baseContext ? { baseContext } : {})
-        })),
+        }))),
         requiresSessionTransition: false
       };
     }
 
-    const inspection = await this.inspectProject(project.mainPath, repositoryId);
     const route = this.store.getLogicalSessionByLegacySessionId(session.id);
+    const inspection = await this.inspectProject(project.mainPath, repositoryId, {
+      inspectionLevel: "session", activeWorkspaceId: route?.activeWorkspaceId
+    });
     const previous = route?.activeWorkspaceId
       ? inspection.worktrees.find((candidate) => candidate.worktreeId === route.activeWorkspaceId)
       : null;

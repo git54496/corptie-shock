@@ -455,7 +455,7 @@ private struct PadResidentTabPage: View {
                 onOpenAutomation: { id in
                     if let destination = controls.selectAutomation(id: id) { open(destination) }
                 }, navigationGesturesEnabled: active)
-        case .automations, .worktrees, .agents:
+        case .automations, .worktrees, .roles:
             PadControlView(tab: page, connection: connection, store: controls, openSession: openSession)
         case .resources:
             ResourceBrowser(focus: $navigation.resourceFocus, active: active,
@@ -744,7 +744,7 @@ private struct PadGeneralSettingsView: View {
             } header: {
                 Text("通用")
             } footer: {
-                Text("会话、自动化、Worktree 与 Agent 数据均由已配对的 Mac 通过长连接主动推送。")
+                Text("会话、自动化、Worktree 与角色数据均由已配对的 Mac 通过长连接主动推送。")
             }
             Section {
                 NavigationLink {
@@ -910,9 +910,13 @@ private struct PadNotificationSettingsView: View {
             Section {
                 notificationToggle(
                     "计划任务通知",
-                    description: "计划任务完成、终态失败、取消或过期时通知；周期完成会自动覆盖，避免刷屏。",
+                    description: "只提醒新的执行结果；历史同步不补弹，离线恢复合并提醒，周期完成自动覆盖。",
                     isOn: $preferences.notifyOnAutomations
                 )
+                if !manager.automationEventFeedAvailable {
+                    Text("当前连接尚未启用通知事件恢复；旧版服务端仅支持在线观察到的结果变化，不补发离线历史。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
             }
 
             Section("任务通知") {

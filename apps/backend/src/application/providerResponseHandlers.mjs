@@ -1,3 +1,4 @@
+import { logError } from "../utils/errorDiagnostics.mjs";
 // Watchdog policy bridges timers to the same durable Provider event path used
 // by normal execution. Terminal projection precedes best-effort interruption.
 export function createProviderResponseHandlers({
@@ -40,7 +41,9 @@ export function createProviderResponseHandlers({
       type: "provider.error",
       error: {
         code: "PROVIDER_RESPONSE_DELAYED",
-        message: entry.probeReasonCode === "PROBE_UNSUPPORTED"
+        message: entry.warningKind === "connection_retry"
+          ? "模型连接尚未恢复，正在等待 Provider 的重连结果。您可以手动停止。"
+          : entry.probeReasonCode === "PROBE_UNSUPPORTED"
           ? "当前 Provider 不支持查询执行状态，尚未收到模型输出；仍在等待，您可以手动停止。"
           : entry.warningKind === "execution_unknown"
             ? `暂时无法确认模型执行状态，正在继续核验；您可以手动停止，本次消息不会自动重发。${entry.probeReasonCode ? `（${entry.probeReasonCode}）` : ""}`
@@ -105,6 +108,7 @@ export function createProviderResponseHandlers({
         source: { type: "system", reason: "provider_response_timeout" }
       });
     } catch (error) {
+      logError("provider-response-watchdog.interrupt", error, { sessionId: entry.sessionId, turnId: entry.turnId });
       console.warn(`[provider-response-watchdog] Provider interrupt failed session=${entry.sessionId} turn=${entry.turnId} code=${error?.code ?? "UNKNOWN"}`);
     }
   }

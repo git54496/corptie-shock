@@ -1,3 +1,4 @@
+import CorptieClientCore
 import Foundation
 
 enum TimelineAnchorWindowLoadResult: Equatable {
@@ -58,7 +59,8 @@ final class SessionTimelineHistoryController: ObservableObject {
     func loadTimelineWindow(
         for session: TaskSession,
         anchorRowID: String,
-        expectedSelectionGeneration: UInt64?
+        expectedSelectionGeneration: UInt64?,
+        retainedTailLimit: Int? = nil, acceptsResult: () -> Bool = { true }
     ) async -> TimelineAnchorWindowLoadResult {
         let anchorKind: String
         let anchorID: String
@@ -85,6 +87,7 @@ final class SessionTimelineHistoryController: ObservableObject {
               timelineWindowLoadSessionIDs.insert(session.id).inserted else {
             return .stale
         }
+        SessionTimelineRepository.shared.state(for: session.id).setProtectsHistoryWindow(true)
         let threadID = current.id
         defer { timelineWindowLoadSessionIDs.remove(session.id) }
 
@@ -113,10 +116,11 @@ final class SessionTimelineHistoryController: ObservableObject {
                   latest.id == threadID else {
                 return .stale
             }
+            guard acceptsResult() else { return .stale }
             guard window.anchor.status == "found" else { return .missing }
             let mergedItems = SessionHistoryPageMerger.mergeAnchorWindow(
                 window.items,
-                with: latest.items
+                with: latest.items, retainedTailLimit: retainedTailLimit
             )
             let merged = CodexThreadDetail(
                 id: latest.id,
@@ -145,6 +149,7 @@ final class SessionTimelineHistoryController: ObservableObject {
         } catch is CancellationError {
             return .stale
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "SessionTimelineHistoryController.loadTimelineWindow")
             return .unavailable
         }
     }
@@ -165,7 +170,8 @@ final class SessionTimelineHistoryController: ObservableObject {
     @discardableResult
     func loadEarlierMessages(
         for session: TaskSession,
-        expectedSelectionGeneration: UInt64? = nil
+        expectedSelectionGeneration: UInt64? = nil,
+        protectsHistoryWindow: Bool = true
     ) async -> EarlierHistoryLoadState {
         let threadId = session.external?.threadId ?? session.id
         guard (expectedSelectionGeneration == nil || Self.historyPageRequestIsCurrent(
@@ -187,6 +193,9 @@ final class SessionTimelineHistoryController: ObservableObject {
         }
         guard earlierHistoryLoadSessionIDs.insert(session.id).inserted else {
             return earlierHistoryLoadState(for: session.id)
+        }
+        if protectsHistoryWindow {
+            SessionTimelineRepository.shared.state(for: session.id).setProtectsHistoryWindow(true)
         }
         setEarlierHistoryLoadState(.loading, for: session.id)
         defer { earlierHistoryLoadSessionIDs.remove(session.id) }
@@ -263,6 +272,7 @@ final class SessionTimelineHistoryController: ObservableObject {
             setEarlierHistoryLoadState(.idle, for: session.id)
             return .idle
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "SessionTimelineHistoryController.loadEarlierMessages")
             let state = EarlierHistoryLoadState.failed(error.localizedDescription)
             setEarlierHistoryLoadState(state, for: session.id)
             return state

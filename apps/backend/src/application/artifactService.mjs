@@ -133,6 +133,7 @@ export class ArtifactService {
   }
 
   context(input = {}) {
+    if (input.kind === "parent_task_deletion") return this.#parentDeletionContext(input);
     if (input.kind === "platform_admin") {
       const binding = resolvePlatformAdminSession(this.store, input);
       const workId = requiredText(input.workId, "workId");
@@ -151,7 +152,8 @@ export class ArtifactService {
       input.revalidateUser?.();
       const workId = input.workId == null ? null : requiredText(input.workId, "workId");
       if (workId && !this.store.getWork(workId)) throw artifactError("ARTIFACT_WORK_NOT_FOUND", "Work not found.", 404);
-      return { kind: "local_user", actorId: input.actorId ?? "local-user", workId, sessionId: null, taskId: null, revalidateUser: input.revalidateUser };
+      return { kind: "local_user", actorId: input.actorId ?? "local-user", workId, sessionId: null, taskId: null, revalidateUser: input.revalidateUser,
+        childDeliveryOperationId:input.childDeliveryOperationId };
     }
     const resolved = this.sessionAuthorizationResolver.resolve({
       actorId: input.actorId,
@@ -198,6 +200,7 @@ export class ArtifactService {
   listForTask(contextInput, taskIdValue, options = {}) {
     const context = this.context(contextInput);
     const taskId = requiredText(taskIdValue, "taskId");
+    if (context.kind === "parent_task_deletion" && context.taskId !== taskId) throw artifactError("TASK_DELETE_FORBIDDEN", "删除作业不拥有此 Task。", 403);
     const task = this.store.getTask(taskId);
     if (!task) throw artifactError("ARTIFACT_TASK_NOT_FOUND", "Task not found.", 404);
     if (task.work_id !== context.workId) {
@@ -510,6 +513,9 @@ export class ArtifactService {
     });
     try {
       this.store.runInTransaction(() => {
+        const currentContext=this.context(contextInput);
+        this.#validateBinding(currentContext.workId,visibility,input);
+        this.#assertCanManageArtifact(currentContext,{workId:currentContext.workId,scope,...binding});
         this.store.createArtifactMetadata({
           artifactId, workId: context.workId, title: requiredText(input.title, "title"),
           summary: optionalText(input.summary) ?? "", visibility, scope, ...taxonomy, ...binding,
@@ -549,6 +555,7 @@ export class ArtifactService {
   }
 
   async #createWorkerArtifact(context, input) {
+    this.#assertCanManageArtifact(context, { workId: context.workId, scope:"task", boundTaskId: context.taskId });
     const idempotencyKey = requiredText(input.idempotencyKey, "idempotencyKey");
     if (idempotencyKey.length > 200) {
       throw artifactError("ARTIFACT_IDEMPOTENCY_KEY_INVALID", "idempotencyKey must not exceed 200 characters.", 400);
@@ -612,6 +619,7 @@ export class ArtifactService {
           || currentTask.deletion_status === "deleting") {
           throw artifactError("ARTIFACT_TASK_FORBIDDEN", "Worker Session no longer has an active authoritative Task binding.", 403);
         }
+        this.#assertCanManageArtifact(context,{workId:context.workId,scope:"task",boundTaskId:context.taskId});
         this.store.createArtifactMetadata({
           artifactId, workId: context.workId, title, summary,
           visibility: "task_private", scope: "task", ...taxonomy,
@@ -1119,6 +1127,20 @@ export class ArtifactService {
     return revoked;
   }
 
+  async transferChildDeliveryArtifact(operation,pin,revalidate) {
+    revalidate();
+    if(!operation.snapshot.artifacts.some(item=>item.artifactId===pin.artifactId)
+      || operation.snapshot.parentTaskId!==operation.parentTaskId) throw artifactError("ARTIFACT_WRITE_FORBIDDEN","Artifact is outside the accepted delivery.",403);
+    const context={kind:"local_user",actorId:operation.actor.id,workId:operation.workId,
+      revalidateUser:revalidate,childDeliveryOperationId:operation.operationId};
+    const receipt=await this.transferOwnership(context,pin.artifactId,{scope:"task",taskId:operation.parentTaskId,
+      expectedResourceVersion:pin.resourceVersion,idempotencyKey:`child-delivery:${operation.operationId}:${pin.artifactId}`});
+    if(!this.store.listArtifactReferences({artifactId:pin.artifactId}).some(ref=>ref.taskId===operation.parentTaskId && !ref.revokedAt)) {
+      this.createReference(context,pin.artifactId,{taskId:operation.parentTaskId,relation:"handoff",versionPolicy:"fixed",version:pin.currentVersion});
+    }
+    return {artifactId:pin.artifactId,resourceVersion:receipt.resourceVersion};
+  }
+
   async transferOwnership(contextInput, artifactId, input = {}) {
     const context = this.context(contextInput);
     const sessionId = context.sessionId ?? `local-actor:${context.actorId}`;
@@ -1276,9 +1298,30 @@ export class ArtifactService {
     return this.present(updated);
   }
 
+  #parentDeletionContext(input) {
+      const operation = this.store.getTaskDeletionOperation(input.operationId);
+      const task = this.store.getTask(operation?.taskId);
+      const logical = this.store.getLogicalSession(input.actorId);
+      const session = logical && this.store.getSession(logical.legacySessionId);
+      let ancestor = task;
+      const visited = new Set();
+      while (ancestor?.parent_task_id && ancestor.parent_task_id !== session?.taskId && !visited.has(ancestor.id)) {
+        visited.add(ancestor.id); ancestor = this.store.getTask(ancestor.parent_task_id);
+      }
+      if (operation?.state !== "running" || task?.deletion_status !== "deleting"
+        || operation.input.actor?.type !== "parent_session" || operation.input.actor.id !== logical?.logicalSessionId
+        || logical?.activeBinding?.state !== "active" || logical.archived || session?.archived || session?.deletedAt
+        || ancestor?.parent_task_id !== session?.taskId || task.work_id !== session?.workId) {
+        throw artifactError("TASK_DELETE_FORBIDDEN", "Artifact 删除必须绑定当前父会话的删除作业。", 403);
+      }
+      return { kind: "parent_task_deletion", actorId: logical.logicalSessionId, sessionId: session.id, taskId: task.id, workId: task.work_id,
+        operationId: operation.operationId, artifactIds: operation.input.target?.artifactIds ?? [] };
+  }
+
   async disposeBoundArtifactsForTaskDeletion(contextInput, taskIdValue, disposition) {
     const context = this.context(contextInput);
     const taskId = requiredText(taskIdValue, "taskId");
+    if (context.kind === "parent_task_deletion" && context.taskId !== taskId) throw artifactError("TASK_DELETE_FORBIDDEN", "删除作业不拥有此 Task。", 403);
     const task = this.store.getTask(taskId);
     if (!task || task.work_id !== context.workId) {
       throw artifactError("ARTIFACT_TASK_NOT_FOUND", "Task not found for Artifact disposal.", 404);
@@ -2020,6 +2063,10 @@ export class ArtifactService {
   }
 
   #assertCanManageArtifact(context, artifact) {
+    const closing=this.store.selectOne(`SELECT operation_id FROM child_task_delivery_operations
+      WHERE state IN ('queued','running','waiting') AND (child_task_id=? OR EXISTS
+        (SELECT 1 FROM sessions s WHERE s.task_id=child_task_id AND s.id=?)) LIMIT 1`,[artifact.boundTaskId ?? null,artifact.boundSessionId ?? null]);
+    if(closing && context.kind!=="parent_task_deletion" && context.childDeliveryOperationId!==closing.operation_id) throw artifactError("CHILD_DELIVERY_IN_PROGRESS","子任务正在交付，暂不允许修改其 Artifact。",409);
     if (this.#canManageArtifact(context, artifact)) return;
     if (context.kind !== "worker") throw artifactError("ARTIFACT_WRITE_FORBIDDEN", "Session cannot manage Work Artifacts.", 403);
     throw artifactError(
@@ -2032,6 +2079,7 @@ export class ArtifactService {
   #canManageArtifact(context, artifact) {
     if (context.kind === "assistantChat") return artifact.scope === "session" && artifact.boundSessionId === context.sessionId;
     if (artifact.workId !== context.workId) return false;
+    if (context.kind === "parent_task_deletion") return context.artifactIds.includes(artifact.artifactId);
     if (["local_user", "platform_admin"].includes(context.kind)) return true;
     if (context.kind === "workChat") return artifact.scope === "work";
     if (context.kind !== "worker") return false;

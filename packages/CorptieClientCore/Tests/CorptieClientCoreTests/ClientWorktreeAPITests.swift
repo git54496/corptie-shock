@@ -3,6 +3,139 @@ import Testing
 @testable import CorptieClientCore
 
 @Suite(.serialized) struct ClientWorktreeAPITests {
+    @Test func missingCapabilitiesAreReadOnlyAndLegacyCompletionDoesNotInventEvidence() throws {
+        var value = try JSONSerialization.jsonObject(with: Data(#"{"id":"job:legacy","repositoryId":"repo","status":"paused","phase":"unknown_future_phase","planFingerprint":"fp","createdAt":"now","updatedAt":"now","plan":{"repositoryId":"repo","mainWorktreeId":"main","mainPath":"/repo","inventoryVersion":"1","mergeOrder":[],"blockingRisks":[],"items":[]},"progress":{"completed":0,"total":1,"fraction":0}}"#.utf8)) as! [String: Any]
+        let legacy = try JSONDecoder().decode(ClientWorktreeJob.self, from: JSONSerialization.data(withJSONObject: value))
+        #expect(legacy.availableActions == nil)
+        #expect(!legacy.canCancel && !legacy.supports("rollback") && !legacy.supports("confirm"))
+        for status in ["completed", "canceled"] {
+            value["status"] = status
+            value["conflictResolution"] = ["status": "running", "agentId": NSNull(), "sessionId": NSNull(), "error": NSNull()]
+            let terminal = try JSONDecoder().decode(ClientWorktreeJob.self, from: JSONSerialization.data(withJSONObject: value))
+            #expect(!terminal.shouldPoll)
+            #expect(terminal.completionEvidence == nil)
+        }
+    }
+
+    @Test func malformedFailureCodeIsRejectedRatherThanSilentlyHidden() throws {
+        for raw in ["true", "{}", "[]"] {
+            let json = "{\"status\":\"blocked\",\"scopeWorktreeIds\":[],\"completedWorktreeIds\":[],\"conflictFiles\":[],\"failureCode\":\(raw)}"
+            #expect(throws: DecodingError.self) { try JSONDecoder().decode(ClientWorktreeConflictAutomation.self, from: Data(json.utf8)) }
+        }
+        let missing = try JSONDecoder().decode(ClientWorktreeConflictAutomation.self,
+            from: Data(#"{"status":"blocked","scopeWorktreeIds":[],"completedWorktreeIds":[],"conflictFiles":[]}"#.utf8))
+        #expect(missing.failureCode == nil)
+    }
+
+    @Test func staleRegistrationDeletionCarriesExplicitOperation() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorktreeProtocol.self]
+        let api = ClientWorktreeAPI(transport: try BackendTransport(
+            endpoint: BackendEndpoint(URL(string: "http://127.0.0.1:1")!), configuration: configuration))
+        WorktreeProtocol.handler = { request in
+            #expect(request.url?.path == "/client/v1/worktrees/repositories/repo/worktrees/stale/delete")
+            let body = try JSONSerialization.jsonObject(with: requestBody(request)) as! [String: Any]
+            #expect(body["action"] as? String == "remove_stale_registration")
+            return "{}"
+        }
+        try await api.delete(repositoryId: "repo", worktreeId: "stale", registrationOnly: true)
+    }
+
+    @Test func rollbackPreviewAndConfirmationRetainExactJobReviewAndImpactChoices() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorktreeProtocol.self]
+        let api = ClientWorktreeAPI(transport: try BackendTransport(
+            endpoint: BackendEndpoint(URL(string: "http://127.0.0.1:1")!), configuration: configuration))
+        let job = #"{"id":"job:rollback","repositoryId":"repo","status":"paused","phase":"rollback_review","planFingerprint":"review","createdAt":"now","updatedAt":"now","availableActions":["rollback","resume","cancel"],"plan":{"repositoryId":"repo","mainWorktreeId":"main","mainPath":"/repo","inventoryVersion":"1","mergeOrder":[],"blockingRisks":[],"items":[]},"progress":{"completed":1,"total":2,"fraction":0.5}}"#
+        let preview = #"{"id":"review:exact","jobId":"job:rollback","targets":[{"worktreeId":"main","path":"/repo","branchName":"main","baselineHead":"before","currentHead":"after","operation":null,"changedFiles":[" M shared.txt"],"ownedCommits":["merged"],"additionalCommits":["extra"],"requiresPreservation":true,"published":false,"mode":"review_additional_history"}]}"#
+        WorktreeProtocol.handler = { request in
+            #expect(request.url?.path == "/client/v1/worktrees/jobs/job:rollback/actions/cancel-preview")
+            return "{\"job\":\(job),\"rollback\":\(preview)}"
+        }
+        let prepared = try await api.prepareRollback(jobId: "job:rollback")
+        let review = try #require(prepared.rollback)
+        #expect(review.targets[0].additionalCommits == ["extra"])
+        #expect(prepared.job.supports("resume"))
+        WorktreeProtocol.handler = { request in
+            #expect(request.url?.path == "/client/v1/worktrees/jobs/job:rollback/actions/rollback")
+            let body = try JSONSerialization.jsonObject(with: requestBody(request)) as! [String: Any]
+            #expect(body["confirmed"] as? Bool == true)
+            #expect(body["reviewId"] as? String == "review:exact")
+            #expect(body["discardChanges"] as? Bool == true)
+            #expect(body["includeAdditionalCommits"] as? Bool == false)
+            return "{\"job\":\(job)}"
+        }
+        _ = try await api.rollback(jobId: prepared.job.id, reviewId: review.id, discardChanges: true, includeAdditionalCommits: false)
+        WorktreeProtocol.handler = { request in
+            #expect(request.url?.path == "/client/v1/worktrees/jobs/job:rollback/actions/resume")
+            return "{\"job\":\(job)}"
+        }
+        _ = try await api.resumeRollbackReview(jobId: prepared.job.id)
+    }
+    @Test func markdownRecoveryKeepsExactJobAndBlockerOnPairedDeviceRoutes() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WorktreeProtocol.self]
+        let api = ClientWorktreeAPI(transport: try BackendTransport(
+            endpoint: BackendEndpoint(URL(string: "http://127.0.0.1:1")!), configuration: configuration))
+        let response = #"{"job":{"id":"job:policy","repositoryId":"repo","status":"paused","phase":"awaiting_commit_policy_resolution","planFingerprint":"review","createdAt":"now","updatedAt":"now","availableActions":["resolve_commit_policy","cancel"],"commitPolicyBlocker":{"id":"blocker:exact","version":3,"worktreeId":"feature","files":[{"path":"plan.md","supportedActions":["ignore","artifact","track","delete"],"appliedAction":null}]},"commitPolicyResidue":{"id":"residue","paths":["old.md"],"supportedActions":["keep_ignore","track"]},"plan":{"repositoryId":"repo","mainWorktreeId":"main","mainPath":"/repo","inventoryVersion":"1","mergeOrder":[],"blockingRisks":[],"items":[]},"progress":{"completed":0,"total":1,"fraction":0}}}"#
+        WorktreeProtocol.handler = { request in
+            #expect(request.httpMethod == "POST")
+            #expect(request.url?.path == "/client/v1/worktrees/jobs/job:policy/actions/commit-policy-prepare")
+            return response
+        }
+        let job = try await api.prepareCommitPolicy(jobId: "job:policy")
+        let blocker = try #require(job.commitPolicyBlocker)
+        #expect(blocker.files.first?.supportedActions.contains("artifact") == true)
+        #expect(job.commitPolicyResidue?.paths == ["old.md"])
+        WorktreeProtocol.handler = { request in
+            #expect(request.url?.path == "/client/v1/worktrees/jobs/job:policy/actions/commit-policy-decisions")
+            let body = try JSONSerialization.jsonObject(with: requestBody(request)) as! [String: Any]
+            #expect(body["blockerId"] as? String == "blocker:exact")
+            #expect(body["version"] as? Int == 3)
+            #expect(body["decisions"] as? [[String: String]] == [["path": "plan.md", "action": "artifact"]])
+            return response
+        }
+        _ = try await api.resolveCommitPolicy(jobId: job.id, blocker: blocker, decisions: [.init(path: "plan.md", action: "artifact")])
+        WorktreeProtocol.handler = { request in
+            #expect(request.url?.path == "/client/v1/worktrees/jobs/job:policy/actions/commit-policy-residue")
+            let body = try JSONSerialization.jsonObject(with: requestBody(request)) as! [String: Any]
+            #expect(body["decisions"] as? [[String: String]] == [["path": "old.md", "action": "keep_ignore"]])
+            return response
+        }
+        _ = try await api.resolveCommitPolicyResidue(jobId: job.id, decisions: [.init(path: "old.md", action: "keep_ignore")])
+    }
+    @Test func conflictAutomationAcceptsLegacyNumericProcessCodesWithoutLosingItsDiagnostic() throws {
+        let cases: [(String, String?)] = [("128", "PROCESS_EXIT_128"), ("\"128\"", "PROCESS_EXIT_128"),
+            ("\"MERGE_CONFLICT\"", "MERGE_CONFLICT"), ("null", nil)]
+        for (raw, expected) in cases {
+            let data = Data("{\"status\":\"blocked\",\"scopeWorktreeIds\":[],\"completedWorktreeIds\":[],\"conflictFiles\":[],\"failureCode\":\(raw),\"failureReason\":\"full index lock diagnostic\"}".utf8)
+            let state = try JSONDecoder().decode(ClientWorktreeConflictAutomation.self, from: data)
+            #expect(state.failureCode == expected)
+            #expect(state.failureReason == "full index lock diagnostic")
+        }
+    }
+
+    @Test func recoveryActionsAndCompleteDiagnosticsSurviveDecoding() throws {
+        var value = try JSONSerialization.jsonObject(with: Data(#"{"id":"job:1","repositoryId":"repo:one","status":"paused","phase":"failed","planFingerprint":"fingerprint","createdAt":"now","updatedAt":"now","availableActions":["repreflight","cancel"],"recovery":{"kind":"repreflight","message":"Review a fresh plan"},"plan":{"repositoryId":"repo:one","mainWorktreeId":"main","mainPath":"/repo","inventoryVersion":"1","mergeOrder":[],"blockingRisks":[],"items":[]},"progress":{"completed":1,"total":3,"fraction":0.333}}"#.utf8)) as! [String: Any]
+        let full = String(repeating: "诊断 👨‍👩‍👧‍👦\n", count: 3_000) + "LAST_DIAGNOSTIC"
+        value["diagnosticText"] = full
+        let job = try JSONDecoder().decode(ClientWorktreeJob.self, from: JSONSerialization.data(withJSONObject: value))
+        #expect(job.supports("repreflight"))
+        #expect(!job.supports("retry"))
+        #expect(job.canCancel)
+        #expect(!job.shouldPoll)
+        #expect(job.diagnosticText == full)
+        #expect(job.recovery?.kind == "repreflight")
+        value["status"] = "completed"
+        value["availableActions"] = [] as [String]
+        value["completionEvidence"] = ["schemaVersion": 1, "repositoryId": "repo:one", "mainWorktreeId": "main",
+            "branchName": "main", "mainHead": "verified-main", "verifiedHeads": ["source"], "verifiedAt": "now"] as [String: Any]
+        let completed = try JSONDecoder().decode(ClientWorktreeJob.self, from: JSONSerialization.data(withJSONObject: value))
+        #expect(completed.completionEvidence?.mainHead == "verified-main")
+        #expect(completed.completionEvidence?.verifiedHeads == ["source"])
+        #expect(!completed.canCancel)
+    }
+
     @Test func busyErrorsPreserveOptionalContextAndLegacyCompatibility() async throws {
         for rich in [false, true] {
             let context = rich ? #","busyContext":{"worktreeId":"tree","sessionId":"session","sessionTitle":"Busy Session","reason":"UNSETTLED_DELIVERY","count":3}"# : ""

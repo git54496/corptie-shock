@@ -96,6 +96,14 @@ public struct ClientManagedWorktree: Identifiable, Decodable, Equatable, Sendabl
     public let associations: [ClientWorktreeAssociation]
     public let deletionBlocker: ClientWorktreeDeletionBlocker?
     public var gitHubPush: ClientGitHubPushStatus?
+    public var cleanupAction: ClientWorktreeCleanupAction? = nil
+    public var isStaleRegistration: Bool { cleanupAction?.kind == "remove_stale_registration" }
+}
+
+public struct ClientWorktreeCleanupAction: Decodable, Equatable, Sendable {
+    public let kind: String
+    public let available: Bool
+    public let blocker: ClientWorktreeDeletionBlocker?
 }
 
 public struct ClientWorktreeAssociation: Decodable, Equatable, Sendable {
@@ -186,7 +194,68 @@ public struct ClientGitCommitProtectionStatus: Decodable, Equatable, Sendable {
     public let requiresDecision: Bool
 }
 
+public struct ClientWorktreeCommitPolicyBlocker: Decodable, Equatable, Sendable {
+    public let id: String
+    public let version: Int
+    public let worktreeId: String
+    public let files: [ClientWorktreeCommitPolicyFile]
+}
+
+public struct ClientWorktreeCommitPolicyFile: Identifiable, Decodable, Equatable, Sendable {
+    public var id: String { path }
+    public let path: String
+    public let supportedActions: [String]
+    public let appliedAction: String?
+}
+
+public struct ClientWorktreeCommitPolicyResidue: Decodable, Equatable, Sendable {
+    public let id: String
+    public let paths: [String]
+    public let supportedActions: [String]
+}
+
+public struct ClientWorktreeMarkdownDecision: Encodable, Sendable {
+    public let path: String
+    public let action: String
+    public init(path: String, action: String) { self.path = path; self.action = action }
+}
+
+public struct ClientWorktreeRollbackPreview: Decodable, Equatable, Sendable {
+    public let id: String
+    public let jobId: String
+    public let targets: [ClientWorktreeRollbackTarget]
+}
+
+public struct ClientWorktreeRollbackTarget: Identifiable, Decodable, Equatable, Sendable {
+    public var id: String { worktreeId }
+    public let worktreeId: String
+    public let path: String
+    public let branchName: String?
+    public let baselineHead: String
+    public let currentHead: String
+    public let operation: String?
+    public let changedFiles: [String]
+    public let ownedCommits: [String]
+    public let additionalCommits: [String]
+    public let requiresPreservation: Bool
+    public let published: Bool
+    public let mode: String
+}
+
+public struct ClientWorktreeRollbackEnvelope: Decodable, Sendable {
+    public let job: ClientWorktreeJob
+    public let rollback: ClientWorktreeRollbackPreview?
+}
+
 public struct ClientWorktreeJob: Identifiable, Decodable, Equatable, Sendable {
+    public var commitPolicyBlocker: ClientWorktreeCommitPolicyBlocker? = nil
+    public var commitPolicyResidue: ClientWorktreeCommitPolicyResidue? = nil
+    public var graphExecution: ClientWorktreeGraphExecution? = nil
+    public var availableActions: [String]? = nil
+    public var recovery: ClientWorktreeRecovery? = nil
+    public var diagnosticText: String? = nil
+    public var errorSummary: String? = nil
+    public var completionEvidence: ClientWorktreeCompletionEvidence? = nil
     public let notification: OperationJobSnapshot?
     public let id: String
     public let repositoryId: String
@@ -205,16 +274,46 @@ public struct ClientWorktreeJob: Identifiable, Decodable, Equatable, Sendable {
     public let conflictAutomation: ClientWorktreeConflictAutomation?
 
     public var shouldPoll: Bool {
-        ["queued", "running", "cancellation_requested", "replanning"].contains(status)
+        if ["completed", "canceled"].contains(status) { return false }
+        return ["queued", "running", "cancellation_requested", "replanning"].contains(status)
             || conflictResolution?.status == "running"
     }
     public var canCancel: Bool {
-        ["awaiting_confirmation", "queued", "running", "paused"].contains(status)
-            && conflictResolution?.status != "running"
+        supports("cancel")
     }
+    public func supports(_ action: String) -> Bool { availableActions?.contains(action) == true }
     public var hasMergeConflict: Bool {
         status == "paused" && plan.operationType != "sync"
             && plan.items.contains { $0.worktreeId == currentWorktreeId && $0.mergeStatus == "conflict" }
+    }
+}
+
+public struct ClientWorktreeRecovery: Decodable, Equatable, Sendable {
+    public let kind: String?
+    public let message: String
+}
+
+public struct ClientWorktreeCompletionEvidence: Decodable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let verifiedAt: String
+    public let repositoryId: String
+    public let mainWorktreeId: String
+    public let branchName: String?
+    public let mainHead: String
+    public let verifiedHeads: [String]
+}
+
+public struct ClientWorktreeGraphExecution: Decodable, Equatable, Sendable {
+    public struct Step: Decodable, Equatable, Sendable {
+        public let kind: String
+        public let rootTaskId: String?
+    }
+    public let index: Int
+    public let steps: [Step]
+    public let acceptanceSessionId: String?
+    public var acceptanceTaskID: String? {
+        guard steps.indices.contains(index), steps[index].kind == "acceptance" else { return nil }
+        return steps[index].rootTaskId
     }
 }
 
@@ -281,9 +380,33 @@ public struct ClientWorktreeConflictResolution: Decodable, Equatable, Sendable {
     public let worktreeId: String?
     public let taskId: String?
     public let sessionId: String?
-    public let agentId: String?
+    public let roleId: String?
     public let agentName: String?
     public let sessionStatus: String?
+    // Legacy transport names remain stable; business code uses Role.
+    enum CodingKeys: String, CodingKey {
+        case status
+        case worktreeId
+        case taskId
+        case sessionId
+        case roleId = "agentId"
+        case agentName
+        case sessionStatus
+    }
+}
+
+/// Legacy Jobs can contain numeric process exit codes. Keep that transport
+/// variation from making the entire repository or live event unreadable.
+public struct ClientWorktreeFailureCode: Decodable, Equatable, Sendable {
+    public let value: String
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let text = try? container.decode(String.self) {
+            value = Int(text).map { "PROCESS_EXIT_\($0)" } ?? text
+        } else {
+            value = "PROCESS_EXIT_\(try container.decode(Int.self))"
+        }
+    }
 }
 
 public struct ClientWorktreeConflictAutomation: Decodable, Equatable, Sendable {
@@ -293,13 +416,30 @@ public struct ClientWorktreeConflictAutomation: Decodable, Equatable, Sendable {
     public let taskId: String?
     public let sessionId: String?
     public let sessionName: String?
-    public let agentId: String?
+    public let roleId: String?
     public let agentName: String?
     public let currentWorktreeId: String?
     public let blockedWorktreeId: String?
     public let conflictFiles: [String]
-    public let failureCode: String?
+    private let rawFailureCode: ClientWorktreeFailureCode?
+    public var failureCode: String? { rawFailureCode?.value }
     public let failureReason: String?
+    // Legacy transport names remain stable; business code uses Role.
+    enum CodingKeys: String, CodingKey {
+        case status
+        case scopeWorktreeIds
+        case completedWorktreeIds
+        case taskId
+        case sessionId
+        case sessionName
+        case roleId = "agentId"
+        case agentName
+        case currentWorktreeId
+        case blockedWorktreeId
+        case conflictFiles
+        case rawFailureCode = "failureCode"
+        case failureReason
+    }
 }
 
 public struct ClientWorktreeCommitDecision: Encodable, Equatable, Sendable {
@@ -393,9 +533,46 @@ public struct ClientWorktreeAPI: Sendable {
                                                             commitProtectionDecisions: decisions))
     }
 
-    public func cancel(jobId: String) async throws -> ClientWorktreeJob {
-        struct Body: Encodable { let replan = false }
-        return try await jobAction(jobId, "cancel", Body())
+    public func cancel(jobId: String, replan: Bool = false) async throws -> ClientWorktreeJob {
+        struct Body: Encodable { let replan: Bool }
+        return try await jobAction(jobId, "cancel", Body(replan: replan))
+    }
+
+    public func prepareCommitPolicy(jobId: String) async throws -> ClientWorktreeJob {
+        try await jobAction(jobId, "commit-policy-prepare", EmptyBody())
+    }
+
+    public func prepareRollback(jobId: String) async throws -> ClientWorktreeRollbackEnvelope {
+        try await post(["client", "v1", "worktrees", "jobs", jobId, "actions", "cancel-preview"], EmptyBody())
+    }
+
+    public func resumeRollbackReview(jobId: String) async throws -> ClientWorktreeJob {
+        try await jobAction(jobId, "resume", EmptyBody())
+    }
+
+    public func rollback(jobId: String, reviewId: String, discardChanges: Bool,
+                          includeAdditionalCommits: Bool) async throws -> ClientWorktreeJob {
+        struct Body: Encodable {
+            let confirmed = true
+            let reviewId: String
+            let discardChanges: Bool
+            let includeAdditionalCommits: Bool
+        }
+        return try await jobAction(jobId, "rollback", Body(reviewId: reviewId, discardChanges: discardChanges,
+            includeAdditionalCommits: includeAdditionalCommits))
+    }
+
+    public func resolveCommitPolicy(jobId: String, blocker: ClientWorktreeCommitPolicyBlocker,
+                                    decisions: [ClientWorktreeMarkdownDecision]) async throws -> ClientWorktreeJob {
+        struct Body: Encodable { let blockerId: String; let version: Int; let decisions: [ClientWorktreeMarkdownDecision] }
+        return try await jobAction(jobId, "commit-policy-decisions",
+            Body(blockerId: blocker.id, version: blocker.version, decisions: decisions))
+    }
+
+    public func resolveCommitPolicyResidue(jobId: String,
+                                           decisions: [ClientWorktreeMarkdownDecision]) async throws -> ClientWorktreeJob {
+        struct Body: Encodable { let decisions: [ClientWorktreeMarkdownDecision] }
+        return try await jobAction(jobId, "commit-policy-residue", Body(decisions: decisions))
     }
 
     public func deletionNotification(operationId: String) async throws -> OperationJobSnapshot {
@@ -412,9 +589,10 @@ public struct ClientWorktreeAPI: Sendable {
         try await jobAction(jobId, "resolve-conflict", EmptyBody())
     }
 
-    public func delete(repositoryId: String, worktreeId: String) async throws {
+    public func delete(repositoryId: String, worktreeId: String, registrationOnly: Bool = false) async throws {
+        struct Body: Encodable { let action: String }
         let _: EmptyResponse = try await post(["client", "v1", "worktrees", "repositories", repositoryId,
-                                               "worktrees", worktreeId, "delete"], EmptyBody())
+                                               "worktrees", worktreeId, "delete"], Body(action: registrationOnly ? "remove_stale_registration" : "remove_worktree"))
     }
 
     public func workspaceAction(repositoryId: String, worktreeId: String, action: String,
@@ -430,6 +608,14 @@ public struct ClientWorktreeAPI: Sendable {
                                                    privateFilesDecision: privateFilesDecision,
                                                    neverRemindPrivateFiles: neverRemindPrivateFiles,
                                                    synchronizeSource: synchronizeSource))
+    }
+
+    public func recoverGitOperation(repositoryId: String, worktree: ClientManagedWorktree,
+                                    action: String) async throws {
+        struct Body: Encodable { let action: String; let expectedOperation: String?; let expectedHead: String? }
+        let _: EmptyResponse = try await post(["client", "v1", "worktrees", "repositories", repositoryId,
+            "workspaces", worktree.worktreeId, "actions", "git-operation"],
+            Body(action: action, expectedOperation: worktree.operationState, expectedHead: worktree.headOid))
     }
 
     public func push(repositoryId: String, worktreeId: String) async throws -> ClientGitHubPushResult {

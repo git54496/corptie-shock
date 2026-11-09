@@ -3,7 +3,7 @@ export function scheduleBackendStartupMaintenance({
   knownActiveWorktrees, worktreeIntegrationJobService, reconcileEntityTasksAtStartup,
   reconcileWorkChatsAtStartup, scheduledSessionTaskService, runtimeActivity,
   tickAgentWorkQueue, emitEvent, artifactService, feishuGateway,
-  skillRegistryService, legacySessionHistoryRepairService
+  skillRegistryService, legacySessionHistoryRepairService, childTaskDeliveryService, taskCoordinationService
 }) {
   // Store-backed APIs and state streams are the Backend readiness boundary.
   // Provider runtimes, recovery, and route verification are optional
@@ -15,19 +15,11 @@ export function scheduleBackendStartupMaintenance({
       console.warn(`[startup-interruption-reconcile] ${JSON.stringify(reconciled)}`);
     }
     const recoveredTaskDeletions = taskDeletionService.recoverInterruptedDeletions();
+    taskCoordinationService?.recover();
     if (recoveredTaskDeletions > 0) {
       console.warn(`[task-deletion-recovery] ${JSON.stringify({ recoveredTaskDeletions })}`);
     }
     trackStartupMaintenance(runProviderStartupMaintenance([...knownActiveWorktrees.values()]));
-    trackStartupMaintenance(worktreeIntegrationJobService.recover()
-      .then((recoveredWorktreeIntegrationJobs) => {
-        if (recoveredWorktreeIntegrationJobs > 0) {
-          console.log(`[worktree-integration] queued ${recoveredWorktreeIntegrationJobs} persisted task(s) for recovery`);
-        }
-      })
-      .catch((error) => {
-        console.warn(`[worktree-integration] startup recovery failed error=${error?.message ?? error}`);
-      }));
     reconcileEntityTasksAtStartup();
     trackStartupMaintenance(reconcileWorkChatsAtStartup());
     scheduledSessionTaskService.start();
@@ -35,11 +27,12 @@ export function scheduleBackendStartupMaintenance({
     tickAgentWorkQueue().catch((error) => emitEvent("AgentWorkQueueError", { error: error.message }));
   });
   setImmediate(() => {
-    trackStartupMaintenance(artifactService.runStartupMaintenance()
-      .then((recoveredArtifactContentOperations) => {
+    trackStartupMaintenance(Promise.all([artifactService.runStartupMaintenance(),worktreeIntegrationJobService.recover()])
+      .then(async ([recoveredArtifactContentOperations]) => {
         if (recoveredArtifactContentOperations.length > 0) {
           console.warn(`[artifact-recovery] ${JSON.stringify(recoveredArtifactContentOperations)}`);
         }
+        await childTaskDeliveryService?.recover();
       })
       .catch((error) => {
         console.warn(`[artifact-recovery] startup maintenance failed code=${error?.code ?? "unknown"} error=${error?.message ?? error}`);

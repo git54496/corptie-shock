@@ -1,3 +1,7 @@
+import { logError } from "../utils/errorDiagnostics.mjs";
+import { handleExecutionChecklistHttp } from "./executionChecklistHttpApi.mjs";
+import { handleSessionAbilityHttp } from "./sessionAbilityHttpApi.mjs";
+import { handleSessionMailboxHttp } from "./sessionMailboxHttpApi.mjs";
 import { handleDesktopDetail, handleDesktopDetailSync } from "./detailDocumentService.mjs";
 import { handleDetailActionHttp } from "./detailActionHttpAdapter.mjs";
 import { handleNativeCodexSessionHttpRequest } from "./nativeCodexSessionHttpApi.mjs";
@@ -5,13 +9,13 @@ import { handleNativeCodexSessionHttpRequest } from "./nativeCodexSessionHttpApi
 export function routeBackendHttpRequest(request, response, ports) {
   const {
     clientDeviceGateway, sendJson, developmentPreview, clientCapabilities, backendStoreReady,
-    store, detailActionService, detailWritesAllowed = false, taskCollaborationEdges, foundationModelSettings, rejectDevelopmentPreviewWrite, handleFoundationModelUpdateHttpRequest,
+    executionChecklistService, store, sessionMailbox, detailActionService, detailWritesAllowed = false, taskCollaborationEdges, foundationModelSettings, rejectDevelopmentPreviewWrite, handleFoundationModelUpdateHttpRequest,
     agentProviderRegistry, backgroundAgentService, taskSummaryService, readJson, rejectUnavailableStoreRequest,
     dataRootMigrationCoordinator, handleSceneHttpRequest, sceneService, handleBackendRestartHttpRequest, shutdown,
     handlePlatformConfirmationHttpRequest, platformConfirmationService, errorStatus, handleSessionToolHttpRequest, collaborationCore,
     toolHostService, sessionToolMetadata, handleCollaborationRoutes, handleArtifactHttpRequest, artifactService,
     handleBenchmarkHttpRequest, benchmarkControlPlane, handleCodeTaskObservabilityHttpRequest, turnObservability, handleSshWorkspaceHttpRequest,
-    getSshWorkspaceServices, handleMcpRegistryHttpRequest, mcpRegistryService, mcpSessionAvailabilityService, emitEvent,
+    getSshWorkspaceServices, handleMcpRegistryHttpRequest, mcpRegistryService, mcpSessionAvailabilityService, sessionAbilityPreferences, emitEvent,
     handleEntityRoutes, handleDshHttpRequest, sessionApplicationService, listGatewaySessions, readStoredSessionConversation,
     readStoredSessionTimeline, now, createSessionThroughApplication, publishDshPromptStart, sendUnifiedSessionMessage,
     publishDshPromptFailure, handleBackendHealthHttpRequest, projectCodeIndexStore, projectCodeRunIsolationPort, projectCodeApplicationService,
@@ -30,7 +34,7 @@ export function routeBackendHttpRequest(request, response, ports) {
     projectToolsetStatus, projectWorkingDirectoryForSession, projectToolsetAuthenticatedSession, projectToolsetInitializer, projectToolsets,
     projectToolsetRunIsolationOptions, handleSessionMutationHttpRequest, sessionDeletionPlan, reserveSessionTitle, deleteSessionWithOptionalMerge,
     mergeSessionWorktreeBeforeDeletion, gitWorkspaces, handleSessionExecutionHttpRequest, sessionBindingReadinessProbe, handleSessionWorkspaceHttpRequest,
-    ensureLogicalRouteForProviderSession, createGitWorkspaceSnapshot, reconcileMovedWorkspaceRoutes, sessionWorkspaceRecoveryStatus, switchSessionWorkspace,
+    ensureLogicalRouteForProviderSession, reconcileMovedWorkspaceRoutes, sessionWorkspaceRecoveryStatus, switchSessionWorkspace,
     recoverableAgentWorkDir, ensureAgentWorkDir, switchSessionProvider, decorateSessionForClient, handleSessionTurnHttpRequest,
     handleStateSyncHttpRequest, eventLog, sseClients, stateSyncService, stateSyncClients,
     sessionStateDiagnostics, writeStateSyncFrame
@@ -80,6 +84,9 @@ export function routeBackendHttpRequest(request, response, ports) {
     request, response, url, reader: ports.nativeCodexSessionReader,
     continuation: ports.nativeCodexContinuation, readJson, sendJson
   })) return;
+  if (executionChecklistService && handleExecutionChecklistHttp({ request, response, url, service: executionChecklistService, sendJson, readJson, preview: developmentPreview })) return;
+
+  if (sessionMailbox && handleSessionMailboxHttp({ request, response, url, service: sessionMailbox, sendJson, readJson, preview: developmentPreview })) return;
 
   if (handleDesktopDetailSync({ request, response, url, store, sendJson }) ||
       handleDesktopDetail({ request, response, url, store, sendJson })) return;
@@ -93,7 +100,10 @@ export function routeBackendHttpRequest(request, response, ports) {
     } })) return;
 
   if (request.method === "GET" && url.pathname === "/search") {
-    const failed = error => sendJson(response, error.statusCode ?? 500, { code: error.code ?? "SEARCH_FAILED", error: error.statusCode === 400 ? error.message : "Search unavailable." });
+    const failed = error => {
+      logError("search.http", error, { stage: "query" });
+      return sendJson(response, error.statusCode ?? 500, { code: error.code ?? "SEARCH_FAILED", error: error.statusCode === 400 ? error.message : "Search unavailable." });
+    };
     try { void getTimelineReadPool().readUnifiedSearch({ query: url.searchParams.toString() })
       .then(result => sendJson(response, 200, result)).catch(failed); }
     catch (error) { failed(error); }
@@ -137,9 +147,17 @@ export function routeBackendHttpRequest(request, response, ports) {
       request, response, url,
       repository: store.sshWorkspaces,
       ...getSshWorkspaceServices()
-    }).catch(() => {
+    }).catch((error) => {
+      logError("ssh.http", error, { stage: "configuration" });
       if (!response.headersSent) sendJson(response, 500, { error: "SSH configuration operation failed." });
     });
+    return;
+  }
+
+  if (/^\/sessions\/[^/]+\/abilities$/.test(url.pathname)) {
+    void handleSessionAbilityHttp({ request, response, url, service: sessionAbilityPreferences, readJson, sendJson,
+      writesAllowed: !developmentPreview,
+      onChanged: (sessionId, receipt) => emitEvent("SessionAbilitiesChanged", { sessionId, receipt }, { sessionId }) });
     return;
   }
 
@@ -298,7 +316,7 @@ export function routeBackendHttpRequest(request, response, ports) {
 
   if (handleSessionWorkspaceHttpRequest({
     request, response, url, store, sessionApplicationService, requireSessionReference,
-    ensureLogicalRouteForProviderSession, createGitWorkspaceSnapshot, reconcileMovedWorkspaceRoutes,
+    ensureLogicalRouteForProviderSession, reconcileMovedWorkspaceRoutes,
     sessionWorkspaceRecoveryStatus, switchSessionWorkspace, recoverableAgentWorkDir, ensureAgentWorkDir,
     gitWorkspaces, switchSessionProvider, decorateSessionForClient,
     readJson, sendJson, emitEvent, errorStatus, unifiedErrorStatus

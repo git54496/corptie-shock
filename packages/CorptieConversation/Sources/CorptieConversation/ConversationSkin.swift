@@ -5,14 +5,13 @@ public enum ConversationSkin: String, CaseIterable, Sendable {
     case classic
     case codexFlat
 
-    public var showsTimelineTimeSeparators: Bool { self == .classic }
+    public var showsTimelineTimeSeparators: Bool { false }
 
     public func surface(for role: ConversationSurfaceRole) -> ConversationSurfaceStyle {
         guard self == .codexFlat else { return .legacy }
         switch role {
         case .assistant, .project: return .plain
-        // User cards share the classic surface and its status halo in both skins.
-        case .user: return .legacy
+        case .user: return .bubble
         case .composer: return .neutral
         case .process, .plan, .structured, .inspector, .interaction: return .legacy
         }

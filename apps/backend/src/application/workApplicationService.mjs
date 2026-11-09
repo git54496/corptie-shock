@@ -134,7 +134,7 @@ export class WorkApplicationService {
       }
     }
     const task = this.store.createTask(normalized, options.creationOrigin ?? {}, {
-      expectedParentResourceVersion: options.expectedParentResourceVersion, creationPending: options.creationPending === true
+      creationPending: options.creationPending === true
     });
     return options.creationPending ? task : this.emit("TaskChanged", task, "created");
   }
@@ -163,12 +163,17 @@ export class WorkApplicationService {
       );
     }
     const normalized = validateTaskInput(patch, "update");
+    if (normalized.coordinationEnabled === true) this.assertCoordinationCanEnable?.(current);
     const nextPatch = { ...normalized };
     if (Object.prototype.hasOwnProperty.call(normalized, "acceptanceCriteria")
       && String(normalized.acceptanceCriteria ?? "").trim() !== String(current.acceptance_criteria ?? "").trim()) {
       nextPatch.acceptanceAssessment = null;
     }
-    return this.emit("TaskChanged", this.store.updateTask(id, nextPatch), "updated");
+    const updated = this.store.updateTask(id, nextPatch);
+    if (Object.hasOwn(normalized, "coordinationEnabled") && updated.coordination_enabled !== current.coordination_enabled) {
+      this.onCoordinationChanged?.(updated.id);
+    }
+    return this.emit("TaskChanged", updated, "updated");
   }
 
   reviseTask(id, input = {}) {

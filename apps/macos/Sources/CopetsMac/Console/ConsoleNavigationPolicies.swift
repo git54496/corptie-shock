@@ -1,7 +1,62 @@
 import Combine
+import Observation
 import CorptieConversation
 import AppKit
 import SwiftUI
+
+/// Pointer feedback stays in this small wrapper, outside list projections and
+/// row content. It changes only paint: no animation, layout or data work.
+private struct ConsoleHoverFeedback: ViewModifier {
+    var enabled = true
+    var isSelected = false
+    var horizontalInset: CGFloat = 0
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                if enabled {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(Color.primary.opacity(isSelected ? 0.055 : isEnabled && isHovering ? 0.065 : 0))
+                        .padding(.horizontal, horizontalInset)
+                        .allowsHitTesting(false)
+                }
+            }
+            .onHover { if enabled { isHovering = $0 } }
+            .onDisappear { isHovering = false }
+    }
+}
+
+extension View {
+    func consoleHoverFeedback(enabled: Bool = true, isSelected: Bool = false,
+                              horizontalInset: CGFloat = 0) -> some View {
+        modifier(ConsoleHoverFeedback(enabled: enabled, isSelected: isSelected, horizontalInset: horizontalInset))
+    }
+}
+
+/// Establish the complete row bounds before painting either interaction state.
+/// Padding belongs inside that surface so text and indicators cannot overhang it.
+struct ConsoleOutlineRowSurface: ViewModifier {
+    let isSelected: Bool
+
+    func body(content: Content) -> some View {
+        content
+            // Native List supplies hierarchy indentation. Leave 8pt of content
+            // padding inside each edge of the surface's 8pt outer inset.
+            .padding(.leading, 16)
+            .padding(.trailing, 16)
+            .frame(maxWidth: .infinity, minHeight: 30,
+                   maxHeight: 30, alignment: .leading)
+            .consoleHoverFeedback(isSelected: isSelected, horizontalInset: 8)
+    }
+}
+
+extension View {
+    func consoleOutlineRowSurface(isSelected: Bool) -> some View {
+        modifier(ConsoleOutlineRowSurface(isSelected: isSelected))
+    }
+}
 
 enum ConsoleNavigationCardWidthPolicy {
     static let minimumTaskColumnWidth = 220.0
@@ -53,16 +108,29 @@ enum ConsoleWorkActivityPolicy {
 }
 
 /// Local disclosure preference for the grouped console outline.
-@MainActor
-final class ConsoleOutlineExpansionPreferences: ObservableObject {
-    @Published private(set) var expandedWorkIDs: Set<String>
-    @Published private(set) var isAssistantCollapsed: Bool
+@MainActor @Observable
+final class ConsoleOutlineExpansionPreferences {
+    // The saved collection is storage, not a shared UI invalidation source.
+    @ObservationIgnored private(set) var expandedWorkIDs: Set<String>
+    @ObservationIgnored private var workStates: [String: WorkState] = [:]
+    @MainActor @Observable fileprivate final class WorkState {
+        var isExpanded: Bool
+        init(isExpanded: Bool) { self.isExpanded = isExpanded }
+    }
+    private(set) var isAssistantCollapsed: Bool
     private let store: WorkOutlineExpansionStore
 
     init(defaults: UserDefaults = CorptieAppEnvironment.userDefaults) {
         store = WorkOutlineExpansionStore(defaults: defaults)
         expandedWorkIDs = store.load()
         isAssistantCollapsed = !store.loadChat()
+    }
+
+    func isWorkExpanded(_ workID: String) -> Bool {
+        if let state = workStates[workID] { return state.isExpanded }
+        let state = WorkState(isExpanded: expandedWorkIDs.contains(workID))
+        workStates[workID] = state
+        return state.isExpanded
     }
 
     func setWorkExpanded(_ isExpanded: Bool, workID: String) {
@@ -72,6 +140,7 @@ final class ConsoleOutlineExpansionPreferences: ObservableObject {
         } else {
             expandedWorkIDs.remove(workID)
         }
+        workStates[workID]?.isExpanded = isExpanded
         store.save(expandedWorkIDs)
     }
 
@@ -91,12 +160,27 @@ final class ConsoleOutlineExpansionPreferences: ObservableObject {
     }
 
     func removeWork(_ workID: String) {
+        workStates.removeValue(forKey: workID)?.isExpanded = false
         guard expandedWorkIDs.remove(workID) != nil else { return }
         store.save(expandedWorkIDs)
     }
 }
 
 typealias ConsoleWorkTitle = CorptieConversation.ConsoleWorkTitle
+
+/// Read the Chat expansion in its own observation scope, not the Console root.
+struct ConsoleAssistantExpansionScope<Content: View>: View {
+    let preferences: ConsoleOutlineExpansionPreferences
+    let forceExpanded: Bool
+    let content: (Bool) -> Content
+
+    init(preferences: ConsoleOutlineExpansionPreferences, forceExpanded: Bool,
+         @ViewBuilder content: @escaping (Bool) -> Content) {
+        self.preferences = preferences; self.forceExpanded = forceExpanded; self.content = content
+    }
+
+    var body: some View { content(forceExpanded || !preferences.isAssistantCollapsed) }
+}
 
 /// Shared by list rows and experimental Task cards; body lives in CorptieConversation.
 struct ConsoleScheduledWakeIcon: View {
@@ -105,50 +189,6 @@ struct ConsoleScheduledWakeIcon: View {
     var body: some View {
         ScheduledWakeIcon(isActive: isActive, label: L10n("存在等待执行的计划任务"))
             .help(L10n("存在等待执行的计划任务"))
-    }
-}
-
-struct ConsoleWorkOutlineDisclosureStyle: DisclosureGroupStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 0) {
-                Button {
-                    withAnimation(ConsoleWorkOutlineMetrics.disclosureAnimation) {
-                        configuration.isExpanded.toggle()
-                    }
-                } label: {
-                    Image(systemName: configuration.isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 18, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(L10n(
-                    configuration.isExpanded ? "Collapse group" : "Expand group"
-                ))
-
-                configuration.label
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            if configuration.isExpanded {
-                configuration.content
-                    .transition(.opacity.combined(with: .offset(y: -4)))
-            }
-        }
-        .animation(
-            ConsoleWorkOutlineMetrics.disclosureAnimation,
-            value: configuration.isExpanded
-        )
-    }
-}
-
-private typealias ConsoleWorkOutlineGroupCardModifier = WorkGroupCardSurface
-
-extension View {
-    func consoleWorkOutlineGroupCard() -> some View {
-        modifier(ConsoleWorkOutlineGroupCardModifier())
     }
 }
 
@@ -180,6 +220,7 @@ struct HoverRevealHeaderAction<Header: View>: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .consoleHoverFeedback()
             .focused($isFocused)
             .opacity(isHovering || isFocused ? 1 : 0)
             .accessibilityLabel(accessibilityLabel)
@@ -189,22 +230,32 @@ struct HoverRevealHeaderAction<Header: View>: View {
     }
 }
 
+/// A running collapsed group uses its title treatment instead of another badge.
+struct ConsoleGroupStatusIndicators: View {
+    let isExpanded: Bool
+    let isProcessing: Bool
+    let hasUnread: Bool
+
+    var body: some View {
+        if !isExpanded && !isProcessing && hasUnread {
+            UnreadSessionDot(label: L10n("Unread Session"))
+        }
+    }
+}
+
 struct ConsoleWorkOutlineHeader: View {
     let work: Work
     let isExpanded: Bool
     let isSelected: Bool
     let isWorking: Bool
     let hasUnread: Bool
-    let isChatSelected: Bool
-    let isChatRunning: Bool
-    let hasUnreadChat: Bool
     let toggleExpanded: () -> Void
-    let openChat: () -> Void
     let createTask: () -> Void
     // Equal display values may retain actions only within the same Console
     // lifetime. Actions in that scope must resolve current state when invoked.
     var actionOwner: AnyObject = NSObject()
     var isActive = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.controlActiveState) private var controlActiveState
 
     @State private var isHovering = false
@@ -214,21 +265,18 @@ struct ConsoleWorkOutlineHeader: View {
         let _ = SessionSwitchTrace.shared.recordWorkHeader(workID: work.id, inputs: .init(
             title: work.name, avatarPath: work.avatarPath, expanded: isExpanded,
             selected: isSelected, working: isWorking, unread: hasUnread,
-            chatSelected: isChatSelected, chatRunning: isChatRunning,
-            unreadChat: hasUnreadChat, active: isActive))
+            chatSelected: false, chatRunning: false,
+            unreadChat: false, active: isActive))
         WorkOutlineHeaderRow(toggleExpanded: toggleExpanded) {
             Button(action: toggleExpanded) {
                 HStack(spacing: 7) {
-                    ObjectiveAvatarView(
-                        objectiveID: work.id,
-                        name: work.name,
-                        avatarPath: work.avatarPath,
-                        size: 22
-                    )
-                    ConsoleWorkTitle(title: work.name, isWorking: isWorking,
-                        isActive: isActive && controlActiveState != .inactive)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                    WorkOutlineFolderIcon(isExpanded: isExpanded)
+                        .stroke(.secondary, style: StrokeStyle(lineWidth: 1.2, lineCap: .round, lineJoin: .round))
+                        .frame(width: 18, height: 14)
+                        .animation(reduceMotion ? nil : ConsoleWorkOutlineMetrics.disclosureAnimation, value: isExpanded)
+                    ConsoleWorkTitle(title: work.name, isWorking: isWorking, isActive: isActive)
+                        .font(WorkbenchTypography.font(for: .navigation))
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
                 }
                 .padding(.vertical, 3)
@@ -239,18 +287,10 @@ struct ConsoleWorkOutlineHeader: View {
             .accessibilityValue(accessibilityValue)
             .help(isExpanded ? L10n("Collapse Work") : L10n("Expand Work"))
         } discussion: {
-            WorkDiscussionButton(isSelected: isChatSelected, isRunning: isChatRunning,
-                hasUnread: hasUnreadChat, title: L10n("讨论"),
-                accessibilityTitle: L10n("Open Work Chat"),
-                accessibilityState: hasUnreadChat ? L10n("Unread Session") : "",
-                action: openChat)
-                .padding(.leading, 6)
-
+            EmptyView()
         } actions: {
-            if hasUnread && !isExpanded {
-                UnreadSessionDot(label: L10n("Unread Session"))
-                    .padding(.trailing, 4)
-            }
+            ConsoleGroupStatusIndicators(isExpanded: isExpanded, isProcessing: isWorking,
+                hasUnread: hasUnread)
 
             Button(action: createTask) {
                 Image(systemName: "plus")
@@ -259,6 +299,7 @@ struct ConsoleWorkOutlineHeader: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .consoleHoverFeedback()
             .focused($isCreateTaskFocused)
             .opacity(isHovering || isCreateTaskFocused ? 1 : 0.45)
             .accessibilityLabel(L10nFormat("Create Session in %@", work.name))
@@ -281,9 +322,6 @@ extension ConsoleWorkOutlineHeader: Equatable {
             && lhs.isSelected == rhs.isSelected
             && lhs.isWorking == rhs.isWorking
             && lhs.hasUnread == rhs.hasUnread
-            && lhs.isChatSelected == rhs.isChatSelected
-            && lhs.isChatRunning == rhs.isChatRunning
-            && lhs.hasUnreadChat == rhs.hasUnreadChat
             && lhs.isActive == rhs.isActive
     }
 }
@@ -345,3 +383,39 @@ enum ConsoleSelectionRefreshPolicy {
 //     没有收起/折叠按钮——只有 <48rem 移动端才 display:none（靠顶部 SlidersHorizontal 打开 Sheet）。
 //   - 字段区标题用 11px uppercase + tracking 的小字「Properties」标签，下面竖向排列字段。
 //   - 窄列固定像素宽度，主工作区吃掉剩余空间。
+
+/// The front flap opens without changing the header's icon or row geometry.
+struct WorkOutlineFolderIcon: Shape {
+    var opening: CGFloat
+
+    init(isExpanded: Bool) { opening = isExpanded ? 1 : 0 }
+
+    var animatableData: CGFloat {
+        get { opening }
+        set { opening = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        // The back remains still while the front flap opens. Both endpoints
+        // share the same path topology so SwiftUI can interpolate the flap.
+        path.move(to: CGPoint(x: 1, y: 12.5))
+        path.addLine(to: CGPoint(x: 1, y: 2.5))
+        path.addQuadCurve(to: CGPoint(x: 2, y: 1.5), control: CGPoint(x: 1, y: 1.5))
+        path.addLine(to: CGPoint(x: 6, y: 1.5))
+        path.addLine(to: CGPoint(x: 8, y: 3.5))
+        path.addLine(to: CGPoint(x: 15, y: 3.5))
+        path.addQuadCurve(to: CGPoint(x: 16, y: 4.5), control: CGPoint(x: 16, y: 3.5))
+        path.addLine(to: CGPoint(x: 16, y: 11.5))
+        path.addQuadCurve(to: CGPoint(x: 15, y: 12.5), control: CGPoint(x: 16, y: 12.5))
+        path.addLine(to: CGPoint(x: 1, y: 12.5))
+
+        path.move(to: CGPoint(x: 1, y: 12.5))
+        path.addLine(to: CGPoint(x: 1 + 3 * opening, y: 4.5 + 2 * opening))
+        path.addLine(to: CGPoint(x: 16 + opening, y: 4.5 + 2 * opening))
+        path.addLine(to: CGPoint(x: 15 - opening, y: 12.5))
+        path.closeSubpath()
+        return path.applying(CGAffineTransform(a: rect.width / 18, b: 0, c: 0,
+            d: rect.height / 14, tx: rect.minX, ty: rect.minY))
+    }
+}

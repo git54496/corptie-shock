@@ -30,7 +30,7 @@ struct PadCreateChatSheet: View {
     let commands: PadEntityCommandState
     @Environment(\.dismiss) private var dismiss
     @State private var title = ""
-    @State private var agentID = ""
+    @State private var roleID = ""
     @State private var providerID = ""
     @State private var options: ClientChatCreationOptions?
     @State private var loading = false
@@ -40,7 +40,7 @@ struct PadCreateChatSheet: View {
         guard let options else { return false }
         let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
         return connection.connected && !commands.isBusy && !loading && EntityTitlePolicy.isValid(title) && name.utf16.count <= 512
-            && options.agents.contains(where: { $0.id == agentID })
+            && options.roles.contains(where: { $0.id == roleID })
             && options.providers.contains(where: { $0.id == providerID && $0.available })
     }
 
@@ -54,14 +54,14 @@ struct PadCreateChatSheet: View {
                 }
                 if let options {
                     Section("执行配置") {
-                        Picker("Agent", selection: $agentID) {
-                            ForEach(options.agents) { Text($0.name).tag($0.id) }
+                        Picker("角色", selection: $roleID) {
+                            ForEach(options.roles) { Text($0.name).tag($0.id) }
                         }
                         Picker("Provider", selection: $providerID) {
                             ForEach(options.providers.filter(\.available)) { Text($0.name).tag($0.id) }
                         }
-                        if options.agents.isEmpty || !options.providers.contains(where: \.available) {
-                            Text("暂无可用的 Agent 或 Provider，请先在 Mac 上配置。")
+                        if options.roles.isEmpty || !options.providers.contains(where: \.available) {
+                            Text("暂无可用的角色或 Provider，请先在 Mac 上配置。")
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -109,7 +109,7 @@ struct PadCreateChatSheet: View {
             let next = try await ClientSessionAPI(transport: connection.transport()).chatCreationOptions()
             guard !Task.isCancelled else { return }
             options = next
-            if !next.agents.contains(where: { $0.id == agentID }) { agentID = next.agents.first?.id ?? "" }
+            if !next.roles.contains(where: { $0.id == roleID }) { roleID = next.roles.first?.id ?? "" }
             if !next.providers.contains(where: { $0.id == providerID && $0.available }) {
                 providerID = next.providers.first(where: { $0.id == next.defaultProviderId && $0.available })?.id
                     ?? next.providers.first(where: \.available)?.id ?? ""
@@ -123,9 +123,9 @@ struct PadCreateChatSheet: View {
     private func create() async {
         guard canCreate else { return }
         let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let agent = agentID, provider = providerID
+        let agent = roleID, provider = providerID
         let receipt = await commands.run(connection, target: .chats, kind: "chat_create", label: "新建 Chat") { api, requestID in
-            try await api.createChat(ClientChatCreation(requestId: requestID, title: name, agentId: agent, providerId: provider))
+            try await api.createChat(ClientChatCreation(requestId: requestID, title: name, roleId: agent, providerId: provider))
         }
         if receipt?.status == "completed" { dismiss() }
     }
@@ -137,7 +137,7 @@ struct PadCreateWorkSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var description = ""
-    @State private var selectedAgents: Set<String> = []
+    @State private var selectedRoles: Set<String> = []
     @State private var options: ClientWorkCreationOptions?
     @State private var error: String?
     @State private var loading = false
@@ -151,12 +151,12 @@ struct PadCreateWorkSheet: View {
                         .font(.caption).foregroundStyle(.secondary)
                     TextField("描述（可选）", text: $description, axis: .vertical)
                 }
-                Section("参与 Agent（至少选择一个）") {
+                Section("参与角色（至少选择一个）") {
                     if let options {
-                        if options.agents.isEmpty { Text("暂无可用 Agent，请先在 Mac 上配置。").foregroundStyle(.secondary) }
-                        ForEach(options.agents) { agent in
-                            Toggle(agent.name, isOn: Binding(get: { selectedAgents.contains(agent.id) }, set: {
-                                if $0 { selectedAgents.insert(agent.id) } else { selectedAgents.remove(agent.id) }
+                        if options.roles.isEmpty { Text("暂无可用角色，请先在 Mac 上配置。").foregroundStyle(.secondary) }
+                        ForEach(options.roles) { agent in
+                            Toggle(agent.name, isOn: Binding(get: { selectedRoles.contains(agent.id) }, set: {
+                                if $0 { selectedRoles.insert(agent.id) } else { selectedRoles.remove(agent.id) }
                             }))
                         }
                     } else if loading { ProgressView("加载创建选项…") }
@@ -177,7 +177,7 @@ struct PadCreateWorkSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("创建") { Task { await create() } }
                         .disabled(options == nil || !EntityTitlePolicy.isValid(name)
-                            || selectedAgents.isEmpty || commands.isBusy)
+                            || selectedRoles.isEmpty || commands.isBusy)
                 }
             }
             .task { await loadOptions() }
@@ -202,7 +202,7 @@ struct PadCreateWorkSheet: View {
         let title = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let receipt = await commands.run(connection, target: .work("new"), kind: "work_create", label: "新增 Work") { api, requestID in
             try await api.createWork(ClientWorkCreation(requestId: requestID, name: title,
-                description: description, contributorAgentIds: selectedAgents.sorted()))
+                description: description, contributorRoleIds: selectedRoles.sorted()))
         }
         if receipt?.status == "completed" { dismiss() }
     }
@@ -378,21 +378,21 @@ struct PadRenameTaskSheet: View {
 }
 
 struct PadEditTaskSheet: View {
-    private struct AgentChoice: Identifiable { let id: String; let name: String }
+    private struct RoleChoice: Identifiable { let id: String; let name: String }
     let connection: PadConnection
     let commands: PadEntityCommandState
     let task: ClientTask
     let detailDefinition: ClientInspectorValue?
     let detailScope: ClientDetailActionScope?
     let detailSessionID: String?
-    private let agentChoices: [AgentChoice]
+    private let roleChoices: [RoleChoice]
     let onFinished: () -> Void
     @State private var title: String
     @State private var description: String
     @State private var acceptance: String
     @State private var verification: String
     @State private var priority: String
-    @State private var mainAgentID: String
+    @State private var mainRoleID: String
     @State private var management: ClientTaskManagement?
     @State private var submitting = false
     @State private var commandNotice: String?
@@ -407,16 +407,16 @@ struct PadEditTaskSheet: View {
         self.detailDefinition = detailDefinition; self.detailScope = detailScope; self.detailSessionID = detailSessionID
         self.onFinished = onFinished
         var seen = Set<String>()
-        agentChoices = (detailDefinition?["agents"].items ?? []).compactMap { value in
+        roleChoices = (detailDefinition?["agents"].items ?? []).compactMap { value in
             guard let id = value["id"].text, id != detailDefinition?["mainAgentId"].text, seen.insert(id).inserted else { return nil }
-            return AgentChoice(id: id, name: value["name"].text ?? id)
+            return RoleChoice(id: id, name: value["name"].text ?? id)
         }
         _title = State(initialValue: detailDefinition?["title"].text ?? task.title)
         _description = State(initialValue: detailDefinition?["description"].text ?? task.description ?? "")
         _acceptance = State(initialValue: detailDefinition?["acceptanceCriteria"].text ?? task.acceptanceCriteria ?? "")
         _verification = State(initialValue: detailDefinition?["verificationCriteria"].text ?? task.verificationCriteria ?? "")
         _priority = State(initialValue: detailDefinition?["priority"].text ?? "medium")
-        _mainAgentID = State(initialValue: detailDefinition?["mainAgentId"].text ?? "")
+        _mainRoleID = State(initialValue: detailDefinition?["mainAgentId"].text ?? "")
     }
     private var detailHasChanges: Bool {
         guard let definition = detailDefinition else { return true }
@@ -424,7 +424,7 @@ struct PadEditTaskSheet: View {
             || description != (definition["description"].text ?? task.description ?? "")
             || acceptance != (definition["acceptanceCriteria"].text ?? task.acceptanceCriteria ?? "")
             || verification != (definition["verificationCriteria"].text ?? task.verificationCriteria ?? "")
-            || priority != (definition["priority"].text ?? "medium") || mainAgentID != (definition["mainAgentId"].text ?? "")
+            || priority != (definition["priority"].text ?? "medium") || mainRoleID != (definition["mainAgentId"].text ?? "")
     }
 
     var body: some View {
@@ -441,9 +441,9 @@ struct PadEditTaskSheet: View {
                         Picker("优先级", selection: $priority) {
                             ForEach(["low", "medium", "high", "urgent"], id: \.self) { Text($0).tag($0) }
                         }
-                        Picker("Agent", selection: $mainAgentID) {
+                        Picker("角色", selection: $mainRoleID) {
                             Text("保留当前设置").tag(definition["mainAgentId"].text ?? "")
-                            ForEach(agentChoices) { agent in Text(agent.name).tag(agent.id) }
+                            ForEach(roleChoices) { agent in Text(agent.name).tag(agent.id) }
                         }
                     }
                     if management == nil { Section { Text("正在核验 Task 编辑能力").font(.footnote) } }
@@ -486,7 +486,7 @@ struct PadEditTaskSheet: View {
                                     if acceptance != (definition["acceptanceCriteria"].text ?? task.acceptanceCriteria ?? "") { req.acceptanceCriteria = acceptance }
                                     if verification != (definition["verificationCriteria"].text ?? task.verificationCriteria ?? "") { req.verificationCriteria = verification }
                                     if priority != (definition["priority"].text ?? "medium") { req.priority = priority }
-                                    if mainAgentID != (definition["mainAgentId"].text ?? "") { req.mainAgentId = mainAgentID }
+                                    if mainRoleID != (definition["mainAgentId"].text ?? "") { req.mainRoleId = mainRoleID }
                                 }
                                 return try await api.taskCommand(taskId: task.id, command: .update, body: req)
                             }
@@ -531,8 +531,7 @@ struct PadDeleteTaskSheet: View {
     @State private var plan: ClientTaskDeletionPlan?
     @State private var loading = true
     @State private var inspectError: String?
-    @State private var showForceConfirmation = false
-    @State private var acknowledgeDataLoss = false
+    @State private var deletionOptions = ClientTaskDeletionOptions()
     @State private var deleteWorktree = true
     @State private var artifactDisposition = "delete"
     @State private var submitting = false
@@ -559,7 +558,7 @@ struct PadDeleteTaskSheet: View {
                     deletionForm(plan)
                 }
             }
-            .navigationTitle(showForceConfirmation ? "二次确认强制删除" : "删除 Task")
+            .navigationTitle("删除 Task")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -568,12 +567,6 @@ struct PadDeleteTaskSheet: View {
                 }
             }
             .task { await loadPlan() }
-            .onChange(of: deleteWorktree) { _, enabled in
-                if !enabled {
-                    showForceConfirmation = false
-                    acknowledgeDataLoss = false
-                }
-            }
         }
         .interactiveDismissDisabled(submitting)
     }
@@ -585,6 +578,10 @@ struct PadDeleteTaskSheet: View {
 
         Section("Task") {
             Text(task.title).font(.headline)
+            if plan.parentTaskId != nil {
+                Text("删除此任务及其子任务；已合入父分支的代码不受影响。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
             Text("删除会永久清除所有关联会话及完整会话历史，无法撤销。Worktree 和 Artifact 仅按下方选项处理。")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.red)
@@ -630,27 +627,32 @@ struct PadDeleteTaskSheet: View {
 
         if !risks.isEmpty {
             Section("可能丢失的内容") {
+                if plan.parentTaskId != nil {
+                    Text("可先将子分支合并到父分支，或继续强制删除。无需先将父分支发布到主分支。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 ForEach(risks, id: \.code) { risk in
                     riskLabel(risk, color: .orange, symbol: "exclamationmark.triangle.fill")
                 }
             }
         }
 
-        if requiresForce(for: plan), !canForceDelete(plan) {
-            Section {
-                Label("无法确认 Worktree 的完整分支名，因此不能强制删除。请保留 Worktree，或先在 Mac 上修复分支状态。",
-                      systemImage: "xmark.octagon.fill")
-                    .font(.footnote)
-                    .foregroundStyle(.red)
+        Section("删除选项") {
+            if plan.blockers.contains(where: { $0.code == "SESSION_BUSY" }) {
+                Toggle("停止正在运行的会话后删除", isOn: $deletionOptions.stopRunning)
             }
-        }
-
-        if showForceConfirmation {
-            Section("永久删除确认") {
-                Text("强制删除将永久丢弃上述未提交修改、未跟踪文件和未合并提交，且无法恢复。")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.red)
-                Toggle("我理解这些内容可能永久丢失", isOn: $acknowledgeDataLoss)
+            if plan.blockers.contains(where: { $0.code == "START_IN_PROGRESS" }) {
+                Toggle("中断启动后删除", isOn: $deletionOptions.cancelStartup)
+            }
+            if plan.blockers.contains(where: { $0.code == "SHARED_WITH_ACTIVE_TASK" }) {
+                Toggle("一并删除共用 Worktree 的关联任务", isOn: $deletionOptions.deleteAssociatedTasks)
+                ForEach(plan.associatedTaskIds ?? [], id: \.self) { Text($0).font(.caption) }
+            }
+            if plan.blockers.contains(where: { $0.code == "ACTIVE_WORKTREE_INTEGRATION_JOB" }) {
+                Toggle("取消占用的集成作业后删除", isOn: $deletionOptions.cancelIntegration)
+            }
+            if !(plan.childTaskIds ?? []).isEmpty {
+                Text("将级联删除 \(plan.childTaskIds?.count ?? 0) 个子任务。")
             }
         }
 
@@ -658,8 +660,6 @@ struct PadDeleteTaskSheet: View {
             Section {
                 Text(notice).font(.footnote).foregroundStyle(.red)
                 Button("重新检查删除条件") {
-                    showForceConfirmation = false
-                    acknowledgeDataLoss = false
                     Task { await loadPlan() }
                 }
                 .disabled(submitting || commands.isBusy)
@@ -667,38 +667,13 @@ struct PadDeleteTaskSheet: View {
         }
 
         Section {
-            if requiresForce(for: plan), !showForceConfirmation {
-                Button("进入强制删除确认", role: .destructive) {
-                    showForceConfirmation = true
-                    acknowledgeDataLoss = false
-                }
-                .disabled(submitting || commands.isBusy || !blockers.isEmpty || !canForceDelete(plan))
-            } else {
-                Button(role: .destructive) {
-                    executeDeletion(plan: plan, force: requiresForce(for: plan))
-                } label: {
-                    HStack {
-                        Spacer()
-                        if submitting {
-                            ProgressView().controlSize(.small).padding(.trailing, 4)
-                        }
-                        Text(showForceConfirmation ? "确认强制删除" : "删除 Task")
-                            .fontWeight(.semibold)
-                        Spacer()
-                    }
-                }
-                .disabled(
-                    submitting
-                        || commands.isBusy
-                        || !blockers.isEmpty
-                        || (requiresForce(for: plan) && (!canForceDelete(plan) || !acknowledgeDataLoss))
-                )
-            }
+            Button("删除 Task", role: .destructive) { executeDeletion(plan: plan, force: true) }
+                .disabled(submitting || commands.isBusy || !blockers.isEmpty)
         }
     }
 
     private func effectiveBlockers(for plan: ClientTaskDeletionPlan) -> [ClientTaskDeletionPlan.Risk] {
-        deleteWorktree ? plan.blockers : plan.blockers.filter { $0.code == "START_IN_PROGRESS" }
+        plan.blockers.filter { (deleteWorktree || TaskDeletionConfirmationPolicy.isTaskLevelBlocker($0.code)) && !deletionOptions.resolves($0.code) }
     }
 
     private func effectiveRisks(for plan: ClientTaskDeletionPlan) -> [ClientTaskDeletionPlan.Risk] {
@@ -711,7 +686,7 @@ struct PadDeleteTaskSheet: View {
 
     private func canForceDelete(_ plan: ClientTaskDeletionPlan) -> Bool {
         guard requiresForce(for: plan) else { return true }
-        return plan.worktree?.branchName?.isEmpty == false
+        return TaskDeletionConfirmationPolicy.canForceDelete(riskCodes: plan.risks.map(\.code), branchName: plan.worktree?.branchName)
     }
 
     private func riskLabel(_ risk: ClientTaskDeletionPlan.Risk, color: Color, symbol: String) -> some View {
@@ -756,9 +731,12 @@ struct PadDeleteTaskSheet: View {
                 request.mode = force ? "force" : "safe"
                 request.deleteWorktree = deleteWorktree
                 request.artifactDisposition = artifactDisposition
+                request.stopRunning = deletionOptions.stopRunning
+                request.cancelStartup = deletionOptions.cancelStartup
+                request.deleteAssociatedTasks = deletionOptions.deleteAssociatedTasks
+                request.cancelIntegration = deletionOptions.cancelIntegration
                 if force {
                     request.acknowledgeDataLoss = true
-                    request.confirmedBranchName = plan.worktree?.branchName
                 }
                 return try await api.taskCommand(taskId: task.id, command: .delete, body: request)
             }

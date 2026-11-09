@@ -14,7 +14,7 @@ struct SettingsWindowLayoutTests {
     }
 
     @Test
-    func actualSplitPaneCapsTheOuterCardWhenTheWindowGrows() throws {
+    func columnsFillTheViewportAndSidebarStaysBoundedWhenTheWindowGrows() throws {
         let host = NSHostingView(rootView: SettingsView())
         func split(in view: NSView) -> NSSplitView? {
             if let view = view as? NSSplitView { return view }
@@ -27,10 +27,22 @@ struct SettingsWindowLayoutTests {
             splitView.layoutSubtreeIfNeeded()
             let sidebar = try #require(splitView.arrangedSubviews.first)
             let detail = try #require(splitView.arrangedSubviews.last)
-            let gap = MainWindowPageLayoutMetrics.halfColumnSpacing
-            #expect(sidebar.frame.width >= SettingsPageLayout.sidebarMinimum + gap - 1)
-            #expect(sidebar.frame.width <= SettingsPageLayout.sidebarMaximum + gap + 1)
+            #expect(sidebar.frame.width >= SettingsPageLayout.sidebarMinimum - 1)
+            #expect(sidebar.frame.width <= SettingsPageLayout.sidebarMaximum + 1)
             #expect(detail.frame.width > sidebar.frame.width)
+            // Regresses the previous 6pt outer card gutter: both panes must
+            // reach the top and bottom, regardless of their form content.
+            let viewport = splitView.convert(splitView.bounds, to: host)
+            #expect(abs(viewport.minX) <= 1)
+            #expect(abs(viewport.minY) <= 1)
+            #expect(abs(viewport.width - host.bounds.width) <= 1)
+            #expect(abs(viewport.height - host.bounds.height) <= 1)
+            for pane in [sidebar, detail] {
+                #expect(abs(pane.frame.minY) <= 1)
+                #expect(abs(pane.frame.height - splitView.bounds.height) <= 1)
+            }
+            #expect(abs(sidebar.frame.minX) <= 1)
+            #expect(abs(detail.frame.maxX - splitView.bounds.width) <= 1)
             print("settings split: host=\(width) sidebar=\(sidebar.frame.width) detail=\(detail.frame.width)")
         }
     }
@@ -43,6 +55,23 @@ struct SettingsWindowLayoutTests {
             hostingView.layoutSubtreeIfNeeded()
             #expect(hostingView.fittingSize.width <= size.width)
             #expect(hostingView.fittingSize.height <= size.height)
+        }
+    }
+
+    @Test func loadedFormsFitCompactWidthsAndKeepDraftWhenSidebarCollapses() throws {
+        let draft = SettingsDraftState()
+        draft.receive(try JSONDecoder().decode(BackendSettings.self, from: Data(#"{"dataRoot":"/test/root"}"#.utf8)))
+        draft.codeDiff.tool = "vscode"
+        let host = NSHostingView(rootView: SettingsView(draft: draft, loadsSettings: false))
+        for width: CGFloat in [900, 799, 600, 479, 900] {
+            host.frame = NSRect(x: 0, y: 0, width: width, height: 560)
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            host.layoutSubtreeIfNeeded()
+            #expect(host.fittingSize.width <= width)
+            #expect(host.fittingSize.height <= 560)
+            #expect(draft.codeDiff.tool == "vscode")
+            #expect(draft.dirtyTabs == [.general])
         }
     }
 
@@ -69,7 +98,9 @@ struct SettingsWindowLayoutTests {
         for route in ["general", "provider", "appearance", "notifications", "proxy", "gateway", "devices", "archivedSessions"] {
             #expect(contents.contains("case .\(route):"))
         }
-        #expect(contents.contains("LocalWallpaperSettingsView()"))
+        #expect(contents.contains("AppearanceSettingsView()"))
+        let appearance = try String(contentsOf: source.deletingLastPathComponent().appendingPathComponent("AppearanceSettingsView.swift"), encoding: .utf8)
+        #expect(appearance.contains("LocalWallpaperSettingsView()"))
         #expect(contents.contains("ForEach(SettingsTab.allCases"))
         #expect(contents.contains("selectedTab = tab"))
         #expect(!contents.contains(".tabItem"))
@@ -78,8 +109,8 @@ struct SettingsWindowLayoutTests {
         #expect(!contents.contains("SettingsWindowLayout"))
         #expect(!contents.contains("sidebarToggle"))
         #expect(!contents.contains("@ObservedObject private var backendClient"))
-        #expect(contents.contains("backendClient.$lastError.removeDuplicates()"))
-        #expect(contents.contains("Button(L10n(\"Save\"))"))
+        #expect(contents.contains("settingsState.settings"))
+        #expect(contents.contains("settings.save"))
         #expect(contents.contains("await saveAllSettings()"))
         let general = contents.components(separatedBy: "private var generalSettingsTab")[1]
             .components(separatedBy: "private var providerSettingsTab")[0]
@@ -90,7 +121,7 @@ struct SettingsWindowLayoutTests {
         #expect(contents.contains("draft: Binding("))
         #expect(!contents.contains("Text(L10n(\"Codex Backend\"))"))
         #expect(!contents.contains("DisclosureGroup(\"终端选项解析"))
-        #expect(contents.contains("sessionCreationDefaults: sessionCreationDraft"))
+        #expect(contents.contains("sessionCreationDefaults:"))
         let mobileSource = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -156,11 +187,11 @@ struct SettingsWindowLayoutTests {
         let firstRun = try String(contentsOf: sources.appendingPathComponent("FirstRunSetupView.swift"), encoding: .utf8)
         let groups = firstRun.components(separatedBy: "struct ProviderEnvironmentSettingsView: View {")[1]
         #expect(groups.contains("Provider 专属配置"))
-        #expect(groups.contains("ForEach(status.providers)"))
+        #expect(groups.contains("ForEach(draft.providers)"))
         #expect(!groups.contains(".filter"))
         #expect(groups.contains("FirstRunProviderCard(provider: provider"))
         #expect(groups.contains("allowsAutomaticChecks: false"))
-        #expect(firstRun.contains("guard allowsAutomaticChecks || checkGeneration > 0 else { return }"))
+        #expect(firstRun.contains("guard checkGeneration > 0 else { return }"))
         #expect(!groups.contains("TaskCreationDefaultsSettingsView"))
     }
 }

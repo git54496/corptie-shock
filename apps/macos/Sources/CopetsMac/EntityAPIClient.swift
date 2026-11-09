@@ -28,10 +28,13 @@ struct EntityRefreshGeneration: Equatable {
     }
 }
 
-private struct SessionGroupingEntityState: Equatable {
-    let tasks: [String: CorptieTask]
-    let works: [String: Work]
-    let agents: [String: Agent]
+/// Constant-size change signal for the Session grouping projection. Holding
+/// entity dictionaries here made `removeDuplicates()` deep-compare every Task,
+/// Work and Role on each State frame.
+private struct SessionGroupingCommitCounters: Equatable {
+    let tasks: UInt64
+    let works: UInt64
+    let roles: UInt64
 }
 
 // 实体层轻量 API 客户端（15 Phase 5 净新增）。
@@ -44,7 +47,7 @@ final class EntityAPIClient: ObservableObject {
 
     private let appState: AppStateStore
     var works: [Work] { appState.works }
-    var agents: [Agent] { appState.agents }
+    var roles: [Role] { appState.roles }
     var tasks: [CorptieTask] { appState.tasks }
     @Published private(set) var tasksRevision: UInt64 = 0
     let sessionGroupingDidChange = PassthroughSubject<Void, Never>()
@@ -81,7 +84,10 @@ final class EntityAPIClient: ObservableObject {
     init(appState: AppStateStore = .shared) {
         self.appState = appState
 
-        appState.$state
+        // Comparing whole entity dictionaries with removeDuplicates() is O(n)
+        // per State frame. The commit counters carry the same "did this family
+        // change" signal in constant time.
+        appState.$commitToken
             .map(\.tasks)
             .removeDuplicates()
             .dropFirst()
@@ -91,14 +97,8 @@ final class EntityAPIClient: ObservableObject {
             }
             .store(in: &appStateCancellables)
 
-        appState.$state
-            .map { state in
-                SessionGroupingEntityState(
-                    tasks: state.tasks,
-                    works: state.works,
-                    agents: state.agents
-                )
-            }
+        appState.$commitToken
+            .map { SessionGroupingCommitCounters(tasks: $0.tasks, works: $0.works, roles: $0.roles) }
             .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
@@ -123,6 +123,7 @@ final class EntityAPIClient: ObservableObject {
             worksLoadError = nil
             errorMessage = nil
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.refreshWorks")
             guard worksRefreshGeneration.isCurrent(generation) else { return }
             worksLoadError = error.localizedDescription
             errorMessage = error.localizedDescription
@@ -136,10 +137,10 @@ final class EntityAPIClient: ObservableObject {
         await refreshWorks()
         await refreshWorkspaces()
         await refreshRepositories()
-        await refreshAgents()
+        await refreshRoles()
     }
 
-    func refreshAgents() async {
+    func refreshRoles() async {
         await AppStateSyncController.shared.refreshSnapshot()
         errorMessage = appState.syncError
     }
@@ -159,6 +160,7 @@ final class EntityAPIClient: ObservableObject {
             }
             workspaces = try decoder.decode(WorkspaceListEnvelope.self, from: data).workspaces
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.refreshWorkspaces")
             errorMessage = error.localizedDescription
         }
     }
@@ -201,7 +203,7 @@ final class EntityAPIClient: ObservableObject {
                 for task in page.tasks where task.resourceVersion >= (revisions[task.id] ?? 0) { appState.acceptCorptieTask(task) }
                 cursor=page.nextCursor
             } while cursor != nil
-        } catch { if !Task.isCancelled { tasksLoadError=error.localizedDescription } }
+        } catch { ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.loadTaskParentChoices"); if !Task.isCancelled { tasksLoadError=error.localizedDescription } }
     }
     func loadTaskChildren(_ parent: CorptieTask, more: Bool = false) async {
         struct Page: Decodable { let tasks:[CorptieTask]; let ancestors:[CorptieTask]; let nextCursor:String? }
@@ -222,7 +224,7 @@ final class EntityAPIClient: ObservableObject {
                 taskChildrenCursors[parent.id]=page.nextCursor
         } catch is CancellationError {
             return
-        } catch { if !Task.isCancelled { tasksLoadError=error.localizedDescription } }
+        } catch { ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.loadTaskChildren"); if !Task.isCancelled { tasksLoadError=error.localizedDescription } }
     }
 
     private func loadCorptieTasks(from url: URL) async -> [CorptieTask]? {
@@ -240,6 +242,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return tasks
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.loadCorptieTasks")
             let message = Self.tasksLoadErrorMessage(error)
             tasksLoadError = message
             errorMessage = message
@@ -282,6 +285,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return browsedTasks
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.loadBrowsedTasks")
             let message = Self.tasksLoadErrorMessage(error)
             tasksLoadError = message
             errorMessage = message
@@ -323,6 +327,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return task
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.task")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -334,7 +339,7 @@ final class EntityAPIClient: ObservableObject {
                         acceptanceCriteria: String? = nil,
                         verificationCriteria: String? = nil,
                         priority: String? = nil, lifecycleState: String? = nil,
-                        mainAgentId: String? = nil, autoTitleEnabled: Bool? = nil) async -> CorptieTask? {
+                        mainRoleId: String? = nil, autoTitleEnabled: Bool? = nil, coordinationEnabled: Bool? = nil) async -> CorptieTask? {
         var request = URLRequest(url: baseURL.appending(path: "tasks/\(taskId)"))
         request.httpMethod = "PATCH"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -345,8 +350,9 @@ final class EntityAPIClient: ObservableObject {
         if let verificationCriteria { body["verificationCriteria"] = verificationCriteria }
         if let priority { body["priority"] = priority }
         if let lifecycleState { body["lifecycleState"] = lifecycleState }
-        if let mainAgentId { body["mainAgentId"] = mainAgentId }
+        if let mainRoleId { body["mainAgentId"] = mainRoleId }
         if let autoTitleEnabled { body["autoTitleEnabled"] = autoTitleEnabled }
+        if let coordinationEnabled { body["coordinationEnabled"] = coordinationEnabled }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         return await performEntityMutation(request, as: CorptieTask.self)
     }
@@ -380,6 +386,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.restartCorptieTask")
             errorMessage = error.localizedDescription
             return false
         }
@@ -397,6 +404,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return plan
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.inspectCorptieTaskDeletion")
             errorMessage = (error as? EntityLaunchError)?.message ?? error.localizedDescription
             return nil
         }
@@ -405,9 +413,9 @@ final class EntityAPIClient: ObservableObject {
     func deleteCorptieTask(
         taskId: String,
         force: Bool = false,
-        confirmedBranchName: String? = nil,
         deleteWorktree: Bool = true,
-        artifactDisposition: CorptieTaskArtifactDisposition = .delete
+        artifactDisposition: CorptieTaskArtifactDisposition = .delete,
+        options: ClientTaskDeletionOptions = .init()
     ) async -> Bool {
         var request = URLRequest(url: baseURL.appending(path: "tasks/\(taskId)/actions/delete"))
         request.httpMethod = "POST"
@@ -416,11 +424,12 @@ final class EntityAPIClient: ObservableObject {
             "mode": force ? "force" : "safe",
             "deleteWorktree": deleteWorktree,
             "artifactDisposition": artifactDisposition.rawValue,
+            "stopRunning": options.stopRunning, "cancelStartup": options.cancelStartup,
+            "deleteAssociatedTasks": options.deleteAssociatedTasks, "cancelIntegration": options.cancelIntegration,
             "idempotencyKey": "task-delete:\(taskId):\(UUID().uuidString)"
         ]
         if force {
             body["acknowledgeDataLoss"] = true
-            body["confirmedBranchName"] = confirmedBranchName ?? ""
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         var notificationOutcome: OperationNotificationOutcome = .failed
@@ -470,6 +479,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.deleteCorptieTask")
             if notificationOutcome != .succeeded { notificationOutcome = .errorOutcome(error) }
             errorMessage = (error as? EntityLaunchError)?.message ?? error.localizedDescription
             return false
@@ -510,6 +520,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return receipt
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.issueCorptieTaskCompletionIntent")
             errorMessage = (error as? EntityLaunchError)?.message ?? error.localizedDescription
             return nil
         }
@@ -546,6 +557,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return result.task
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.confirmCorptieTaskCompletion")
             errorMessage = (error as? EntityLaunchError)?.message ?? error.localizedDescription
             return nil
         }
@@ -571,6 +583,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return .success(restored)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.restoreCorptieTaskExecution")
             let message = error.localizedDescription
             errorMessage = message
             return .failure(message: message)
@@ -593,6 +606,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return status
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.worktreeStatus")
             errorMessage = (error as? EntityLaunchError)?.message ?? error.localizedDescription
             return nil
         }
@@ -619,6 +633,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return status
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.reclaimWorktree")
             errorMessage = (error as? EntityLaunchError)?.message ?? error.localizedDescription
             return nil
         }
@@ -667,6 +682,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return task
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.submitAcceptanceAssessment")
             errorMessage = (error as? EntityLaunchError)?.message ?? error.localizedDescription
             return nil
         }
@@ -677,13 +693,12 @@ final class EntityAPIClient: ObservableObject {
     func createCorptieTask(id: String? = nil, workId: String, title: String, description: String? = nil,
                         acceptanceCriteria: String? = nil,
                         verificationCriteria: String? = nil,
-                        mainAgentId: String? = nil,
+                        mainRoleId: String? = nil,
                         priority: String? = nil,
                         providerId: String,
                         model: String? = nil,
                         reasoningLevel: String? = nil,
                         parentTaskId: String? = nil,
-                        expectedParentResourceVersion: Int? = nil,
                         sourceSession explicitSourceSession: TaskSession? = nil) async -> CorptieTask? {
         let backendClient = BackendClient.shared
         guard let sourceSession = CorptieTaskSessionSourcePolicy.resolve(
@@ -712,12 +727,11 @@ final class EntityAPIClient: ObservableObject {
         if let id, !id.isEmpty { body["id"] = id }
         if let parentTaskId {
             body["parentTaskId"] = parentTaskId
-            body["expectedParentResourceVersion"] = expectedParentResourceVersion
         }
         if let description, !description.isEmpty { body["description"] = description }
         if let acceptanceCriteria, !acceptanceCriteria.isEmpty { body["acceptanceCriteria"] = acceptanceCriteria }
         if let verificationCriteria, !verificationCriteria.isEmpty { body["verificationCriteria"] = verificationCriteria }
-        if let mainAgentId, !mainAgentId.isEmpty { body["mainAgentId"] = mainAgentId }
+        if let mainRoleId, !mainRoleId.isEmpty { body["mainAgentId"] = mainRoleId }
         if let priority { body["priority"] = priority }
         if let model, !model.isEmpty { body["model"] = model }
         if let reasoningLevel, !reasoningLevel.isEmpty { body["reasoningLevel"] = reasoningLevel }
@@ -740,6 +754,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return envelope.snapshots
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.taskSnapshots")
             errorMessage = (error as? EntityLaunchError)?.message ?? error.localizedDescription
             return []
         }
@@ -799,6 +814,7 @@ final class EntityAPIClient: ObservableObject {
             _ = try await URLSession.shared.data(for: request)
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.deleteSession")
             errorMessage = error.localizedDescription
             return false
         }
@@ -822,6 +838,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.interruptSession")
             errorMessage = error.localizedDescription
             return false
         }
@@ -841,6 +858,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.resumeSession")
             errorMessage = error.localizedDescription
             return false
         }
@@ -883,6 +901,7 @@ final class EntityAPIClient: ObservableObject {
             try validateMemoryResponse(response, data: data)
             return try decoder.decode(MemoryExtractionJobsEnvelope.self, from: data).jobs
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.memoryExtractionJobs")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -945,6 +964,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return try decoder.decode(MemoryItem.self, from: data)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.createMemory")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -997,6 +1017,7 @@ final class EntityAPIClient: ObservableObject {
             try validateMemoryResponse(response, data: data)
             return try decoder.decode(MemoryHitListEnvelope.self, from: data).hits
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.memoryHits")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1014,6 +1035,7 @@ final class EntityAPIClient: ObservableObject {
             try validateMemoryResponse(response, data: data)
             return try decoder.decode(MemoryRecallListEnvelope.self, from: data).recalls
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.memoryRecalls")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1032,6 +1054,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return try decoder.decode(MemoryBackfillProgress.self, from: data)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.backfillSessionMemories")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1046,6 +1069,7 @@ final class EntityAPIClient: ObservableObject {
             try validateMemoryResponse(response, data: data)
             return try decoder.decode(MemoryAuditListEnvelope.self, from: data).audit
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.memoryAudit")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1077,6 +1101,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return browsedMemories
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.loadMemories")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1089,6 +1114,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return try decoder.decode(MemoryEnvelope.self, from: data).memory
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.mutateMemory")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1104,7 +1130,7 @@ final class EntityAPIClient: ObservableObject {
     @discardableResult
     func createSession(
         taskId: String,
-        agentId: String,
+        roleId: String,
         providerId: String,
         title: String? = nil,
         sourceSession explicitSourceSession: TaskSession? = nil,
@@ -1129,10 +1155,10 @@ final class EntityAPIClient: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(sourceSessionId, forHTTPHeaderField: "X-Corptie-Logical-Session-Id")
-        let idempotencyKey = "task-start:\(taskId):\(agentId):\(providerId)" + (dispatchInitialTurn ? "" : ":prepare-chat")
+        let idempotencyKey = "task-start:\(taskId):\(roleId):\(providerId)" + (dispatchInitialTurn ? "" : ":prepare-chat")
         let command = WorkSessionStartRequest(
             taskId: taskId,
-            assigneeAgentId: agentId,
+            assigneeRoleId: roleId,
             expectedTaskVersion: task.resourceVersion,
             providerId: providerId,
             title: title,
@@ -1173,6 +1199,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return .success(session)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.createSession")
             preparationFailure = .errorOutcome(error)
             let message = error.localizedDescription
             errorMessage = message
@@ -1182,13 +1209,13 @@ final class EntityAPIClient: ObservableObject {
 
     // Assistant Chat Session：仅凭 Assistant 开聊，不绑定 CorptieTask。
     @discardableResult
-    func startAgentSession(
-        agentId: String,
+    func startRoleSession(
+        roleId: String,
         providerId: String,
         title: String? = nil,
         prompt: String? = nil
     ) async -> EntitySessionLaunchResult {
-        var request = URLRequest(url: baseURL.appending(path: "agents/\(agentId)/sessions"))
+        var request = URLRequest(url: baseURL.appending(path: "agents/\(roleId)/sessions"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: Any] = ["providerId": providerId]
@@ -1207,6 +1234,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return .success(created.session)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.startRoleSession")
             let message = error.localizedDescription
             errorMessage = message
             return .failure(message: message)
@@ -1216,7 +1244,7 @@ final class EntityAPIClient: ObservableObject {
     @discardableResult
     func startWorkChat(
         workId: String,
-        agentId: String,
+        roleId: String,
         providerId: String,
         title: String? = nil,
         prompt: String? = nil
@@ -1224,7 +1252,7 @@ final class EntityAPIClient: ObservableObject {
         var request = URLRequest(url: baseURL.appending(path: "works/\(workId)/sessions"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var body: [String: Any] = ["agentId": agentId, "providerId": providerId]
+        var body: [String: Any] = ["agentId": roleId, "providerId": providerId]
         if let title, !title.isEmpty { body["title"] = title }
         if let prompt, !prompt.isEmpty { body["prompt"] = prompt }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -1240,6 +1268,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return .success(session)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.startWorkChat")
             errorMessage = error.localizedDescription
             return .failure(message: error.localizedDescription)
         }
@@ -1249,7 +1278,7 @@ final class EntityAPIClient: ObservableObject {
     @discardableResult
     func updateWork(workId: String, name: String? = nil, description: String? = nil,
                          profile: String? = nil, tags: [String]? = nil,
-                         contributorAgentIds: [String]? = nil) async -> Work? {
+                         contributorRoleIds: [String]? = nil) async -> Work? {
         var request = URLRequest(url: baseURL.appending(path: "works/\(workId)"))
         request.httpMethod = "PATCH"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1258,7 +1287,7 @@ final class EntityAPIClient: ObservableObject {
         if let description { body["description"] = description }
         if let profile { body["profile"] = profile }
         if let tags { body["tags"] = tags }
-        if let contributorAgentIds { body["contributorAgentIds"] = contributorAgentIds }
+        if let contributorRoleIds { body["contributorAgentIds"] = contributorRoleIds }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         if let work = await performEntityMutation(request, as: Work.self) {
             await refreshWorks()
@@ -1297,19 +1326,20 @@ final class EntityAPIClient: ObservableObject {
             await refreshWorks()
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.deleteWork")
             errorMessage = error.localizedDescription
             return false
         }
     }
 
     // Agent 辅助填写：POST /assist/draft { fieldLabel, prompt, cwd?, agentId? } → { text, providerId }
-    func assistDraft(fieldLabel: String, prompt: String, cwd: String? = nil, agentId: String? = nil) async -> String? {
+    func assistDraft(fieldLabel: String, prompt: String, cwd: String? = nil, roleId: String? = nil) async -> String? {
         var request = URLRequest(url: baseURL.appending(path: "assist/draft"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: Any] = ["fieldLabel": fieldLabel, "prompt": prompt]
         if let cwd, !cwd.isEmpty { body["cwd"] = cwd }
-        if let agentId, !agentId.isEmpty { body["agentId"] = agentId }
+        if let roleId, !roleId.isEmpty { body["agentId"] = roleId }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -1322,6 +1352,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return result.text
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.assistDraft")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1333,7 +1364,7 @@ final class EntityAPIClient: ObservableObject {
         prompt: String,
         currentValues: [String: String],
         cwd: String? = nil,
-        agentId: String? = nil
+        roleId: String? = nil
     ) async -> AssistFormDraft? {
         var request = URLRequest(url: baseURL.appending(path: "assist/form-draft"))
         request.httpMethod = "POST"
@@ -1344,7 +1375,7 @@ final class EntityAPIClient: ObservableObject {
             "currentValues": currentValues
         ]
         if let cwd, !cwd.isEmpty { body["cwd"] = cwd }
-        if let agentId, !agentId.isEmpty { body["agentId"] = agentId }
+        if let roleId, !roleId.isEmpty { body["agentId"] = roleId }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -1361,6 +1392,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return result
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.assistFormDraft")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1378,6 +1410,7 @@ final class EntityAPIClient: ObservableObject {
             let (data, _) = try await URLSession.shared.data(for: request)
             return try decoder.decode(AssistantChatResponse.self, from: data).messages
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.assistantChat")
             errorMessage = error.localizedDescription
             return [AssistantMessage(role: "assistant", content: "抱歉，请求失败：\(error.localizedDescription)")]
         }
@@ -1388,7 +1421,7 @@ final class EntityAPIClient: ObservableObject {
     func createWork(id: String? = nil, name: String, description: String? = nil,
                          avatarPath: String? = nil, profile: String = "general", tags: [String] = [],
                          workspaceId: String? = nil,
-                         contributorAgentIds: [String] = []) async -> Work? {
+                         contributorRoleIds: [String] = []) async -> Work? {
         var request = URLRequest(url: baseURL.appending(path: "works"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1399,7 +1432,7 @@ final class EntityAPIClient: ObservableObject {
         body["profile"] = profile
         if !tags.isEmpty { body["tags"] = tags }
         if let workspaceId, !workspaceId.isEmpty { body["workspaceId"] = workspaceId }
-        if !contributorAgentIds.isEmpty { body["contributorAgentIds"] = contributorAgentIds }
+        if !contributorRoleIds.isEmpty { body["contributorAgentIds"] = contributorRoleIds }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         if let work = await performEntityMutation(request, as: Work.self) {
             await refreshWorks()
@@ -1454,6 +1487,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return .success(repository)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.registerRepository")
             errorMessage = error.localizedDescription
             return .failure(error.localizedDescription)
         }
@@ -1483,6 +1517,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return .success(registration)
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.registerWorkspace")
             errorMessage = error.localizedDescription
             return .failure(error.localizedDescription)
         }
@@ -1490,10 +1525,10 @@ final class EntityAPIClient: ObservableObject {
 
     // 创建 Agent 资源包：Provider 由实际 Session 选择。
     @discardableResult
-    func createAgent(name: String, description: String? = nil,
+    func createRole(name: String, description: String? = nil,
                      systemPrompt: String? = nil, capabilities: [String] = [],
                      skillIds: [String] = [], workDir: String? = nil,
-                     idempotencyKey: String = UUID().uuidString) async -> Agent? {
+                     idempotencyKey: String = UUID().uuidString) async -> Role? {
         var request = URLRequest(url: baseURL.appending(path: "agents"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1511,13 +1546,14 @@ final class EntityAPIClient: ObservableObject {
             let (data, response) = try await URLSession.shared.data(for: request)
             if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                 let envelope = try? decoder.decode(EntityErrorEnvelope.self, from: data)
-                errorMessage = envelope?.error ?? "保存 Agent 失败（HTTP \(http.statusCode)）"
+                errorMessage = envelope?.error ?? "保存角色失败（HTTP \(http.statusCode)）"
                 return nil
             }
-            let agent = try decoder.decode(AgentCreateEnvelope.self, from: data).agent
-            await refreshAgents()
+            let agent = try decoder.decode(RoleCreateEnvelope.self, from: data).agent
+            await refreshRoles()
             return agent
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.createRole")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1525,10 +1561,10 @@ final class EntityAPIClient: ObservableObject {
 
     // 更新 Agent：PATCH /agents/:id → { agent }
     @discardableResult
-    func updateAgent(agentId: String, name: String? = nil, description: String? = nil,
+    func updateRole(roleId: String, name: String? = nil, description: String? = nil,
                      systemPrompt: String? = nil, skillIds: [String]? = nil,
-                     workDir: String? = nil) async -> Agent? {
-        var request = URLRequest(url: baseURL.appending(path: "agents/\(agentId)"))
+                     workDir: String? = nil) async -> Role? {
+        var request = URLRequest(url: baseURL.appending(path: "agents/\(roleId)"))
         request.httpMethod = "PATCH"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: Any] = [:]
@@ -1542,27 +1578,29 @@ final class EntityAPIClient: ObservableObject {
             let (data, response) = try await URLSession.shared.data(for: request)
             if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                 let envelope = try? decoder.decode(EntityErrorEnvelope.self, from: data)
-                errorMessage = envelope?.error ?? "保存 Agent 失败（HTTP \(http.statusCode)）"
+                errorMessage = envelope?.error ?? "保存角色失败（HTTP \(http.statusCode)）"
                 return nil
             }
-            let agent = try decoder.decode(AgentCreateEnvelope.self, from: data).agent
-            await refreshAgents()
+            let agent = try decoder.decode(RoleCreateEnvelope.self, from: data).agent
+            await refreshRoles()
             return agent
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.updateRole")
             errorMessage = error.localizedDescription
             return nil
         }
     }
 
     // 删除 Agent：DELETE /agents/:id → { ok }
-    func deleteAgent(agentId: String) async -> Bool {
-        var request = URLRequest(url: baseURL.appending(path: "agents/\(agentId)"))
+    func deleteRole(roleId: String) async -> Bool {
+        var request = URLRequest(url: baseURL.appending(path: "agents/\(roleId)"))
         request.httpMethod = "DELETE"
         do {
             _ = try await URLSession.shared.data(for: request)
-            await refreshAgents()
+            await refreshRoles()
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.deleteRole")
             errorMessage = error.localizedDescription
             return false
         }
@@ -1570,27 +1608,28 @@ final class EntityAPIClient: ObservableObject {
 
     // 设置 Agent 头像：PATCH /agents/:id { avatarPath: 源文件路径 } → { agent }
     @discardableResult
-    func setAgentAvatar(agentId: String, sourcePath: String) async -> Agent? {
-        await patchAgentAvatar(agentId: agentId, body: ["avatarPath": sourcePath])
+    func setRoleAvatar(roleId: String, sourcePath: String) async -> Role? {
+        await patchRoleAvatar(roleId: roleId, body: ["avatarPath": sourcePath])
     }
 
     // 清除 Agent 头像：PATCH /agents/:id { avatarPath: null } → { agent }
     @discardableResult
-    func clearAgentAvatar(agentId: String) async -> Agent? {
-        await patchAgentAvatar(agentId: agentId, body: ["avatarPath": NSNull()])
+    func clearRoleAvatar(roleId: String) async -> Role? {
+        await patchRoleAvatar(roleId: roleId, body: ["avatarPath": NSNull()])
     }
 
-    private func patchAgentAvatar(agentId: String, body: [String: Any]) async -> Agent? {
-        var request = URLRequest(url: baseURL.appending(path: "agents/\(agentId)"))
+    private func patchRoleAvatar(roleId: String, body: [String: Any]) async -> Role? {
+        var request = URLRequest(url: baseURL.appending(path: "agents/\(roleId)"))
         request.httpMethod = "PATCH"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
-            let agent = try decoder.decode(AgentCreateEnvelope.self, from: data).agent
-            await refreshAgents()
+            let agent = try decoder.decode(RoleCreateEnvelope.self, from: data).agent
+            await refreshRoles()
             return agent
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.patchRoleAvatar")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1616,6 +1655,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return result
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.discoverSkills")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1628,12 +1668,15 @@ final class EntityAPIClient: ObservableObject {
         description: String?,
         sourceType: String,
         source: String,
-        sourceSubpath: String? = nil
+        sourceSubpath: String? = nil,
+        requestID: String = UUID().uuidString,
+        onAccepted: ((String) -> Void)? = nil
     ) async -> Skill? {
         var request = URLRequest(url: baseURL.appending(path: "skills"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var body: [String: Any] = ["sourceType": sourceType, "source": source, "assist": true]
+        var body: [String: Any] = ["sourceType": sourceType, "source": source, "assist": true,
+                                   "async": true, "requestId": requestID]
         if let name, !name.isEmpty { body["name"] = name }
         if let description, !description.isEmpty { body["description"] = description }
         if let sourceSubpath { body["sourceSubpath"] = sourceSubpath }
@@ -1645,10 +1688,46 @@ final class EntityAPIClient: ObservableObject {
                 errorMessage = envelope?.error ?? "登记 Skill 失败（HTTP \(http.statusCode)）"
                 return nil
             }
-            let skill = try decoder.decode(SkillEnvelope.self, from: data).skill
+            var skillData = data
+            if (response as? HTTPURLResponse)?.statusCode == 202 {
+                var operation = try decoder.decode(ClientSkillInstallEnvelope.self, from: data).operation
+                onAccepted?(operation.operationId)
+                // Bounded observation only. The server owns the operation and
+                // keeps its receipt even if this task or window goes away.
+                for _ in 0..<120 {
+                    if operation.isTerminal { break }
+                    try await Task.sleep(for: .seconds(2))
+                    let (receiptData, receiptResponse) = try await URLSession.shared.data(from:
+                        baseURL.appending(path: "skills/install-operations/\(operation.operationId)"))
+                    guard (receiptResponse as? HTTPURLResponse)?.statusCode == 200 else {
+                        throw URLError(.badServerResponse)
+                    }
+                    operation = try decoder.decode(ClientSkillInstallEnvelope.self, from: receiptData).operation
+                }
+                guard operation.succeeded, let skillID = operation.skillId else {
+                    errorMessage = operation.isTerminal
+                        ? "安装未完成：\(operation.errorCode ?? operation.status)。操作 ID：\(operation.operationId)"
+                        : "后台安装仍在进行，请通过操作 ID 查询：\(operation.operationId)"
+                    OperationNotificationManager.shared.complete(OperationNotificationEvent(
+                        id: "skill-install:\(operation.operationId):\(operation.status)", category: .environment,
+                        outcome: operation.isTerminal ? .attention : .unconfirmed,
+                        name: "Skill 安装", summary: errorMessage ?? ""))
+                    return nil
+                }
+                let (installedData, installedResponse) = try await URLSession.shared.data(from:
+                    baseURL.appending(path: "skills/\(skillID)"))
+                guard (installedResponse as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                skillData = installedData
+                OperationNotificationManager.shared.complete(OperationNotificationEvent(
+                    id: "skill-install:\(operation.operationId):succeeded", category: .environment,
+                    outcome: .succeeded, name: "Skill 安装", summary: name ?? "Skill 已完成托管安装"))
+            }
+            let skill = try decoder.decode(SkillEnvelope.self, from: skillData).skill
+            errorMessage = nil
             await refreshSkills()
             return skill
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.registerSkill")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1660,6 +1739,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return impact
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.skillDeletionImpact")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1676,6 +1756,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return true
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.deleteSkill")
             errorMessage = error.localizedDescription
             return false
         }
@@ -1708,6 +1789,7 @@ final class EntityAPIClient: ObservableObject {
             errorMessage = nil
             return value
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "EntityAPIClient.performEntityMutation")
             errorMessage = error.localizedDescription
             return nil
         }
@@ -1715,8 +1797,8 @@ final class EntityAPIClient: ObservableObject {
 }
 
 // POST /agents 响应 envelope
-private struct AgentCreateEnvelope: Decodable {
-    let agent: Agent
+private struct RoleCreateEnvelope: Decodable {
+    let agent: Role
 }
 
 // POST /assist/draft 响应

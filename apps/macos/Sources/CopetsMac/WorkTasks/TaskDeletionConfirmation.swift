@@ -9,31 +9,34 @@ struct CorptieTaskDeletionConfirmationView: View {
     let onMergeFirst: () -> Void
     let onDelete: (
         _ force: Bool,
-        _ branch: String?,
         _ deleteWorktree: Bool,
-        _ artifactDisposition: CorptieTaskArtifactDisposition
+        _ artifactDisposition: CorptieTaskArtifactDisposition,
+        _ options: ClientTaskDeletionOptions
     ) -> Void
 
-    @State private var showForceConfirmation = false
-    @State private var acknowledgesDataLoss = false
+    @State private var options = ClientTaskDeletionOptions()
     @State private var deleteWorktree = true
     @State private var artifactDisposition: CorptieTaskArtifactDisposition = .delete
 
     private var artifacts: [CorptieTaskDeletionArtifact] { plan.artifacts ?? [] }
     private var effectiveBlockers: [CorptieTaskDeletionRisk] {
-        deleteWorktree ? plan.blockers : plan.blockers.filter { $0.code == "START_IN_PROGRESS" }
+        plan.blockers.filter { (deleteWorktree || TaskDeletionConfirmationPolicy.isTaskLevelBlocker($0.code)) && !options.resolves($0.code) }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label(
-                showForceConfirmation ? L10n("二次确认强制删除") : L10n("删除 CorptieTask"),
+                L10n("删除 CorptieTask"),
                 systemImage: "exclamationmark.triangle.fill"
             )
             .font(.title3.weight(.semibold))
-            .foregroundStyle(showForceConfirmation ? Color.red : Color.primary)
+            .foregroundStyle(Color.primary)
 
             Text(task.title).font(.headline)
+            if plan.parentTaskId != nil {
+                Text(L10n("删除此任务及其子任务；已合入父分支的代码不受影响。"))
+                    .font(.callout).foregroundStyle(.secondary)
+            }
 
             Text(L10nFormat(
                 "删除此 CorptieTask 将永久删除 %d 个关联会话及完整会话历史。Worktree 和 Artifact 将按下方选项处理。此操作无法撤销。",
@@ -82,38 +85,32 @@ struct CorptieTaskDeletionConfirmationView: View {
                 riskList(title: L10n("可能丢失的内容"), risks: plan.risks, color: .orange)
             }
 
-            if showForceConfirmation {
-                Text(L10n("强制删除将永久丢弃上述未提交修改、未跟踪文件和未合并提交，且无法从 Corptie 恢复。"))
-                    .font(.callout.weight(.semibold)).foregroundStyle(.red)
-                Toggle(L10n("我理解这些内容可能永久丢失"), isOn: $acknowledgesDataLoss)
+            if plan.blockers.contains(where: { $0.code == "SESSION_BUSY" }) {
+                Toggle(L10n("停止正在运行的会话后删除"), isOn: $options.stopRunning)
             }
-
+            if plan.blockers.contains(where: { $0.code == "START_IN_PROGRESS" }) {
+                Toggle(L10n("中断启动后删除"), isOn: $options.cancelStartup)
+            }
+            if plan.blockers.contains(where: { $0.code == "SHARED_WITH_ACTIVE_TASK" }) {
+                Toggle(L10n("一并删除共用 Worktree 的关联任务"), isOn: $options.deleteAssociatedTasks)
+                Text((plan.associatedTaskIds ?? []).joined(separator: "\n")).font(.caption).foregroundStyle(.secondary)
+            }
+            if plan.blockers.contains(where: { $0.code == "ACTIVE_WORKTREE_INTEGRATION_JOB" }) {
+                Toggle("取消占用的集成作业后删除", isOn: $options.cancelIntegration)
+            }
+            if !(plan.childTaskIds ?? []).isEmpty {
+                Text(L10nFormat("将级联删除 %d 个子任务。", plan.childTaskIds?.count ?? 0)).font(.callout).foregroundStyle(.secondary)
+            }
             HStack {
                 Spacer()
                 Button(L10n("取消"), role: .cancel, action: onCancel)
-                if !showForceConfirmation, deleteWorktree, !plan.risks.isEmpty, effectiveBlockers.isEmpty {
-                    Button(L10n("先合并"), action: onMergeFirst)
-                    Button(L10n("强制删除"), role: .destructive) { showForceConfirmation = true }
-                } else if showForceConfirmation {
-                    Button(L10n("确认强制删除"), role: .destructive) {
-                        onDelete(true, plan.worktree?.branchName, deleteWorktree, artifactDisposition)
-                    }
-                    .disabled(!acknowledgesDataLoss)
-                } else if effectiveBlockers.isEmpty {
-                    Button(L10n("确认删除"), role: .destructive) {
-                        onDelete(false, nil, deleteWorktree, artifactDisposition)
-                    }
-                }
+                Button(L10n("删除"), role: .destructive) {
+                    onDelete(true, deleteWorktree, artifactDisposition, options)
+                }.disabled(!effectiveBlockers.isEmpty)
             }
         }
         .padding(20)
         .frame(width: 520)
-        .onChange(of: deleteWorktree) { _, enabled in
-            if !enabled {
-                showForceConfirmation = false
-                acknowledgesDataLoss = false
-            }
-        }
     }
 
     private func riskList(title: String, risks: [CorptieTaskDeletionRisk], color: Color) -> some View {

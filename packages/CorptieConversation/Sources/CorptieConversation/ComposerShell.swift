@@ -3,6 +3,10 @@ import SwiftUI
 /// Geometry of the message composer row, identical on macOS (`MessageComposer`)
 /// and iPad. Hosts keep their own text engine (NSTextView / UITextView); the
 /// clamp, chip strip, action glyphs and model menu frame live here.
+public enum ComposerModelMenuPresentation: Equatable, Sendable {
+    case compact, regular
+}
+
 public enum ComposerShellMetrics {
     public static let minimumInputHeight: CGFloat = 30
     public static let maximumInputHeight: CGFloat = 96
@@ -26,10 +30,17 @@ public enum ComposerShellMetrics {
         min(maximumInputHeight, max(minimumInputHeight, ceil(contentHeight)))
     }
 
-    /// The model menu yields to the editor: a sixth of the row, 54–74pt.
-    public static func modelMenuMaxWidth(composerWidth: CGFloat) -> CGFloat {
-        guard composerWidth > 0 else { return 74 }
-        return max(54, min(74, composerWidth / 6))
+    /// Compact clients keep a 54–74pt menu; regular desktop menus reserve readable space.
+    public static func modelMenuMaxWidth(composerWidth: CGFloat,
+                                        presentation: ComposerModelMenuPresentation = .compact) -> CGFloat {
+        switch presentation {
+        case .compact:
+            guard composerWidth.isFinite, composerWidth > 0 else { return 74 }
+            return max(54, min(74, composerWidth / 6))
+        case .regular:
+            guard composerWidth.isFinite, composerWidth > 0 else { return 176 }
+            return max(176, min(240, composerWidth * 0.35))
+        }
     }
 }
 
@@ -256,19 +267,22 @@ public struct ConversationComposerChrome<Header: View, Content: View>: View {
     private let content: Content
     private let verticalPadding: CGFloat
     private let contentSpacing: CGFloat
+    private let headerAtBottom: Bool
 
-    public init(verticalPadding: CGFloat = 6, contentSpacing: CGFloat = 2,
+    public init(verticalPadding: CGFloat = 6, contentSpacing: CGFloat = 2, headerAtBottom: Bool = false,
                 @ViewBuilder header: () -> Header, @ViewBuilder content: () -> Content) {
         self.header = header()
         self.content = content()
         self.verticalPadding = verticalPadding
         self.contentSpacing = contentSpacing
+        self.headerAtBottom = headerAtBottom
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: contentSpacing) {
-            header.padding(.horizontal, 8)
+            if !headerAtBottom { header.padding(.horizontal, 8) }
             content
+            if headerAtBottom { header.padding(.horizontal, 8) }
         }
         .padding(.horizontal, 6)
         .padding(.vertical, verticalPadding)
@@ -347,16 +361,24 @@ public struct ConversationComposerEditorRow<Attachments: View, Editor: View, Sen
 #if os(macOS)
 /// Repositions the same editor and model views; unlike switching two view
 /// trees, crossing the breakpoint cannot recreate NSTextView or lose its focus.
-private struct ComposerEditorRowLayout: Layout {
+public struct ComposerEditorRowLayout: Layout {
     private let spacing: CGFloat = 8
-    private let minimumEditorWidth: CGFloat = 176
+    private let minimumEditorWidth: CGFloat
+    private let preservesLeadingContentWidth: Bool
+
+    public init(minimumEditorWidth: CGFloat = 176, preservesLeadingContentWidth: Bool = false) {
+        self.minimumEditorWidth = minimumEditorWidth
+        self.preservesLeadingContentWidth = preservesLeadingContentWidth
+    }
 
     private func measure(width: CGFloat, subviews: Subviews)
         -> (editor: CGSize, model: CGSize, stacked: Bool, total: CGSize) {
         guard !subviews.isEmpty else { return (.zero, .zero, false, .zero) }
         let model = subviews.count > 1 ? subviews[1].sizeThatFits(.unspecified) : .zero
         let modelWidth = min(width, model.width)
-        let stacked = subviews.count > 1 && width < minimumEditorWidth + spacing + modelWidth
+        let leadingWidth = preservesLeadingContentWidth
+            ? max(minimumEditorWidth, subviews[0].sizeThatFits(.unspecified).width) : minimumEditorWidth
+        let stacked = subviews.count > 1 && width < leadingWidth + spacing + modelWidth
         let editorWidth = subviews.count < 2 || stacked ? width : max(0, width - modelWidth - spacing)
         let editor = subviews[0].sizeThatFits(.init(width: editorWidth, height: nil))
         let height = stacked ? editor.height + spacing + model.height : max(editor.height, model.height)
@@ -364,12 +386,12 @@ private struct ComposerEditorRowLayout: Layout {
                 CGSize(width: modelWidth, height: model.height), stacked, CGSize(width: width, height: height))
     }
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    public func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width.flatMap { $0.isFinite ? max(0, $0) : nil } ?? 384
         return measure(width: width, subviews: subviews).total
     }
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         guard !subviews.isEmpty else { return }
         let plan = measure(width: max(0, bounds.width), subviews: subviews)
         let editorY = plan.stacked ? bounds.minY : bounds.minY + (plan.total.height - plan.editor.height) / 2
@@ -427,14 +449,19 @@ public struct ComposerModelMenuLabel: View {
     private let isBusy: Bool
     private let maxWidth: CGFloat
     private let showsSurface: Bool
+    private let presentation: ComposerModelMenuPresentation
+    private let showsDisclosureIndicator: Bool
 
     public init(modelLabel: String, reasoningShortLabel: String, isBusy: Bool, maxWidth: CGFloat,
-                showsSurface: Bool = true) {
+                showsSurface: Bool = true, presentation: ComposerModelMenuPresentation = .compact,
+                showsDisclosureIndicator: Bool = false) {
+        self.presentation = presentation
         self.modelLabel = modelLabel
         self.reasoningShortLabel = reasoningShortLabel
         self.isBusy = isBusy
         self.maxWidth = maxWidth
         self.showsSurface = showsSurface
+        self.showsDisclosureIndicator = showsDisclosureIndicator
     }
 
     public var body: some View {
@@ -454,25 +481,46 @@ public struct ComposerModelMenuLabel: View {
     }
 
     private var labelContent: some View {
+        Group {
+            if presentation == .regular {
+                menuText
+                    .padding(.horizontal, 8)
+                    .frame(maxWidth: maxWidth)
+                    .fixedSize(horizontal: true, vertical: false)
+            } else {
+                menuText
+                    .frame(maxWidth: maxWidth)
+                    .padding(.horizontal, 8)
+            }
+        }
+        .frame(height: ComposerShellMetrics.modelMenuHeight)
+        .help(modelLabel)
+    }
+
+    private var menuText: some View {
         HStack(spacing: 4) {
             if isBusy {
                 ProgressView().controlSize(.small).frame(width: 16, height: 16)
             }
-            Text(ComposerModelLabel.compact(modelLabel))
-                .font(.system(size: 10, weight: .semibold, design: .rounded))
+            Text(presentation == .regular ? modelLabel : ComposerModelLabel.compact(modelLabel))
+                .font(presentation == .regular ? WorkbenchTypography.font(for: .help) : .system(size: 10, weight: .semibold, design: .rounded))
                 .lineLimit(1)
                 .truncationMode(.tail)
             if !reasoningShortLabel.isEmpty {
                 Text(reasoningShortLabel)
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                    .font(presentation == .regular ? WorkbenchTypography.font(for: .help).weight(.medium) : .system(size: 9, weight: .bold, design: .rounded))
                     .foregroundStyle(ComposerPalette.secondaryText)
                     .lineLimit(1)
+                    .layoutPriority(1)
+            }
+            if showsDisclosureIndicator {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(ComposerPalette.secondaryText)
+                    .accessibilityHidden(true)
             }
         }
         .foregroundStyle(ComposerPalette.primaryText)
-        .frame(maxWidth: maxWidth)
-        .padding(.horizontal, 8)
-        .frame(height: ComposerShellMetrics.modelMenuHeight)
     }
 }
 

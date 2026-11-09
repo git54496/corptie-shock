@@ -1,3 +1,4 @@
+import { logError } from "../utils/errorDiagnostics.mjs";
 import { unifiedSearch } from "./unifiedSearch.mjs";
 import { parentPort, workerData } from "node:worker_threads";
 import { readQuickMessages } from "../application/quickMessageRecommendations.mjs";
@@ -21,6 +22,7 @@ try {
   });
   parentPort?.postMessage({ type: "ready" });
 } catch (error) {
+  logError("timeline-worker.initialize", error, { stage: "initialize" });
   parentPort?.postMessage({ type: "fatal", error: serializeError(error) });
 }
 
@@ -36,6 +38,7 @@ parentPort?.on("message", (message) => {
     const payload = new TextEncoder().encode(JSON.stringify(result));
     parentPort?.postMessage({ type: "result", requestId, payload }, [payload.buffer]);
   } catch (error) {
+    logError("timeline-worker.read", error, { requestId, stage: "read" });
     parentPort?.postMessage({ type: "result", requestId, error: serializeError(error) });
   }
 });
@@ -44,6 +47,8 @@ function execute(operation, input) {
   switch (operation) {
     case "unifiedSearch":
       return unifiedSearch(store, new URLSearchParams(input.query));
+    case "userMessageNavigation":
+      return store.timelineReadRepository.readUserMessageNavigationPage(input.sessionId, input);
     case "quickMessages":
       return readQuickMessages(store, input.sessionId);
     case "storedTimelineSnapshot": {

@@ -6,7 +6,7 @@ import { SessionMutationRepository } from "./repositories/sessionMutationReposit
 import { SessionReadRepository } from "./repositories/sessionReadRepository.mjs";
 import { ProjectCodeReceiptRepository } from "./repositories/projectCodeReceiptRepository.mjs";
 import { StateSyncRepository } from "./repositories/stateSyncRepository.mjs";
-import { AgentRepository } from "./repositories/agentRepository.mjs";
+import { RoleRepository } from "./repositories/roleRepository.mjs";
 import { TaskRepository } from "./repositories/taskRepository.mjs";
 import { TaskHierarchyRepository } from "./repositories/taskHierarchyRepository.mjs";
 import { TaskCompletionRepository } from "./repositories/taskCompletionRepository.mjs";
@@ -102,7 +102,7 @@ export function createStoreRepositories({ getDatabase, getSshWorkspaces, environ
       selectOne: (...args) => ports.selectOne(...args),
       selectAll: (...args) => ports.selectAll(...args),
     });
-    const agentRepository = new AgentRepository({
+    const agentRepository = new RoleRepository({
       getDatabase: () => getDatabase(),
       environmentName,
       selectAll: (...args) => ports.selectAll(...args),
@@ -113,6 +113,7 @@ export function createStoreRepositories({ getDatabase, getSshWorkspaces, environ
       recordSkillRuntimeEvent: (...args) => ports.recordSkillRuntimeEvent(...args),
     });
     const taskHierarchyRepository = new TaskHierarchyRepository({
+      listGitWorktrees: (...args) => ports.listGitWorktrees(...args),
       getDatabase, selectOne: (...args) => ports.selectOne(...args), selectAll: (...args) => ports.selectAll(...args),
       getTask: (...args) => ports.getTask(...args), getWork: (...args) => ports.getWork(...args),
       getTaskWorkspaceContext: (...args) => taskRepository.getTaskWorkspaceContext(...args), scheduleSave: (...args) => ports.scheduleSave(...args)

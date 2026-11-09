@@ -15,6 +15,7 @@ struct DetailDisplayCache: Sendable {
     let visibleMessageLimit: Int
     let signature: String
     let sourceSignature: String
+    let isPresentationPrepared: Bool
     /// Non-nil only when the requested semantic viewport anchor was present
     /// in this bounded projection window.
     let restorationAnchorRowID: String?
@@ -27,7 +28,8 @@ struct DetailDisplayCache: Sendable {
         visibleMessageLimit: Int,
         signature: String,
         sourceSignature: String,
-        restorationAnchorRowID: String? = nil
+        restorationAnchorRowID: String? = nil,
+        isPresentationPrepared: Bool = false
     ) {
         self.sessionId = sessionId
         self.displayItems = displayItems
@@ -36,6 +38,7 @@ struct DetailDisplayCache: Sendable {
         self.visibleMessageLimit = visibleMessageLimit
         self.signature = signature
         self.sourceSignature = sourceSignature
+        self.isPresentationPrepared = isPresentationPrepared
         self.restorationAnchorRowID = restorationAnchorRowID
     }
 }
@@ -51,12 +54,19 @@ func makeDetailDisplayCache(
     for detail: CodexThreadDetail,
     sessionId: String,
     visibleMessageLimit: Int,
-    restorationAnchorRowID: String? = nil
+    restorationAnchorRowID: String? = nil,
+    preparedSourceSignature: String? = nil
 ) -> DetailDisplayCache {
+    if Task.isCancelled {
+        return DetailDisplayCache(sessionId: sessionId, displayItems: [], displayEntries: [],
+            totalDisplayEntryCount: 0, visibleMessageLimit: visibleMessageLimit,
+            signature: preparedSourceSignature ?? "cancelled", sourceSignature: preparedSourceSignature ?? "cancelled")
+    }
     let preparedDisplay = makeVisibleDetailDisplay(
         for: detail,
         visibleMessageLimit: visibleMessageLimit,
-        restorationAnchorRowID: restorationAnchorRowID
+        restorationAnchorRowID: restorationAnchorRowID,
+        preparedSourceSignature: preparedSourceSignature
     )
     return DetailDisplayCache(
         sessionId: sessionId,
@@ -73,12 +83,12 @@ func makeDetailDisplayCache(
 private func makeVisibleDetailDisplay(
     for detail: CodexThreadDetail,
     visibleMessageLimit: Int,
-    restorationAnchorRowID: String?
+    restorationAnchorRowID: String?, preparedSourceSignature: String?
 ) -> (displayItems: [CodexThreadItem], visibleEntries: [ChatDisplayEntry], totalCount: Int, signature: String, sourceSignature: String, resolvedRestorationAnchorRowID: String?) {
-    let displayItems = detail.items
-        .filter { !isLowSignalDetailProcessItem($0) }
+    let displayItems = Array(detail.items.lazy.prefix { _ in !Task.isCancelled }
+        .filter { !isLowSignalDetailProcessItem($0) })
     let displayEntries = PerfStopwatch.measure("timeline.makeChatDisplayEntries") {
-        makeChatDisplayEntries(from: displayItems)
+        Task.isCancelled ? [] : makeChatDisplayEntries(from: displayItems)
     }
     let uniqueDisplayEntries = uniquedChatDisplayEntries(displayEntries)
     let anchoredWindow = restorationAnchorRowID.flatMap { anchorRowID in
@@ -94,8 +104,8 @@ private func makeVisibleDetailDisplay(
         displayItems: displayItems,
         visibleEntries: visibleEntries,
         totalCount: uniqueDisplayEntries.reduce(0) { $0 + $1.displayWeight },
-        signature: detailDisplaySignature(for: visibleEntries, visibleMessageLimit: visibleMessageLimit),
-        sourceSignature: makeDetailSourceSignature(
+        signature: preparedSourceSignature ?? detailDisplaySignature(for: visibleEntries, visibleMessageLimit: visibleMessageLimit),
+        sourceSignature: preparedSourceSignature ?? makeDetailSourceSignature(
             for: detail,
             visibleMessageLimit: visibleMessageLimit,
             restorationAnchorRowID: restorationAnchorRowID
@@ -247,7 +257,7 @@ func canIncrementallyAppendChatDisplayEntries(
 }
 
 func makeChatDisplayEntries(from items: [CodexThreadItem]) -> [ChatDisplayEntry] {
-    ConversationTimeline.makeEntries(from: items)
+    ConversationTimeline.makeEntries(from: items, showsPendingInputAsProcessing: true)
 }
 
 func stableChronologicalChatItems(_ items: [CodexThreadItem]) -> [CodexThreadItem] {
@@ -257,7 +267,7 @@ func stableChronologicalChatItems(_ items: [CodexThreadItem]) -> [CodexThreadIte
 func makeChatDisplayEntriesForTurn(
     _ items: [CodexThreadItem], displayTurnId: String? = nil
 ) -> [ChatDisplayEntry] {
-    ConversationTimeline.entriesForTurn(items, displayTurnId: displayTurnId)
+    ConversationTimeline.entriesForTurn(items, displayTurnId: displayTurnId, showsPendingInputAsProcessing: true)
 }
 
 /// Projects the state of the whole execution card from the turn lifecycle.
@@ -280,7 +290,7 @@ struct NativeCollaborationCardPresentation: Equatable {
     let metadata: String
     let bodyMarkdown: String
     let messageText: String
-    let route: NativeCollaborationRoutePresentation
+    let route: NativeCollaborationRoutePresentation?
 }
 
 struct NativeSpecialEventCardPresentation: Equatable {
@@ -334,17 +344,6 @@ func nativeCollaborationCardPresentation(
         return value
     }
 
-    if isMessage {
-        guard (nonEmpty(item.collaborationTaskId) != nil || nonEmpty(item.collaborationChannelId) != nil),
-              nonEmpty(item.collaborationInitiatorSessionId) != nil,
-              nonEmpty(item.collaborationRecipientSessionId) != nil,
-              nonEmpty(item.collaborationSourceWorkId) != nil,
-              nonEmpty(item.collaborationTargetWorkId) != nil,
-              nonEmpty(item.presentationText) != nil else {
-            return nil
-        }
-    }
-
     let kind: String = switch item.collaborationMessageKind?.lowercased() {
     case "change_request": L10n("修改请求")
     case "needs_information": L10n("澄清请求")
@@ -368,25 +367,32 @@ func nativeCollaborationCardPresentation(
     default: isConfirmation ? L10n("等待确认") : L10n("等待处理")
     }
     let hasTargetSession = nonEmpty(item.collaborationRecipientSessionId) != nil
+    let hasSourceSession = nonEmpty(item.collaborationInitiatorSessionId) != nil
+    let direction = item.collaborationDirection?.lowercased()
+    let directionLabel: String? = switch direction {
+    case "inbound": L10n("收到")
+    case "outbound": L10n("发出")
+    default: nil
+    }
     let sourceSession = readableName(
-        item.collaborationInitiatorSessionTitle ?? currentSessionTitle,
+        item.collaborationInitiatorSessionTitle ?? (direction == "outbound" ? currentSessionTitle : nil),
         id: item.collaborationInitiatorSessionId,
-        fallback: L10n("当前会话")
+        fallback: L10n("来源会话信息不可用")
     )
     let targetSession = readableName(
         item.collaborationRecipientSessionTitle,
         id: item.collaborationRecipientSessionId,
-        fallback: L10n("目标会话")
+        fallback: L10n("目标会话信息不可用")
     )
     let sourceWork = readableName(
         item.collaborationSourceWorkName,
         id: item.collaborationSourceWorkId,
-        fallback: L10n("来源 Work")
+        fallback: nonEmpty(item.collaborationSourceWorkId) == nil ? L10n("未关联 Work") : L10n("来源 Work")
     )
     let targetWork = readableName(
         item.collaborationTargetWorkName,
         id: item.collaborationTargetWorkId,
-        fallback: L10n("目标 Work")
+        fallback: nonEmpty(item.collaborationTargetWorkId) == nil ? L10n("未关联 Work") : L10n("目标 Work")
     )
     let message = nonEmpty(item.presentationText)
         ?? nonEmpty(item.text)
@@ -397,6 +403,13 @@ func nativeCollaborationCardPresentation(
         fallback: L10n("未命名协作任务")
     )
     var lines = ["**\(L10n("消息"))**", message]
+    // Work is optional metadata. Missing Session endpoints only suppress the
+    // route diagram, never the collaboration card or its authored message.
+    let hasRoute = (hasSourceSession && hasTargetSession)
+        || (isConfirmation && item.collaborationAuthorizationKind != "session_channel")
+    if isMessage && !hasRoute {
+        lines.append(L10n("部分协作来源或目标信息不可用。"))
+    }
     if isConfirmation, item.collaborationAuthorizationKind == "session_channel", statusSource == "pending" {
         lines.insert(L10n("首次与此会话建立通道，或原通道已撤销。授权仅适用于这两个 Session。"), at: 0)
     }
@@ -418,10 +431,10 @@ func nativeCollaborationCardPresentation(
     return NativeCollaborationCardPresentation(
         title: isConfirmation && item.collaborationAuthorizationKind == "session_channel"
             ? L10n("首次授权并发送") : "\(L10n("跨会话协作")) · \(kind)",
-        metadata: [status, timestamp].compactMap { $0 }.joined(separator: " · "),
+        metadata: [directionLabel, status, timestamp].compactMap { $0 }.joined(separator: " · "),
         bodyMarkdown: lines.joined(separator: "\n"),
         messageText: message,
-        route: NativeCollaborationRoutePresentation(
+        route: hasRoute ? NativeCollaborationRoutePresentation(
             destinationKind: hasTargetSession ? .existingSession : .newCorptieTask,
             routeLabel: hasTargetSession ? L10n("发送到现有会话") : L10n("将创建新的 CorptieTask"),
             sourceLabel: L10n("来源"),
@@ -432,7 +445,7 @@ func nativeCollaborationCardPresentation(
                 ? "Session · \(targetSession)"
                 : "CorptieTask · \(targetCorptieTask)",
             targetWork: "Work · \(targetWork)"
-        )
+        ) : nil
     )
 }
 
@@ -488,6 +501,11 @@ func nativeSystemEventCardPresentation(for item: CodexThreadItem) -> NativeSpeci
     guard ConversationPresentationKind.resolve(type: item.type, presentationRole: item.presentationRole) == .systemEvent else { return nil }
     let reason = item.systemEventReason
     let words = ConversationEventText(languageCode: AppLanguageController.shared.languageCode)
+    if item.systemEventKind == "child_task_result" {
+        let body = item.presentationText ?? words.text("子任务已返回执行结果。", "Child task results are available.")
+        return NativeSpecialEventCardPresentation(title: words.systemKind(item.systemEventKind),
+            metadata: nativeEventTimestamp(item.createdAt), bodyMarkdown: body, messageText: body)
+    }
     let source = words.source(item.systemEventSource)
     let taskID = nonEmptyPresentationValue(item.collaborationTaskId)
     var lines = [

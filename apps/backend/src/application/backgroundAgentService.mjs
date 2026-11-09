@@ -1,3 +1,4 @@
+import { logError } from "../utils/errorDiagnostics.mjs";
 import { AGENT_PROVIDER_CAPABILITIES, AgentProviderNotFoundError } from "../agent-provider/contracts.mjs";
 import { performance } from "node:perf_hooks";
 import { BackgroundOperationQueue } from "./backgroundOperationQueue.mjs";
@@ -16,6 +17,7 @@ export class BackgroundAgentService {
     this.registry = options.registry;
     this.defaultProviderId = options.defaultProviderId ?? null;
     this.getModelSettings = options.getModelSettings ?? (() => ({ mode: "default" }));
+    this.onCompletionDelivery = options.onCompletionDelivery ?? null;
     this.onOperationEvent = options.onOperationEvent ?? (() => {});
     // provider-neutral Agent 上下文解析器：resolveAgentContext(agentId, { intent }) → { agent, instructions }。
     // 由组合根注入（agentContextService），BackgroundAgentService 不依赖具体 Provider 或 store。
@@ -107,6 +109,9 @@ export class BackgroundAgentService {
       throw new BackgroundAgentUnavailableError();
     }
 
+    if (!input.foundationAPI && (resolvedProviderId ?? this.defaultProviderId)) {
+      this.registry.assertExecutionAllowed?.(resolvedProviderId ?? this.defaultProviderId);
+    }
     const providerId = input.foundationAPI ? FOUNDATION_API_ID : this.selectProvider(resolvedProviderId, permissionProfile, {
       allowFallback: input.allowProviderFallback !== false,
       executionPolicy: input.executionPolicy ?? "legacy"
@@ -163,11 +168,14 @@ export class BackgroundAgentService {
         purpose: request.purpose,
         ...performanceMeasurement
       });
+      await this.deliverCompletion(input, result.text ?? "Background operation completed.", "completed");
       return { ...result, operationId, providerId, historyPolicy: "hidden", validatedOutput, performance: performanceMeasurement };
     } catch (error) {
+      logError("background-agent.invoke", error, { operationId, providerId, stage: "invoke" });
       const performanceMeasurement = {
         phases: {
           agentContextMs,
+          queueWaitMs: input.queueWaitMs,
           providerInvokeMs: roundedMilliseconds(performance.now() - providerStartedAt)
         },
         totalMs: roundedMilliseconds(performance.now() - operationStartedAt)
@@ -177,9 +185,25 @@ export class BackgroundAgentService {
         providerId,
         purpose: request.purpose,
         error: error.message,
+        errorCode: error.code ?? null,
+        phase: error.phase ?? null,
+        timeoutMs: request.timeoutMs,
         ...performanceMeasurement
       });
+      await this.deliverCompletion(input, `Background operation failed: ${error.message}`, "failed");
       throw error;
+    }
+  }
+
+  async deliverCompletion(input, body, phase) {
+    if (!input.completionDelivery || !this.onCompletionDelivery) return;
+    try {
+      await this.onCompletionDelivery({ ...input.completionDelivery, sourceType: "background", sourceId: input.operationId,
+        idempotencyKey: `${input.operationId}:${phase}`, body,
+        authorization: { ownerLogicalSessionId: input.completionDelivery.recipientSessionId, sourceId: input.operationId } });
+    } catch (error) {
+      logError("background-agent.completion", error, { operationId: input.operationId, stage: "completion-delivery" });
+      this.onOperationEvent("BackgroundCompletionDeliveryFailed", { operationId: input.operationId, error: error.message });
     }
   }
 

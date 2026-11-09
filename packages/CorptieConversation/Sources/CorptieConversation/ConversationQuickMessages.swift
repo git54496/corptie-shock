@@ -7,9 +7,9 @@ import UniformTypeIdentifiers
 /// per-chip observation, layout animation, or full-width material layer.
 public struct ConversationQuickMessages: View {
     #if os(iOS)
-    private static let rowHeight: CGFloat = 50
+    public static let rowHeight: CGFloat = 50
     #else
-    private static let rowHeight: CGFloat = 30
+    public static let rowHeight: CGFloat = 30
     #endif
     let items: [ClientQuickMessage]
     let enabled: Bool
@@ -58,7 +58,7 @@ public struct ConversationQuickMessages: View {
             .font(.system(size: 11, weight: .medium))
             .lineLimit(1).fixedSize()
             .padding(.horizontal, 9).frame(height: 24)
-            .platformGlassSurface(in: Capsule(), interactive: true)
+            .platformGlassSurface(in: Capsule(), interactive: true, variant: .clear)
     }
 
     @ViewBuilder private func chip(_ item: ClientQuickMessage) -> some View {

@@ -2,6 +2,8 @@ import SwiftUI
 import CorptieClientCore
 
 struct ConversationNativeBusinessDetail: View {
+    @Environment(\.detailFixedContentWidth) private var fixedContentWidth
+    @State private var fallbackSizes: [String: DetailWidgetSize] = [:]
     let store: ClientDetailBusinessStore
     var commandStore: ClientDetailBusinessStore? = nil
     private var operationStore: ClientDetailBusinessStore { commandStore ?? store }
@@ -29,11 +31,20 @@ struct ConversationNativeBusinessDetail: View {
         let scope = handle.scope
         return [scope.serverID, scope.ownerID, scope.principalID, scope.sessionID, scope.taskID ?? "", scope.workID ?? ""]
     }
+    private struct SizedCard: Identifiable {
+        let state: ClientDetailBusinessCardState
+        let size: DetailWidgetSize
+        let id: String
+    }
     var body: some View {
-        let snapshot = cards
+        let source = cards
+        let sizes = renderState?.widgetSizes ?? fallbackSizes
+        let snapshot = source.map { SizedCard(state: $0, size: sizes[$0.id] ?? .medium, id: $0.id) }
+        let sizingInput = renderState == nil ? source.map(\.card) : nil
+        Group {
         #if os(macOS)
         let input = DetailCardReorderController.Input(scope: reorderScope, enabled: canReorder,
-            items: snapshot.map { .init(id: $0.id, size: DetailWidgetSizing.preferredSize(for: $0.card)) })
+            items: snapshot.map { .init(id: $0.id, size: $0.size) })
         let generation = activity?.generation ?? 0
         let states = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0) })
         grid(cardReorder.displayOrder(snapshot.map(\.id)).compactMap { states[$0] })
@@ -52,11 +63,18 @@ struct ConversationNativeBusinessDetail: View {
         #else
         grid(snapshot)
         #endif
+        }
+        .onChange(of: sizingInput, initial: true) { old, next in
+            guard let next else { return }
+            let prepared = DetailWidgetSizing.prepare(previous: old ?? [], current: next, cached: fallbackSizes)
+            if fallbackSizes != prepared.sizes { fallbackSizes = prepared.sizes }
+        }
     }
 
-    private func grid(_ snapshot: [ClientDetailBusinessCardState]) -> some View {
-        DetailWidgetLayout(sizes: snapshot.map { DetailWidgetSizing.preferredSize(for: $0.card) }) {
-            ForEach(snapshot) { state in
+    private func grid(_ snapshot: [SizedCard]) -> some View {
+        DetailWidgetLayout(sizes: snapshot.map(\.size), fixedWidth: fixedContentWidth) {
+            ForEach(snapshot) { sized in
+                let state = sized.state
                 Group {
                     if state.card.loadState == "error" {
                         NativeBusinessCard(state: state, api: api, store: store, commandStore: operationStore, activity: activity, actions: actions, references: adapters.referenceManagement, openArtifact: adapters.openArtifact, workID: context.workID,
@@ -69,7 +87,9 @@ struct ConversationNativeBusinessDetail: View {
                 #if os(macOS)
                 .opacity(cardReorder.draft?.source == state.id ? 0 : 1)
                 #endif
-                .detailWidget(DetailWidgetSizing.preferredSize(for: state.card))
+                .detailWidget(sized.size)
+                .environment(\.detailPrefersNaturalContent,
+                    state.card.kind == "sessionInfo" || state.card.kind == "provider" || state.card.loadState == "error")
                 .environment(\.detailCardDrag, canReorder ? .init(scope: reorderScope, cardID: state.id) : nil)
                 .modifier(ConversationDetailCardDropTarget(enabled: canReorder) { payload, after in
                     guard canReorder else { return false }
@@ -77,9 +97,13 @@ struct ConversationNativeBusinessDetail: View {
                 })
             }
         }
+        .frame(width: fixedContentWidth)
     }
     @ViewBuilder private func sharedCard(_ state: ClientDetailBusinessCardState) -> some View {
         switch state.card.payload {
+        case .coordinationProgress(let value):
+            CoordinationProgressCard(progress: value, api: { guard let api else { throw ClientConnectionError.invalidResponse }; return api },
+                openSession: { adapters.openSession?($0) }).disabled(!store.isCurrent)
         case .provider:
             ConversationDetailProviderCard(configuration: adapters.configuration, scope: handle.scope.sessionID,
                 select: adapters.selectConfiguration, reload: adapters.reloadConfiguration).disabled(!store.isCurrent)
@@ -95,7 +119,7 @@ struct ConversationNativeBusinessDetail: View {
             ConversationWorktreeCard(sessionID: handle.scope.sessionID, refreshID: "\(value.worktreeId ?? ""):\(state.card.revision)",
                 api: { try await adapters.worktreeAPI(value.worktreeId) }, onJob: adapters.onWorktreeJob,
                 state: handle.worktree, expectedWorktreeID: value.worktreeId,
-                presentationState: renderState?.worktree, activity: activity)
+                presentationState: renderState?.worktree, activity: activity, openParent: adapters.openSession)
                 .disabled(!store.isCurrent)
         default:
             NativeBusinessCard(state: state, api: api, store: store, commandStore: operationStore, activity: activity, actions: actions, references: adapters.referenceManagement, openArtifact: adapters.openArtifact, workID: context.workID,
@@ -246,8 +270,9 @@ private struct NativeBusinessCard: View {
     }
     @ViewBuilder private var content: some View {
         switch card.payload {
+        case .coordinationProgress: EmptyView()
         case .session(let value):
-            NativeBusinessProperty(title: "Session", value: value.sessionId)
+            NativeBusinessProperty(title: "Session", value: value.sessionId, technical: true)
             if !value.workName.isEmpty { NativeBusinessProperty(title: "Work", value: value.workName) }
         case .summary(let value): NativeBusinessTextSection(title: "会话摘要", text: value.text)
         case .work(let value):
@@ -267,6 +292,11 @@ private struct NativeBusinessCard: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             NativeBusinessSummary(summary: value.summary)
+            if let action = command("task.coordination.update", target: value.taskId) {
+                ConversationTaskCoordinationControl(enabled: value.coordinationEnabled ?? false, dispatches: value.coordinationDispatches ?? [], execution: value.coordinationExecution) { enabled in
+                    perform(action, ["coordinationEnabled": .bool(enabled)])
+                }.disabled(!action.available)
+            }
             NativeBusinessTextSection(title: "描述", text: value.description)
             NativeBusinessTextSection(title: "验收标准", text: value.acceptanceCriteria)
             NativeBusinessTextSection(title: "验证标准", text: value.verificationCriteria)
@@ -572,7 +602,14 @@ private struct NativeBusinessNavigation: View {
 }
 private struct NativeBusinessProperty: View {
     let title: String; let value: String
-    var body: some View { HStack(alignment: .top, spacing: 8) { Text(title).foregroundStyle(.secondary); Spacer(minLength: 0); Text(value).textSelection(.enabled) }.font(.caption) }
+    var technical = false
+    var body: some View {
+        ConversationDetailPropertyRow(title) {
+            Text(value).font(WorkbenchTypography.font(for: technical ? .technical : .body))
+                .multilineTextAlignment(.leading).fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
 }
 private struct NativeBusinessStatus: View {
     let status: String

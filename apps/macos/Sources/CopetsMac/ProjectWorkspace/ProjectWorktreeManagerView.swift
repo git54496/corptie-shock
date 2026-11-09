@@ -220,7 +220,7 @@ struct ProjectWorktreeManagerView: View {
             ),
             presenting: pendingDeletionWarning
         ) { deletion in
-            Button(L10n("Continue to branch-name confirmation"), role: .destructive) {
+            Button(L10n("Continue to permanent deletion confirmation"), role: .destructive) {
                 pendingDeletionWarning = nil
                 Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(140))
@@ -239,7 +239,7 @@ struct ProjectWorktreeManagerView: View {
         .sheet(item: $pendingDeletionConfirmation) { deletion in
             ForceDeleteWorktreeConfirmationView(
                 deletion: deletion,
-                onConfirm: { branchName in
+                onConfirm: {
                     backendClient.operateProjectWorktree(
                         deletion.worktree,
                         mergeIntoMain: false,
@@ -247,8 +247,7 @@ struct ProjectWorktreeManagerView: View {
                         deleteWorktree: true,
                         deleteSessions: deletion.deleteSessions,
                         restartService: deletion.restartService,
-                        forceDeleteUnmerged: true,
-                        confirmedBranchName: branchName
+                        forceDeleteUnmerged: true
                     )
                     pendingDeletionConfirmation = nil
                 },
@@ -261,10 +260,10 @@ struct ProjectWorktreeManagerView: View {
                     run: run,
                     status: integrationStatus,
                     isCreating: backendClient.isCreatingIntegrationConflictCorptieTask,
-                    onConfirm: { agentId, title in
+                    onConfirm: { roleId, title in
                         backendClient.createIntegrationConflictCorptieTask(
                             runId: run.id,
-                            agentId: agentId,
+                            roleId: roleId,
                             title: title
                         )
                         pendingConflictRun = nil
@@ -416,7 +415,7 @@ struct ProjectWorktreeManagerView: View {
                         } else {
                             backendClient.createIntegrationConflictCorptieTask(
                                 runId: run.id,
-                                agentId: status.eligibleAgents.first?.agentId ?? ""
+                                roleId: status.eligibleAgents.first?.roleId ?? ""
                             )
                         }
                     }
@@ -426,7 +425,7 @@ struct ProjectWorktreeManagerView: View {
                             || (run.conflictCorptieTaskId == nil && status.eligibleAgents.isEmpty)
                     )
                     .help(status.eligibleAgents.isEmpty && run.conflictCorptieTaskId == nil
-                        ? L10n("Add an IC Agent to this Work before creating the resolution CorptieTask")
+                        ? L10n("Add an IC Role to this Work before creating the resolution CorptieTask")
                         : L10n("Create and immediately start a CorptieTask to resolve these merge conflicts"))
                 }
             }

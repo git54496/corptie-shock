@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { createRuntimeAgentWorkQueue } from "../src/runtime/runtimeAgentWorkQueue.mjs";
 import { automaticWorktreeMutationActive } from "../src/application/worktreeAutoFollowService.mjs";
 
-test("a paused integration yields its verified safe source so the message it waits for can run", async () => {
-  const job = { id: "integration", status: "paused", phase: "awaiting_session_idle", details: {
+for (const phase of ["awaiting_session_idle", "awaiting_integration_acceptance"]) {
+test(`a paused integration yields its verified safe source so queued work can run: ${phase}`, async () => {
+  const job = { id: "integration", status: "paused", phase, details: {
     plan: { orchestration: {}, reservedWorktreeIds: ["source", "target"] },
     dispatchSafety: { safeWorktrees: [{ worktreeId: "source" }], blockedWorktreeIds: ["target"] }
   } };
@@ -18,6 +19,7 @@ test("a paused integration yields its verified safe source so the message it wai
   store.getLogicalSessionByLegacySessionId = () => ({ repositoryId: "repo", activeWorkspaceId: "target" });
   assert.equal(automaticWorktreeMutationActive(store, { sessionId: "session" }), true);
 });
+}
 
 test("integration starting during an asynchronous route probe prevents claiming queued work", async () => {
   let mutating = false;
@@ -90,7 +92,7 @@ function fixture(overrides = {}) {
     dispatchSessionChannelDelivery: async () => { throw new Error("unexpected channel dispatch"); },
     sendUnifiedSessionMessage: async (...args) => {
       sends.push(args);
-      return { result: { turn: { id: "turn" } } };
+      return { result: { turnId: "turn", turn: { id: "legacy-field-must-not-win" }, delivery: "accepted" } };
     },
     emitEvent: (...args) => events.push(args),
     syncSessionChannelDeliveriesIntoAgentWorkQueue: async () => syncs.push("channel"),
@@ -197,6 +199,20 @@ test("already dispatched work is not retried and runtime instances do not share 
   assert.equal(f.queue.runtimeQueuePosition("session", "work"), 0);
 });
 
+test("unknown delivery and invalid send receipts never requeue or announce running execution", async () => {
+  for (const code of ["DELIVERY_UNKNOWN", "PROVIDER_SEND_RECEIPT_INVALID", "PROVIDER_SEND_RECEIPT_CORRELATION_CONFLICT"]) {
+    let sends = 0;
+    const failure = Object.assign(new Error("uncertain dispatch"), { code, dispatchState: "unknown" });
+    const f = fixture({ sendUnifiedSessionMessage: async () => { sends++; throw failure; } });
+    f.add("work");
+    await assert.rejects(f.queue.drainAgentWork("session"), error => error === failure);
+    assert.equal(f.tasks.get("work").status, "failed");
+    assert.equal(f.events.some(([type]) => type === "AgentWorkStarted"), false);
+    await f.queue.drainAgentWork("session");
+    assert.equal(sends, 1);
+  }
+});
+
 test("orphaned dispatched work is cancelled without resending", async () => {
   const f = fixture();
   f.add("work", { status: "running", targetTurnId: "existing-turn" }, false);
@@ -246,7 +262,55 @@ test("verified channel dispatch writes the returned turn and publishes work star
   await f.queue.drainAgentWork("session");
   assert.equal(f.tasks.get("work").targetTurnId, "channel-turn");
   assert.equal(f.tasks.get("work").status, "running");
-  assert.equal(f.events[0][0], "AgentWorkStarted");
+  assert.equal(f.events[0][0], "AgentWorkPreparing");
+  assert.equal(f.events.at(-1)[0], "AgentWorkStarted");
   assert.equal(f.settled[0][0], "started");
   assert.equal(f.sends.length, 0);
+});
+
+test('mailbox dispatch blocks carry reasons once and clear on actual resumption',async()=>{
+ let paused=true;
+ const f=fixture({sessionMailbox:{dispatchDecision:()=>paused?{allowed:false,code:'MAILBOX_PAUSED',message:'邮箱已暂停',kind:'paused'}:{allowed:true},validateOperation(){}}});
+ f.add('waiting');
+ for(let i=0;i<4;i++) await f.queue.drainAgentWork('session');
+ assert.equal(f.sends.length,0);assert.equal(f.tasks.get('waiting').source.dispatchBlock.code,'MAILBOX_PAUSED');
+ assert.equal(f.events.filter(([type])=>type==='AgentWorkDispatchBlocked').length,1);
+ paused=false;await f.queue.drainAgentWork('session');
+ assert.equal(f.sends.length,1);assert.equal(f.tasks.get('waiting').source.dispatchBlock,undefined);
+ assert.equal(f.events.filter(([type])=>type==='AgentWorkDispatchReady').length,1);
+});
+
+for(const type of ['role','worktree','running','unknown','transition','missing']) test(`non-dispatchable ${type} returns an explicit recoverable reason`,async()=>{
+ const f=fixture();f.add('waiting');let expected;
+ if(type==='role'){f.deps.collaborationCore.getAgentForSession=()=>null;expected='SESSION_ROLE_UNBOUND';}
+ if(type==='worktree'){f.deps.inspectWorkspaceDispatchBlocker=()=>({reason:'WORKTREE_CONFLICT_OR_RECOVERY',message:'工作区有冲突'});expected='WORKTREE_CONFLICT_OR_RECOVERY';}
+ if(type==='running'||type==='unknown'){
+  f.add('old',{status:'running'});f.deps.inspectCollaborationSession=async()=>type==='running'?'running':'missing';expected=type==='running'?'SESSION_BUSY':'SESSION_STATE_UNAVAILABLE';
+ }
+ if(type==='transition'){f.deps.store.getLogicalSessionByLegacySessionId=()=>({transitionState:'committingRoute'});expected='WORKSPACE_TRANSITION_IN_PROGRESS';}
+ if(type==='missing'){f.deps.store.getSession=()=>null;expected='RECIPIENT_SESSION_NOT_FOUND';}
+ const queue=createRuntimeAgentWorkQueue(f.deps);queue.registerRuntimeQueuedWork('session','waiting');
+ await queue.drainAgentWork('session');
+ assert.equal(f.sends.length,0);assert.equal(f.tasks.get('waiting').status,'queued');assert.equal(f.tasks.get('waiting').source.dispatchBlock.code,expected);
+ assert.equal(f.events.find(([event])=>event==='AgentWorkDispatchBlocked')[1].reason.code,expected);
+});
+
+test('mailbox hard rejection fails the operation with its original reason',async()=>{
+ const f=fixture({sessionMailbox:{dispatchDecision:()=>({allowed:false,code:'MAILBOX_MESSAGE_NOT_FOUND',message:'消息不存在',kind:'rejected'})}});
+ f.add('missing');await f.queue.drainAgentWork('session');
+ assert.equal(f.tasks.get('missing').status,'failed');assert.equal(f.events.find(([event])=>event==='AgentWorkFailed')[1].reason.code,'MAILBOX_MESSAGE_NOT_FOUND');
+ assert.equal(f.sends.length,0);
+});
+
+test('disabled providers pause queued work without consuming retries and enabling resumes it', async () => {
+  let enabled = false;
+  const f = fixture({ providerDispatchDecision: () => enabled ? { allowed: true }
+    : { allowed: false, code: 'PROVIDER_DISABLED', kind: 'paused', message: 'disabled' } });
+  f.add('message');
+  for (let i = 0; i < 6; i++) await f.queue.drainAgentWork('session');
+  assert.equal(f.tasks.get('message').status, 'queued');
+  assert.equal(f.sends.length, 0);
+  enabled = true;
+  await f.queue.drainAgentWork('session');
+  assert.equal(f.sends.length, 1);
 });

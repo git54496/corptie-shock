@@ -33,6 +33,14 @@ test("shared ranker keeps exact canonical/alias names above misleading hints", (
   assert.deepEqual(rankDiscoveryCandidates(candidates, { intent: "unrelated", domainHint: "one" }), []);
 });
 
+test("Role management discovers the existing canonical tool without adding another write entry", () => {
+  const candidates = platformDynamicTools.map(definition => ({ name: definition.name, definition,
+    domainId: "platform", aliases: ["role", "roles", "角色", "角色管理"], preferred: definition.name === "corptie_platform_capabilities" }));
+  for (const intent of ["创建角色", "Role management", "agent management", "编辑角色技能"]) {
+    assert.equal(rankDiscoveryCandidates(candidates, { intent })[0].name, "corptie_platform_agents_manage");
+  }
+});
+
 const domains = {
   artifacts: artifactDynamicTools,
   collaboration: collaborationDynamicTools,
@@ -53,6 +61,16 @@ function catalogFixture() {
     execute: ({ arguments: args }) => args
   })));
 }
+
+test("batch Task creation intent recommends the real batch contract", () => {
+  const candidates = collaborationDynamicTools.map(definition => ({ name: definition.name, definition, domainId: "collaboration" }));
+  for (const intent of ["批量创建多个子任务", "create a batch of child tasks"]) {
+    assert.equal(rankDiscoveryCandidates(candidates, { intent })[0].name, "corptie_collaboration_tasks_create_batch");
+  }
+  const definition = collaborationDynamicTools.find(tool => tool.name === "corptie_collaboration_tasks_create_batch");
+  assert.equal(definition.inputSchema.properties.items.maxItems, 10);
+  assert.equal(definition.inputSchema.properties.items.minItems, 1);
+});
 
 test("all required deferred domains expose one recommended tool and self-contained machine contracts", async () => {
   const catalog = catalogFixture();

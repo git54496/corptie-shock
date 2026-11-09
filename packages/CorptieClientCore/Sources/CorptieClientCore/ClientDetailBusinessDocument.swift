@@ -36,8 +36,25 @@ public struct ClientDetailBusinessTask: Decodable, Equatable, Sendable {
     public let resourceRevision: String
     public let summary: ClientDetailBusinessTaskSummary
     public var parentTaskId: String? = nil
+    public var coordinationProgress: ClientCoordinationProgress? = nil
+    public var coordinationEnabled: Bool? = nil
+    public var coordinationExecution: ClientCoordinationExecution? = nil
+    public var coordinationDispatches: [ClientTaskCoordinationDispatch]? = nil
     public var parentSessionId: String? = nil
     public var hierarchy: TaskHierarchySummary? = nil
+}
+public struct ClientCoordinationExecution: Decodable, Equatable, Sendable {
+    public let status: String
+    public let reason: String
+    public var statusLabel: String {
+        switch status {
+        case "off": "已关闭"
+        case "pending": "等待生效"
+        case "enforced": "强协调已启用"
+        case "unsupported": "当前运行环境不支持"
+        default: "执行限制尚未验证"
+        }
+    }
 }
 public struct ClientDetailBusinessArtifact: Decodable, Equatable, Identifiable, Sendable {
     public var id: String { artifactId }
@@ -54,6 +71,7 @@ public struct ClientDetailBusinessArtifacts: Decodable, Equatable, Sendable {
 }
 public struct ClientDetailBusinessCard: Decodable, Equatable, Identifiable, Sendable {
     public enum Payload: Equatable, Sendable {
+        case coordinationProgress(ClientCoordinationProgress)
         case task(ClientDetailBusinessTask), artifacts(ClientDetailBusinessArtifacts), unsupported
         case session(ClientDetailBusinessSession), summary(ClientDetailBusinessSummary), work(ClientDetailBusinessWork)
         case focus(ClientDetailBusinessList<ClientDetailBusinessFocus>), references(ClientDetailBusinessList<ClientDetailBusinessReference>)
@@ -92,6 +110,7 @@ public struct ClientDetailBusinessCard: Decodable, Equatable, Identifiable, Send
             case "memoryResources": payload = .memories(try value.decode(ClientDetailBusinessList<ClientDetailBusinessMemory>.self, forKey: .data))
             case "memoryHits": payload = .hits(try value.decode(ClientDetailBusinessList<ClientDetailBusinessMemory>.self, forKey: .data))
             case "schedules": payload = .schedules(try value.decode(ClientDetailBusinessList<ClientDetailBusinessSchedule>.self, forKey: .data))
+            case "coordinationProgress": payload = .coordinationProgress(try value.decode(ClientCoordinationProgress.self, forKey: .data))
             case "provider": payload = .provider(try value.decode(ClientDetailBusinessProvider.self, forKey: .data))
             case "worktree": payload = .worktree(try value.decode(ClientDetailBusinessWorktree.self, forKey: .data))
             case "turnMetrics": payload = .turn(try value.decode(ClientDetailBusinessTurn.self, forKey: .data))
@@ -110,11 +129,19 @@ public struct ClientDetailBusinessCard: Decodable, Equatable, Identifiable, Send
                 (action.target?.id.count ?? 1000) <= 512,
                 action.kind == "navigation" && ["resource.open", "editor.open"].contains(action.operation)
                 || action.kind == "read" && ["detail.collection.page", "artifact.content"].contains(action.operation)
-                || action.kind == "command" && ["memory.update", "memory.delete", "reference.add", "reference.remove", "schedule.cancel"].contains(action.operation)
+                || action.kind == "command" && ["memory.update", "memory.delete", "reference.add", "reference.remove", "schedule.cancel", "task.coordination.update"].contains(action.operation)
             else { throw ClientDetailFailure.invalidGraph }
         }
         switch payload {
+        case .coordinationProgress(let value):
+            guard value.version == 1, value.items.count <= 3, value.total <= 10000,
+                Set(value.items.map(\.id)).count == value.items.count else { throw ClientDetailFailure.invalidGraph }
         case .task(let task):
+            let dispatches = task.coordinationDispatches ?? []
+            guard dispatches.count <= 5, Set(dispatches.map(\.id)).count == dispatches.count,
+                actions.filter({ $0.operation == "task.coordination.update" }).allSatisfy({
+                    task.parentTaskId == nil && $0.target?.resourceType == "task" && $0.target?.id == task.taskId
+                }) else { throw ClientDetailFailure.invalidGraph }
             guard !task.taskId.isEmpty, [task.title, task.status, task.description, task.acceptanceCriteria,
                 task.verificationCriteria, task.resourceRevision].allSatisfy({ validText($0) }),
                 actions.filter({ $0.kind == "navigation" }).allSatisfy({ action in
@@ -157,6 +184,7 @@ public struct ClientDetailBusinessCard: Decodable, Equatable, Identifiable, Send
         func texts(_ values: [String]) -> Int { values.reduce(0) { $0 + $1.utf8.count * 2 } }
         let base = 2048 + actions.count * 2048
         switch payload {
+        case .coordinationProgress(let value): return base + value.items.count * 8192
         case .task(let value): return base + texts([value.title, value.description, value.acceptanceCriteria, value.verificationCriteria, value.summary.focus, value.summary.progress, value.summary.reason, value.summary.nextAction])
         case .session(let value): return base + texts([value.sessionId, value.workName])
         case .summary(let value): return base + texts([value.text])

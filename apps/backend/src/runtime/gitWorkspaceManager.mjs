@@ -1,17 +1,24 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, mkdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { inspectArtifactDocumentEntry } from "./artifactMarkdownCommitGate.mjs";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import { createGitWorkspaceSnapshot, inspectGitWorkspace } from "../utils/gitWorktreeInventory.mjs";
+import { createGitWorkspaceSnapshot, createScopedGitWorkspaceSnapshot, inspectGitWorkspace } from "../utils/gitWorktreeInventory.mjs";
 import {
   DEFAULT_SHARED_AGENT_CONFIGURATION_PATHS,
   linkSharedAgentConfiguration
 } from "./sharedAgentConfiguration.mjs";
 import { stageValidatedIntegrationTree } from "./integrationStagedTreeValidator.mjs";
+import { redactInlineSecrets } from "../utils/providerRawMetadata.mjs";
 import { ensureProjectLocalState } from "./projectLocalStateDirectory.mjs";
+import { withWorktreeOperationLock } from "./worktreeOperationLock.mjs";
+import { mergeWorkspaceSnapshot, synchronizeWorkspaceSnapshot, prepareSnapshotConflictWorkspace, snapshotBaseForWorktree } from "./workspaceSnapshotIntegration.mjs";
+import { measureStartup } from "../utils/startupTiming.mjs";
+import { ProjectWorkspaceSnapshotService } from "../application/projectWorkspaceSnapshotService.mjs";
+import { staleRegistrationAction } from "./staleWorktreeRegistration.mjs";
+import { classifyIntegrationRollback } from "../domain/integrationRollbackPlan.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -103,6 +110,17 @@ export class GitWorkspaceManager {
     };
   }
 
+  async operationSnapshot(workingDirectory, input = {}) {
+    const participants = [input.sourceWorktreeId, input.targetWorktreeId, input.workspace?.worktreeId, ...(input.worktreeIds ?? [])]
+      .filter(Boolean).map(id => this.store.getGitWorktree(id)).filter(Boolean);
+    for (const path of [input.targetPath, input.mainPath, input.workspace?.path]) {
+      if (path && await pathExists(path)) participants.push(path);
+    }
+    return createScopedGitWorkspaceSnapshot(absolutePath(workingDirectory), {
+      worktrees: participants, includeMain: input.includeMain !== false, execFile: this.execFile
+    });
+  }
+
   async createWorktree(input) {
     const logical = this.requireLogicalRoute(input.logicalSessionId);
     if (!logical.repositoryId || !logical.activeBinding?.boundCwd) {
@@ -110,13 +128,9 @@ export class GitWorkspaceManager {
     }
     const targetPath = absolutePath(input.targetPath);
     await assertPathMissing(targetPath);
-    const snapshotBefore = await createGitWorkspaceSnapshot(logical.activeBinding.boundCwd);
+    const snapshotBefore = await this.operationSnapshot(logical.activeBinding.boundCwd, input);
     if (snapshotBefore.repository.id !== logical.repositoryId) {
       throw new Error("The active workspace no longer belongs to the registered repository.");
-    }
-    if (input.inventoryVersion
-      && input.inventoryVersion !== snapshotBefore.inventoryVersion) {
-      throw new Error("The Git worktree inventory changed; refresh it before creating a worktree.");
     }
     this.store.upsertGitWorkspaceSnapshot(snapshotBefore);
     if (snapshotBefore.worktrees.some((worktree) => resolve(worktree.path) === targetPath)) {
@@ -134,7 +148,7 @@ export class GitWorkspaceManager {
     } catch (error) {
       throw new Error(safeGitError(error, "git worktree add failed"));
     }
-    const snapshotAfter = await createGitWorkspaceSnapshot(targetPath);
+    const snapshotAfter = await this.operationSnapshot(targetPath, input);
     this.store.upsertGitWorkspaceSnapshot(snapshotAfter);
     const targetCanonicalPath = await realpath(targetPath);
     const created = snapshotAfter.worktrees.find((worktree) => {
@@ -222,6 +236,23 @@ export class GitWorkspaceManager {
     return this.taskDeletionStatusForWorktree(logical.repositoryId, logical.activeWorkspaceId);
   }
 
+  async taskDeletionDeliveryComparison(taskId, worktree) {
+    const task = this.store.getTask(taskId);
+    const binding = this.store.getTaskDeliveryBinding(taskId);
+    const parent = task?.parent_task_id && this.store.getTaskDeliveryBinding(task.parent_task_id);
+    const parentTree = parent && this.store.getGitWorktree(parent.worktree_id);
+    if (!binding || binding.worktree_id !== worktree.worktreeId || !parentTree || parent.repository_id !== binding.repository_id) {
+      throw deletionSafetyError("TASK_DELIVERY_BINDING_CHANGED", "无法确认子分支与父分支的交付关系，请先修复绑定。");
+    }
+    const parentHead = (await this.gitOutput(parentTree.path, ["rev-parse", "--verify", "HEAD"])).trim();
+    const snapshotBase=snapshotBaseForWorktree(this.store,worktree.worktreeId);
+    const inheritedOnly = Boolean(binding.base_commit_oid && (worktree.headOid === binding.base_commit_oid
+      || snapshotBase && (await this.gitOutput(parentTree.path,["rev-parse",`${worktree.headOid}^{tree}`])).trim()===snapshotBase.baseTreeOid));
+    const delivered = inheritedOnly || await this.gitSucceeds(parentTree.path, ["merge-base", "--is-ancestor", worktree.headOid, parentHead]);
+    const commitCount = delivered ? 0 : Number((await this.gitOutput(parentTree.path, ["rev-list", "--count", `${parentHead}..${worktree.headOid}`])).trim());
+    return { target: "parent", parentTaskId: task.parent_task_id, parentHeadOid: parentHead, delivered, commitCount };
+  }
+
   async taskDeletionStatusForWorktree(repositoryId, worktreeId) {
     const startedAt = performance.now();
     const target = this.store.getGitWorktree(worktreeId);
@@ -258,7 +289,7 @@ export class GitWorkspaceManager {
       headOid: targetHead.trim(),
       branchName: targetBranch.trim() === "HEAD" ? null : targetBranch.trim(),
       dirty,
-      statusSummary: status.trim(),
+      statusSummary: status.trimEnd(),
       diffStat: "",
       mergedIntoMain: aheadOfMain === 0,
       synchronizedWithMain: !dirty && aheadOfMain === 0 && behindMain === 0,
@@ -287,7 +318,7 @@ export class GitWorkspaceManager {
   async projectStatusForPath(workingDirectory, expectedRepositoryId = null, options = {}) {
     const inspectionLevel = normalizedInspectionLevel(options.inspectionLevel, options.activeWorkspaceId);
     const repositoryKey = expectedRepositoryId || `path:${absolutePath(workingDirectory)}`;
-    const cacheKey = `${repositoryKey}\0${inspectionLevel}`;
+    const cacheKey = `${repositoryKey}\0${inspectionLevel}\0${(options.worktreeIds ?? []).join(",")}`;
     const reason = String(options.reason || "unspecified");
     this.inspectionMetrics.requests += 1;
     this.inspectionMetrics.reasons.set(reason, (this.inspectionMetrics.reasons.get(reason) ?? 0) + 1);
@@ -330,10 +361,12 @@ export class GitWorkspaceManager {
     const startedAt = performance.now();
     const snapshotStartedAt = performance.now();
     this.inspectionMetrics.scans += 1;
-    const snapshot = await this.createSnapshot(absolutePath(workingDirectory), {
-      inspectionConcurrency: this.inspectionConcurrency,
-      execFile: this.execFile
-    });
+    const local = String(options.inspectionLevel).startsWith("session:") || Array.isArray(options.worktreeIds);
+    const snapshot = local
+      ? await this.operationSnapshot(workingDirectory, { sourceWorktreeId: options.activeWorkspaceId, worktreeIds: options.worktreeIds })
+      : await this.createSnapshot(absolutePath(workingDirectory), {
+        inspectionConcurrency: this.inspectionConcurrency, execFile: this.execFile
+      });
     const snapshotMs = performance.now() - snapshotStartedAt;
     if (expectedRepositoryId && snapshot.repository.id !== expectedRepositoryId) {
       throw new Error("The active workspace no longer belongs to the registered repository.");
@@ -343,7 +376,12 @@ export class GitWorkspaceManager {
     if (!main || main.availability !== "available") {
       throw new Error("The repository's main worktree is unavailable.");
     }
-    const selectedWorktrees = selectWorktreesForInspection(snapshot.worktrees, options);
+    // Missing-directory snapshots use a synthetic ID; persisted bindings retain
+    // the original ID. Keep association checks on that persisted identity.
+    const storedByPath = new Map((local ? [] : this.store.listGitWorktrees(snapshot.repository.id)).map(tree => [tree.path, tree]));
+    const selectedWorktrees = selectWorktreesForInspection(snapshot.worktrees.map(tree =>
+      tree.availability !== "available" && storedByPath.has(tree.path)
+        ? { ...tree, worktreeId: storedByPath.get(tree.path).worktreeId } : tree), options);
     const worktrees = await mapConcurrentOrdered(
       selectedWorktrees,
       this.inspectionConcurrency,
@@ -495,12 +533,13 @@ export class GitWorkspaceManager {
       inspectionLevel: "integration",
       reason: options.reason ?? "integration_preflight",
       forceFresh: options.forceFresh === true,
-      cacheTtlMs: options.cacheTtlMs
+      cacheTtlMs: options.cacheTtlMs,
+      ...(options.worktreeIds ? { worktreeIds: options.worktreeIds } : {})
     });
     const enrichmentStartedAt = performance.now();
     const worktrees = await mapConcurrentOrdered(status.worktrees, this.inspectionConcurrency, async (worktree) => {
       if (worktree.availability !== "available") {
-        return { ...worktree, operationState: null, conflictFiles: [], changedFiles: [] };
+        return { ...worktree, cleanupAction: await this.staleRegistrationCapability(worktree, workingDirectory), operationState: null, conflictFiles: [], changedFiles: [] };
       }
       const [operationState, conflicts] = await Promise.all([
         this.integrationOperationState(worktree.path),
@@ -534,6 +573,7 @@ export class GitWorkspaceManager {
     });
     const worktrees = await mapConcurrentOrdered(status.worktrees, this.inspectionConcurrency, async (worktree) => ({
       ...worktree,
+      cleanupAction: await this.staleRegistrationCapability(worktree, workingDirectory),
       changedFiles: worktree.availability === "available"
         ? changedFilesFromPorcelain(worktree.statusSummary ?? "")
         : [],
@@ -569,6 +609,10 @@ export class GitWorkspaceManager {
   }
 
   async recoverGitOperation(input) {
+    return withWorktreeOperationLock(input.path, () => this.recoverGitOperationLocked(input));
+  }
+
+  async recoverGitOperationLocked(input) {
     const path = absolutePath(input.path);
     const requestedAction = String(input.action ?? "").trim();
     if (!["continue", "abort"].includes(requestedAction)) {
@@ -628,7 +672,16 @@ export class GitWorkspaceManager {
   }
 
   async commitIntegrationChanges(input) {
-    this.store.assertStandaloneWorktreeMutation?.({paths:[input.path],jobId:input.jobId});
+    this.store.assertStandaloneWorktreeMutation?.({...(input.snapshotOnly ? {readPaths:[input.path]} : {paths:[input.path]}),jobId:input.jobId});
+    if(input.snapshotOnly===true) {
+      if(typeof input.prepare==="function") await input.prepare();
+      const currentHead=(await this.gitOutput(input.path,["rev-parse","HEAD"])).trim();
+      const captured=await new ProjectWorkspaceSnapshotService().captureParentWorkspace({path:input.path,
+        operationId:`integration:${input.jobId}:${Buffer.from(input.path).toString("hex")}:${currentHead}`});
+      const head=captured.baseCommitOid;
+      await this.assertIntegrationTreePolicy(input.path,head,captured.parentHeadOid ?? head);
+      return {committed:captured.kind==="parent_workspace_snapshot",recovered:false,headOid:head};
+    }
     const legacyHookRepair = await this.repairLegacyArtifactHookPollution(input.path);
     const currentHead = (await this.gitOutput(input.path, ["rev-parse", "--verify", "HEAD"])).trim();
     const marker = `Corptie-Integration-Job: ${input.jobId}`;
@@ -662,6 +715,58 @@ export class GitWorkspaceManager {
     }
     const headOid = (await this.gitOutput(input.path, ["rev-parse", "--verify", "HEAD"])).trim();
     return { committed: true, recovered: false, headOid, legacyHookPollutionRepaired: legacyHookRepair.repaired };
+  }
+
+  // Native human acceptance prepares only its exact child. This is a separate
+  // hierarchy operation, not an escape hatch in standalone Git mutation APIs.
+  async prepareChildDeliveryCommit(input) {
+    if(this.directCommitRepositories.has(input.repositoryId)) throw integrationGitError("REPOSITORY_BUSY","Another commit is running.");
+    this.directCommitRepositories.add(input.repositoryId);
+    try {
+      const assertScope=()=>{
+        input.revalidate();
+        const task=this.store.getTask(input.taskId),parent=this.store.getTask(input.parentTaskId);
+        const binding=this.store.getTaskDeliveryBinding(input.taskId),tree=this.store.getGitWorktree(input.worktreeId);
+        if(!task || !parent || task.deletion_status || task.archived || parent.deletion_status || parent.archived
+          || task.parent_task_id!==parent.id || task.work_id!==parent.work_id || tree?.isMain
+          || binding?.repository_id!==input.repositoryId || binding.worktree_id!==input.worktreeId
+          || binding.binding_revision!==input.bindingRevision || (tree?.canonicalPath || tree?.path)!==input.path) {
+          throw integrationGitError("TASK_DELIVERY_BINDING_CHANGED","The child delivery binding changed.");
+        }
+        if(this.store.selectOne("SELECT 1 FROM task_delivery_worktrees WHERE worktree_id=? AND task_id<>? LIMIT 1",[input.worktreeId,task.id])
+          || this.store.selectOne("SELECT 1 FROM child_task_delivery_operations WHERE child_task_id=? AND state IN ('queued','running','waiting') AND operation_id<>? LIMIT 1",[task.id,input.operationId ?? ""])
+          || this.store.selectAll("SELECT * FROM worktree_integration_jobs WHERE repository_id=? AND status IN ('running','cancellation_requested')",[input.repositoryId]).some(job=>{
+            const plan=JSON.parse(job.details_json).plan;
+            return (plan.writeWorktreeIds ?? plan.items?.map(item=>item.worktreeId) ?? []).includes(input.worktreeId);
+          })) {
+          throw integrationGitError("REPOSITORY_BUSY","The child Worktree is already reserved.");
+        }
+        for(const logical of this.store.listLogicalSessionsByWorkspaceId(input.worktreeId)) {
+          if((logical.taskId ?? this.store.getSession(logical.legacySessionId)?.taskId)!==task.id) {
+            throw integrationGitError("WORKTREE_IN_USE","Another Session owns this Worktree.");
+          }
+        }
+      };
+      assertScope();
+      if(await this.integrationOperationState(input.path)) throw integrationGitError("GIT_OPERATION_IN_PROGRESS","Finish the existing Git operation first.");
+      const before=await this.inspectWorktreeCommitPolicy({path:input.path,repositoryId:input.repositoryId,verifyPromotion:input.verifyPromotion});
+      if(before.files.length || before.violations.length) throw integrationGitError("GIT_ARTIFACT_POLICY_REJECTED","交付包含尚未授权入库的文档或不安全路径，请先在 Worktree 提交检查中处理；没有提交或删除文件。");
+      await input.prepareProtection(input.path);
+      const after=await this.inspectWorktreeCommitPolicy({path:input.path,repositoryId:input.repositoryId,verifyPromotion:input.verifyPromotion});
+      if(after.state!==before.state) throw integrationGitError("COMMIT_REVIEW_CHANGED","The child files changed during preparation.");
+      assertScope();
+      await stageValidatedIntegrationTree({cwd:input.path,execFile:this.execFile});
+      assertScope();
+      const staged=await this.inspectWorktreeCommitPolicy({path:input.path,repositoryId:input.repositoryId,verifyPromotion:input.verifyPromotion});
+      if(staged.files.length || staged.violations.length || staged.contentState!==before.contentState) {
+        throw integrationGitError("COMMIT_REVIEW_CHANGED","Files changed while staging; review the child again. No commit was created.");
+      }
+      await input.prepareProtection(input.path);
+      assertScope();
+      if((await this.gitOutput(input.path,["rev-parse","HEAD"])).trim()!==before.headOid) throw integrationGitError("WORKTREE_HEAD_CHANGED","The child HEAD changed during preparation.");
+      await this.runGit(input.path,["commit","-m",`Corptie: prepare accepted child ${input.taskId}`]);
+      return {headOid:(await this.gitOutput(input.path,["rev-parse","HEAD"])).trim()};
+    } finally { this.directCommitRepositories.delete(input.repositoryId); }
   }
 
   async repairLegacyArtifactHookPollution(path) {
@@ -929,7 +1034,12 @@ export class GitWorkspaceManager {
   }
 
   async mergeIntegrationSource(input) {
+    return withWorktreeOperationLock(input.mainPath, () => this.mergeIntegrationSourceLocked(input));
+  }
+
+  async mergeIntegrationSourceLocked(input) {
     this.store.assertStandaloneWorktreeMutation?.({paths:[input.mainPath],readPaths:[input.sourcePath],jobId:input.jobId});
+    if (input.snapshotBase) return mergeWorkspaceSnapshot(this,input);
     if (input.strictExpectedMain) {
       const head = (await this.gitOutput(input.mainPath, ["rev-parse", "HEAD"])).trim();
       if (head !== input.expectedMainHead) {
@@ -937,7 +1047,8 @@ export class GitWorkspaceManager {
         const recordedMerge = input.allowRecordedMergeRecovery && (input.mergeStrategy === "ff-only"
           ? head === input.sourceHead && await this.gitSucceeds(input.mainPath, ["merge-base", "--is-ancestor", input.expectedMainHead, head])
           : parents.length === 2 && parents[0] === input.expectedMainHead && parents[1] === input.sourceHead);
-        if (!recordedMerge) throw integrationGitError("MAIN_HEAD_CHANGED", "The integration target changed outside the recorded step. Review a new plan; completed changes were preserved.");
+        if (!recordedMerge) throw integrationGitError("MAIN_HEAD_CHANGED", `The integration target changed outside the recorded step. Review a new plan; completed changes were preserved.\nTarget: ${input.mainPath}\nExpected HEAD: ${input.expectedMainHead}\nActual HEAD: ${head}`,
+          { expectedHead: input.expectedMainHead, actualHead: head });
       }
     }
     if (await this.gitSucceeds(input.mainPath, ["merge-base", "--is-ancestor", input.sourceHead, "HEAD"])) {
@@ -973,23 +1084,24 @@ export class GitWorkspaceManager {
     }
     const mainHead = (await this.gitOutput(input.mainPath, ["rev-parse", "--verify", "HEAD"])).trim();
     if (mainHead !== input.expectedMainHead) {
-      throw integrationGitError("MAIN_HEAD_CHANGED", "main HEAD changed while the integration task was running.");
+      throw integrationGitError("MAIN_HEAD_CHANGED", `main HEAD changed while the integration task was running.\nTarget: ${input.mainPath}\nExpected HEAD: ${input.expectedMainHead}\nActual HEAD: ${mainHead}`,
+        { expectedHead: input.expectedMainHead, actualHead: mainHead });
     }
     const mainStatus = (await this.gitOutput(input.mainPath, ["status", "--porcelain=v1"])).trim();
-    if (mainStatus) throw integrationGitError("MAIN_DIRTY", "main gained uncommitted changes while integrating.");
-    if(input.mergeStrategy==="ff-only") await this.assertIntegrationTreePolicy(input.mainPath,input.sourceHead,input.expectedMainHead);
+
+    await this.assertIntegrationTreePolicy(input.mainPath,input.sourceHead,input.expectedMainHead);
     try {
       await this.assertCommitHasNoMainLinkedAgentConfiguration(input.sourcePath ?? input.mainPath,input.mainPath,input.sourceHead);
-      await this.runGit(input.mainPath, input.mergeStrategy==="ff-only" ? ["merge","--ff-only",input.sourceHead] : ["merge", "--no-ff", "--no-edit", input.sourceHead]);
+      await this.runGit(input.mainPath, input.mergeStrategy==="ff-only" ? ["merge","--autostash","--ff-only",input.sourceHead] : ["merge", "--autostash", "--no-ff", "--no-edit", input.sourceHead]);
     } catch (error) {
       const conflicts = (await this.gitOutput(input.mainPath, ["diff", "--name-only", "--diff-filter=U"]))
         .split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
       if (conflicts.length > 0) {
-        const conflict = integrationGitError("MERGE_CONFLICT", safeGitError(error, "Merge conflict"));
+        const conflict = integrationGitError("MERGE_CONFLICT", safeGitError(error, "Merge conflict"), { cause: error });
         conflict.conflictFiles = conflicts;
         throw conflict;
       }
-      throw integrationGitError("MERGE_FAILED", safeGitError(error, "Could not merge the Worktree into main"));
+      throw integrationGitError("MERGE_FAILED", safeGitError(error, "Could not merge the Worktree into main"), { cause: error });
     }
     const updatedHead = (await this.gitOutput(input.mainPath, ["rev-parse", "--verify", "HEAD"])).trim();
     if(input.mergeStrategy==="ff-only" && updatedHead!==input.sourceHead) throw integrationGitError("INTEGRATION_ACCEPTANCE_STALE","Final main HEAD differs from the accepted parent.");
@@ -1022,16 +1134,9 @@ export class GitWorkspaceManager {
   }
 
   async #assertIntegrationPostconditionClean(path) {
-    const status = (await this.gitOutput(path, ["status", "--porcelain=v1"])).trim();
-    if (!status) return;
-    const error = integrationGitError(
-      "INTEGRATION_POSTCONDITION_DIRTY",
-      "The integration commit completed but left uncommitted changes in the target Worktree."
-    );
-    error.changedFiles = changedFilesFromPorcelain(status);
-    error.statusSummary = status;
-    error.recoverable = false;
-    throw error;
+    const conflicts=(await this.gitOutput(path,["diff","--name-only","--diff-filter=U"])).split(/\r?\n/).filter(Boolean);
+    if(conflicts.length) throw integrationGitError("MERGE_CONFLICT","Git completed the merge but restoring local changes produced conflicts.",{conflictFiles:conflicts});
+    if(await this.integrationOperationState(path)) throw integrationGitError("GIT_OPERATION_IN_PROGRESS","Git has not finished the current integration operation.");
   }
 
   async inspectSyncWorktree({ repositoryId, item, targetHead, allowResume = true, syncStrategy = null }) {
@@ -1093,7 +1198,12 @@ export class GitWorkspaceManager {
   }
 
   async rebaseIntegrationSource(input) {
+    return withWorktreeOperationLock(input.path, () => this.rebaseIntegrationSourceLocked(input));
+  }
+
+  async rebaseIntegrationSourceLocked(input) {
     this.store.assertStandaloneWorktreeMutation?.({paths:[input.path],jobId:input.jobId});
+    if (input.snapshotBase) return synchronizeWorkspaceSnapshot(this,input);
     if(input.syncStrategy==="merge") {
       try {
         const result=await this.mergeIntegrationSource({mainPath:input.path,sourceHead:input.targetHead,
@@ -1143,12 +1253,11 @@ export class GitWorkspaceManager {
       throw integrationGitError("WORKTREE_HEAD_CHANGED", "The source branch changed while synchronization was running.");
     }
     const status = (await this.gitOutput(input.path, ["status", "--porcelain=v1"])).trim();
-    if (status) throw integrationGitError("WORKTREE_RECHECK_DIRTY", "The source Worktree gained uncommitted changes.");
     if (await this.gitSucceeds(input.path, ["merge-base", "--is-ancestor", input.targetHead, "HEAD"])) {
       return { rebased: false, alreadySynchronized: true, headOid: head };
     }
     try {
-      await this.runGit(input.path, ["rebase", input.targetHead]);
+      await this.runGit(input.path, ["rebase", "--autostash", input.targetHead]);
     } catch (error) {
       const conflicts = (await this.gitOutput(input.path, ["diff", "--name-only", "--diff-filter=U"]))
         .split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
@@ -1187,7 +1296,98 @@ export class GitWorkspaceManager {
     return { headOid: updatedHead };
   }
 
+  async inspectIntegrationRollbackTarget(input) {
+    return withWorktreeOperationLock(input.target.path, async () => {
+      const { target } = input;
+      const identity = await inspectGitWorkspace(target.path, { execFile: this.execFile });
+      if (identity.repositoryId !== input.repositoryId || identity.worktreeId !== target.worktreeId) {
+        throw integrationGitError("WORKTREE_IDENTITY_CHANGED", "The rollback target changed. Refresh the rollback preview before acting.");
+      }
+      const [head, branch, operation, status] = await Promise.all([
+        this.gitOutput(target.path, ["rev-parse", "HEAD"]),
+        this.gitOutput(target.path, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => ""),
+        this.integrationOperationState(target.path),
+        this.gitOutput(target.path, ["status", "--porcelain=v1"])
+      ]);
+      if (!target.baselineHead || branch.trim() !== target.branchName) {
+        throw integrationGitError("ROLLBACK_BASELINE_UNAVAILABLE", "The target branch or recorded merge baseline is unavailable. Review the target before rolling back.");
+      }
+      const baselineIsAncestor = await this.gitSucceeds(target.path, ["merge-base", "--is-ancestor", target.baselineHead, head.trim()]);
+      const commits = (await this.gitOutput(target.path,
+        ["rev-list", "--first-parent", "--reverse", "--parents", `${target.baselineHead}..${head.trim()}`]))
+        .trim().split(/\r?\n/u).filter(Boolean).map(line => {
+          const [head, ...parents] = line.split(/\s+/u);
+          return { head, parents };
+        });
+      const mergeHead = operation === "merge"
+        ? (await this.gitOutput(target.path, ["rev-parse", "MERGE_HEAD"])).trim() : null;
+      const observation = { head: head.trim(), baselineIsAncestor, commits, operation, mergeHead,
+        dirty: status.trim().length > 0, changedFiles: status.trimEnd().split(/\r?\n/u).filter(Boolean) };
+      const classified = classifyIntegrationRollback(target, observation);
+      let published = false;
+      for (const commit of classified.ownedCommits) {
+        if ((await this.gitOutput(target.path, ["for-each-ref", "--format=%(refname)", "--contains", commit, "refs/remotes/"])).trim()) {
+          published = true; break;
+        }
+      }
+      const diff = await this.gitOutput(target.path, ["diff", "HEAD", "--binary"]);
+      return { ...classifyIntegrationRollback(target, { ...observation, published }), published,
+        reviewState: { head: head.trim(), branch: branch.trim(), operation, mergeHead, status, diff } };
+    });
+  }
+
+  async rollbackIntegrationTarget(input) {
+    return withWorktreeOperationLock(input.target.path, async () => {
+      const target = input.target;
+      const current = await this.inspectIntegrationRollbackTarget(input);
+      if (current.mode === "already_restored") return { mainHead: target.baselineHead, aborted: false };
+      if (JSON.stringify(current.reviewState) !== JSON.stringify(target.reviewState)) throw integrationGitError(
+        "ROLLBACK_REVIEW_REQUIRED", "The target changed after the rollback review. Refresh the preview before continuing.");
+      if (current.operation && !current.operationOwned) throw integrationGitError(
+        "ROLLBACK_GIT_RECOVERY_REQUIRED", `Finish or abort the ${current.operation} in ${target.path}, then refresh the rollback preview.`);
+      if ((current.additionalCommits.length || current.published) && input.includeAdditionalCommits !== true) throw integrationGitError(
+        "ROLLBACK_ADDITIONAL_COMMITS", "Review and confirm the additional or published history listed in the rollback preview before resetting this local branch.");
+      if (current.dirty && input.discardChanges !== true) throw integrationGitError(
+        "ROLLBACK_EDITS_REQUIRE_CONFIRMATION", "The target contains uncommitted or conflict-resolution changes. Preserve them first, or confirm discarding the changes listed in the rollback preview.");
+      this.store.assertStandaloneWorktreeMutation?.({ paths: [target.path], jobId: input.jobId });
+      this.invalidateInspectionCache(input.repositoryId, "integration_rollback");
+      try {
+        await this.runGit(target.path, ["reset", input.discardChanges === true ? "--hard" : "--merge", target.baselineHead]);
+        const head = (await this.gitOutput(target.path, ["rev-parse", "HEAD"])).trim();
+        const conflicts = (await this.gitOutput(target.path, ["diff", "--name-only", "--diff-filter=U"])).trim();
+        if (head !== target.baselineHead || await this.integrationOperationState(target.path) || conflicts) throw integrationGitError(
+          "MAIN_NOT_RESTORED", `Git did not restore ${target.branchName} to the reviewed merge baseline. Refresh the rollback preview to continue.`);
+        return { mainHead: head, aborted: current.operationOwned };
+      } finally {
+        this.invalidateInspectionCache(input.repositoryId, "integration_rollback_completed");
+      }
+    });
+  }
+
   async abortIntegrationMerge(input) {
+    return withWorktreeOperationLock(input.mainPath, async () => {
+      const delays = [50, 100, 200, 400, 800];
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await this.abortIntegrationMergeLocked(input);
+        } catch (error) {
+          // A failed index-lock acquisition performs no abort. Revalidate the
+          // complete ownership/edit fence before trying again; never remove a
+          // Git lock or replay an arbitrary failed Git write.
+          const indexBusy = error?.code === 128 && /fatal: Unable to create ['"][^\r\n]*[/\\]index\.lock['"]: File exists\./u.test(String(error.stderr ?? ""));
+          if (!indexBusy) throw error;
+          if (attempt === delays.length) {
+            throw integrationGitError("GIT_INDEX_LOCK_BUSY",
+              safeGitError(error, "The integration target's Git index is still busy after bounded retries. The merge was preserved; retry conflict handling after the other Git operation finishes"),
+              { cause: error, retryCount: attempt });
+          }
+          await new Promise(done => setTimeout(done, delays[attempt]));
+        }
+      }
+    });
+  }
+
+  async abortIntegrationMergeLocked(input) {
     this.store.assertStandaloneWorktreeMutation?.({paths:[input.mainPath],jobId:input.jobId});
     const operationState = await this.integrationOperationState(input.mainPath);
     const mainHead = (await this.gitOutput(input.mainPath, ["rev-parse", "--verify", "HEAD"])).trim();
@@ -1198,6 +1398,9 @@ export class GitWorkspaceManager {
           "MAIN_NOT_RESTORED",
           "main no longer contains the task-owned merge and has uncommitted changes."
         );
+      }
+      if (mainHead !== input.expectedMainHead) {
+        throw integrationGitError("MAIN_HEAD_CHANGED", "The target HEAD changed while waiting to restore the task-owned merge.");
       }
       return { aborted: false, alreadyClean: true, mainHead };
     }
@@ -1220,6 +1423,11 @@ export class GitWorkspaceManager {
         "main HEAD changed after the integration conflict was recorded."
       );
     }
+    if (!await this.gitSucceeds(input.mainPath, ["rev-parse", "--verify", "AUTO_MERGE"])
+      || !await this.gitSucceeds(input.mainPath, ["diff", "--quiet", "AUTO_MERGE", "--"])) {
+      throw integrationGitError("INTEGRATION_CONFLICT_EDITS_PRESENT",
+        "The conflict Worktree contains resolution edits, or its original conflict state cannot be verified. Those edits were preserved. Complete or preserve them before stopping this merge.");
+    }
     await this.runGit(input.mainPath, ["merge", "--abort"]);
     const remainingOperation = await this.integrationOperationState(input.mainPath);
     const status = (await this.gitOutput(input.mainPath, ["status", "--porcelain=v1"])).trim();
@@ -1235,7 +1443,7 @@ export class GitWorkspaceManager {
 
   async createConvergenceWorktreeForProject(input) {
     const root = absolutePath(input.workingDirectory);
-    const snapshot = await createGitWorkspaceSnapshot(root);
+    const snapshot = await this.operationSnapshot(root, input);
     if (snapshot.repository.id !== input.repositoryId) {
       throw integrationGitError("REPOSITORY_IDENTITY_CHANGED", "The convergence repository identity changed.");
     }
@@ -1255,7 +1463,7 @@ export class GitWorkspaceManager {
       } catch (error) {
         throw integrationGitError("CONVERGENCE_WORKSPACE_CREATE_FAILED", safeGitError(error, "Could not create the convergence Worktree"));
       }
-      const updated = await createGitWorkspaceSnapshot(targetPath);
+      const updated = await this.operationSnapshot(targetPath, input);
       this.store.upsertGitWorkspaceSnapshot(updated);
       const created = updated.worktrees.find((worktree) =>
         worktree.branchName === branchName
@@ -1294,27 +1502,104 @@ export class GitWorkspaceManager {
     }
     await this.runGit(input.workingDirectory, ["worktree", "remove", workspace.path]);
     await this.runGit(input.workingDirectory, ["branch", "-d", workspace.branchName]);
-    const updated = await createGitWorkspaceSnapshot(input.workingDirectory);
+    const updated = await this.operationSnapshot(input.workingDirectory, input);
     this.store.upsertGitWorkspaceSnapshot(updated);
     return { removed: true };
   }
 
+  async inspectMainIntegrationCompletion(input) {
+    const snapshot = await this.operationSnapshot(absolutePath(input.targetPath), input);
+    const {expectedTargetHead,expectedMainHead,...targetIdentity}=input;
+    const main = await this.#resolveIntegrationTarget(targetIdentity, snapshot);
+    if (!main.isMain || (input.branchName && main.branchName !== input.branchName)) {
+      throw integrationGitError("INTEGRATION_FINAL_TARGET_INVALID", "The final integration target is no longer the reviewed main Worktree and branch.");
+    }
+    if (await this.integrationOperationState(main.path)) {
+      throw integrationGitError("GIT_OPERATION_IN_PROGRESS", `Final target ${main.branchName} still has an unfinished Git operation.`);
+    }
+    await this.#assertIntegrationPostconditionClean(main.path);
+    for (const head of new Set(input.requiredHeads)) {
+      if (!await this.gitSucceeds(main.path, ["merge-base", "--is-ancestor", head, main.headOid])) {
+        throw integrationGitError("INTEGRATION_RESULT_MISSING", `The integration is not complete.\nTarget: ${main.branchName}\nMain HEAD: ${main.headOid}\nMissing source or resolution commit: ${head}`);
+      }
+    }
+    return { mainWorktreeId: main.worktreeId, mainHead: main.headOid, verifiedHeads: [...new Set(input.requiredHeads)] };
+  }
+
+  async #resolveIntegrationTarget(input, snapshot) {
+    if (snapshot.repository.id !== input.repositoryId) {
+      throw integrationGitError("REPOSITORY_IDENTITY_CHANGED", "The integration repository identity changed.");
+    }
+    const targetPath = input.targetPath ?? input.mainPath;
+    const canonical = targetPath ? await realpath(absolutePath(targetPath)) : null;
+    const target = snapshot.worktrees.find(tree => tree.availability === "available"
+      && (input.targetWorktreeId ? tree.worktreeId === input.targetWorktreeId
+        : canonical ? resolve(tree.canonicalPath ?? tree.path) === canonical : tree.isMain));
+    if (!target || (canonical && await realpath(target.path) !== canonical)) {
+      throw integrationGitError("INTEGRATION_TARGET_CHANGED", "The recorded integration target Worktree is unavailable or its identity changed.");
+    }
+    const expected = input.expectedTargetHead ?? input.expectedMainHead;
+    const actual = (await this.gitOutput(target.path, ["rev-parse", "--verify", "HEAD"])).trim();
+    if (expected && actual !== expected) {
+      throw integrationGitError("MAIN_HEAD_CHANGED", `Integration target ${target.branchName ?? target.worktreeId} changed.\nExpected HEAD: ${expected}\nActual HEAD: ${actual}`,
+        { expectedHead: expected, actualHead: actual });
+    }
+    return { ...target, headOid: actual };
+  }
+
   async createIntegrationWorktreeForProject(input) {
-    let snapshot = await createGitWorkspaceSnapshot(absolutePath(input.workingDirectory));
+    let snapshot = await this.operationSnapshot(absolutePath(input.workingDirectory), input);
     if (snapshot.repository.id !== input.repositoryId) {
       throw new Error("The integration project no longer belongs to the registered repository.");
     }
-    let main = snapshot.worktrees.find((worktree) => worktree.isMain && worktree.availability === "available");
+    let main = await this.#resolveIntegrationTarget(input, snapshot);
     if (!main) throw new Error("The repository's main worktree is unavailable.");
-    const mainStatus = await this.gitOutput(main.path, ["status", "--porcelain=v1"]);
-    if (mainStatus.trim()) {
-      const error = integrationGitError(
-        "MAIN_DIRTY",
-        "The main worktree has uncommitted changes. Corptie preserved them and did not create or remove a Worktree."
-      );
-      error.failureStage = "workspace_preflight";
-      error.recoverySuggestion = "Commit or preserve the main changes, then retry conflict resolution.";
-      throw error;
+    // The job owns one conflict workspace across all graph targets. Recover its
+    // original identity from existing job records, including pre-fix jobs.
+    const job = input.runId && this.store.getWorktreeIntegrationJob?.(input.runId);
+    const firstWorkspace = job?.details?.audit?.find(entry => entry.event === "conflict_workspace_created");
+    const workspaceId = firstWorkspace?.worktreeId ?? job?.details?.conflictAutomation?.workspaceId;
+    if (workspaceId) {
+      const workspace = snapshot.worktrees.find(tree => tree.worktreeId === workspaceId);
+      const stored = this.store.getGitWorktree(workspaceId);
+      if (!workspace || workspace.availability !== "available" || workspace.isMain
+        || workspace.worktreeId === main.worktreeId || workspace.path !== stored?.path
+        || workspace.branchName !== stored?.branchName
+        || (firstWorkspace?.branchName && workspace.branchName !== firstWorkspace.branchName)
+        || (firstWorkspace?.worktreePath && workspace.path !== firstWorkspace.worktreePath)
+        || !workspace.branchName?.startsWith("integration/")) {
+        throw integrationGitError("CONFLICT_PLAN_WORKSPACE_UNAVAILABLE", "The plan-owned conflict Worktree changed or is unavailable. Restore it before continuing.");
+      }
+      return withWorktreeOperationLock(workspace.path, async () => {
+        for (const route of this.store.listLogicalSessionsByWorkspaceId(workspaceId)) {
+          const session = this.store.getSession(route.legacySessionId);
+          if (["running", "blocked"].includes(session?.status)
+            || this.store.getSessionRuntimeBlocker?.(route.legacySessionId, { includeQueued: true })) {
+            throw integrationGitError("CONFLICT_PLAN_SESSION_BUSY", "The plan Session still has unfinished work.");
+          }
+        }
+        if (workspace.isLocked || await this.integrationOperationState(workspace.path)
+          || (await this.gitOutput(workspace.path, ["status", "--porcelain=v1"])).trim()) {
+          throw integrationGitError("INTEGRATION_WORKSPACE_NOT_CLEAN", "The plan-owned conflict Worktree still contains unfinished changes.");
+        }
+        const head = (await this.gitOutput(workspace.path, ["rev-parse", "HEAD"])).trim();
+        if (head !== main.headOid) {
+          const targets = snapshot.worktrees.filter(tree => tree.availability === "available"
+            && tree.worktreeId !== workspaceId && (job.details.plan.reservedWorktreeIds ?? []).includes(tree.worktreeId));
+          let retained = false;
+          for (const target of targets) {
+            if (await this.gitSucceeds(main.path, ["merge-base", "--is-ancestor", head, target.headOid])) { retained = true; break; }
+          }
+          if (!retained) throw integrationGitError("INTEGRATION_WORKSPACE_DIVERGED", "The previous conflict result has not been retained in a plan target. No workspace was reset.");
+          // This clean scratch branch can move only after its old result is
+          // retained by a reviewed target. Never reset a source or target tree.
+          await this.runGit(workspace.path, ["reset", "--hard", main.headOid]);
+        }
+        const refreshed = await createGitWorkspaceSnapshot(workspace.path);
+        this.store.upsertGitWorkspaceSnapshot(refreshed);
+        return this.#presentIntegrationWorkspace(refreshed, main,
+          refreshed.worktrees.find(tree => tree.worktreeId === workspaceId), 0, true);
+      });
     }
     const baseSuffix = String(input.runId ?? "integration")
       .replace(/^integration:/, "")
@@ -1325,14 +1610,15 @@ export class GitWorkspaceManager {
     let lastError = null;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (attempt > 0) {
-        snapshot = await createGitWorkspaceSnapshot(main.path);
+        snapshot = await this.operationSnapshot(main.path, input);
         this.store.upsertGitWorkspaceSnapshot(snapshot);
-        main = snapshot.worktrees.find((worktree) => worktree.isMain && worktree.availability === "available");
+        main = await this.#resolveIntegrationTarget(input, snapshot);
         if (!main) throw integrationGitError("MAIN_UNAVAILABLE", "The repository's main worktree became unavailable.");
       }
       const suffix = attempt === 0 ? baseSuffix : `${baseSuffix}-${attempt + 1}`;
       const branchName = `integration/${suffix}`;
       const targetPath = resolve(dirname(main.path), `${basename(main.path)}-integration-${suffix}`);
+      if (await pathExists(targetPath)) snapshot = await this.operationSnapshot(targetPath, input);
       const byPath = snapshot.worktrees.find((worktree) => resolve(worktree.path) === targetPath);
       if (byPath?.availability === "available" && byPath.branchName === branchName) {
         const operation = await this.integrationOperationState(byPath.path);
@@ -1352,15 +1638,15 @@ export class GitWorkspaceManager {
           if (!canFastForward) {
             const error = integrationGitError(
               "INTEGRATION_WORKSPACE_DIVERGED",
-              `The plan-owned Integration branch no longer follows main: ${branchName}.`
+              `The plan-owned Integration branch no longer follows the integration target: ${branchName}.`
             );
             error.recoverable = false;
             throw error;
           }
           await this.runGit(byPath.path, ["merge", "--ff-only", main.headOid]);
-          snapshot = await createGitWorkspaceSnapshot(byPath.path);
+          snapshot = await this.operationSnapshot(byPath.path, input);
           this.store.upsertGitWorkspaceSnapshot(snapshot);
-          main = snapshot.worktrees.find((worktree) => worktree.isMain && worktree.availability === "available");
+          main = await this.#resolveIntegrationTarget(input, snapshot);
           const advanced = snapshot.worktrees.find((worktree) => resolve(worktree.path) === targetPath);
           if (!main || !advanced) {
             throw integrationGitError(
@@ -1388,7 +1674,7 @@ export class GitWorkspaceManager {
           ["-C", main.path, "worktree", "add", "-b", branchName, targetPath, main.headOid],
           { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 }
         );
-        const updated = await createGitWorkspaceSnapshot(targetPath);
+        const updated = await this.operationSnapshot(targetPath, input);
         this.store.upsertGitWorkspaceSnapshot(updated);
         const created = updated.worktrees.find((worktree) => resolve(worktree.path) === targetPath);
         if (created?.availability === "available") {
@@ -1432,11 +1718,44 @@ export class GitWorkspaceManager {
     };
   }
 
+  async ensureChildTaskWorktree(input, task) {
+    const binding = this.store.getTaskDeliveryBinding(task.parent_task_id);
+    const parent = this.store.getGitWorktree(binding.worktree_id);
+    const parentPath = parent.canonicalPath || parent.path;
+    const repository = this.store.getGitRepository(binding.repository_id);
+    const configured = typeof this.taskWorktreesRoot === "function"
+      ? this.taskWorktreesRoot({ repositoryId: binding.repository_id, taskId: task.id, mainPath: parentPath })
+      : this.taskWorktreesRoot;
+    const root = configured ? resolve(configured) : resolve(dirname(parentPath), ".corptie-children");
+    const suffix = randomUUID(), branchName = `task/${suffix}`, targetPath = resolve(root, suffix);
+    await mkdir(root, { recursive: true });
+    await this.runGit(parentPath, ["worktree", "add", "-b", branchName, targetPath, "HEAD"]);
+    // Read only the newly created directory's identifiers for registration.
+    // No worktree-list scan, inventory fingerprint or before/after comparison.
+    const identity = await inspectGitWorkspace(targetPath);
+    const [headOid, sourceTreeOid] = (await this.gitOutput(targetPath, ["rev-parse", "HEAD", "HEAD^{tree}"])).trim().split(/\r?\n/);
+    const created = { ...identity, branchName, branchRef: `refs/heads/${branchName}`, headOid,
+      availability: "available", isDetached: false, isLocked: false, isPrunable: false };
+    this.store.upsertGitWorkspaceSnapshot({ partial: true, repository: { id: binding.repository_id,
+      commonGitDirCanonicalPath: repository.commonGitDirCanonicalPath },
+      worktrees: [created], inventoryVersion: created.worktreeId, observedAt: new Date().toISOString() });
+    const sharedAgentConfiguration = await linkSharedAgentConfiguration({ mainPath: parentPath,
+      targetPath, commonGitDir: repository.commonGitDirCanonicalPath });
+    return { ...await presentEnsuredTaskWorkspace(created, false, sharedAgentConfiguration),
+      sourceTreeOid, inventoryVersion: created.worktreeId,
+      baseContext: { version: 1, kind: "parent", rootTaskId: task.parent_task_id, parentTaskId: task.parent_task_id,
+        parentWorktreeId: binding.worktree_id, parentBindingRevision: binding.binding_revision,
+        baseCommitOid: headOid, baseTreeOid: sourceTreeOid } };
+  }
+
   async ensureTaskWorktreeForProject(input) {
+    const task = this.store.getTask?.(input.taskId);
+    if (task?.parent_task_id) return this.ensureChildTaskWorktree(input, task);
+    const timing = input.startupTiming;
     const repositoryId = requiredText(input.repositoryId, "repositoryId");
     const taskId = requiredText(input.taskId, "taskId");
     const workingDirectory = absolutePath(input.workingDirectory);
-    let snapshot = await createGitWorkspaceSnapshot(workingDirectory);
+    let snapshot = await measureStartup(timing, "git.inventory.before", () => this.operationSnapshot(workingDirectory, input));
     if (snapshot.repository.id !== repositoryId) {
       throw new Error("The Task project no longer belongs to the registered repository.");
     }
@@ -1449,50 +1768,29 @@ export class GitWorkspaceManager {
     // implicit commit would mutate user data. Reuse the only authoritative
     // checkout for this bootstrap state and make the exception auditable.
     if (!main.headOid) {
-      if (input.baseContext || this.store.getTask?.(taskId)?.parent_task_id) {
-        throw integrationGitError("PARENT_WORKTREE_REQUIRED", "Child Worktree requires a committed repository baseline.");
-      }
       this.store.upsertGitWorkspaceSnapshot(snapshot);
       return presentEnsuredTaskWorkspace(main, true, null, "unborn-main");
     }
 
-    const baseContext = input.baseContext ?? null;
-    if (baseContext) {
-      const frozen = this.store.selectOne(`SELECT worktree_base_context_json FROM work_session_startup_operations
-        WHERE task_id=? AND repository_id=? AND worktree_base_context_json=? LIMIT 1`,
-      [taskId,repositoryId,JSON.stringify(baseContext)]);
-      const binding = this.store.getTaskDeliveryBinding(baseContext.parentTaskId);
-      const task = this.store.getTask(taskId);
-      if (!frozen || baseContext.kind !== "parent" || !binding || task?.parent_task_id !== baseContext.parentTaskId
-        || binding.worktree_id !== baseContext.parentWorktreeId || binding.repository_id !== repositoryId
-        || binding.binding_revision !== baseContext.parentBindingRevision
-        || !/^[a-f0-9]{40,64}$/i.test(baseContext.baseCommitOid ?? "")) {
-        throw integrationGitError("TASK_DELIVERY_BINDING_CHANGED", "Child Worktree requires a durable, verified parent base.");
-      }
-      const tree = (await this.gitOutput(main.path, ["rev-parse", `${baseContext.baseCommitOid}^{tree}`])).trim();
-      if (tree !== baseContext.baseTreeOid) throw integrationGitError("START_BASE_DIVERGED", "Frozen base object changed.");
-    } else if (this.store.getTask?.(taskId)?.parent_task_id) {
-      throw integrationGitError("PARENT_WORKTREE_REQUIRED", "Child Worktree cannot fall back to the main branch.");
-    }
     const configuredRoot = typeof this.taskWorktreesRoot === "function"
       ? this.taskWorktreesRoot({ repositoryId, taskId, mainPath: main.path })
       : this.taskWorktreesRoot;
     const worktreesRoot = configuredRoot
       ? absolutePath(configuredRoot)
       : resolve(dirname(main.path), `.corptie-worktrees-${repositoryId.split(":").at(-1)}`);
-    const identity = await this.allocateTaskWorkspaceIdentity({
+    const identity = await measureStartup(timing, "git.allocate-identity", () => this.allocateTaskWorkspaceIdentity({
       taskId,
       mainPath: main.path,
       worktreesRoot,
       worktrees: snapshot.worktrees
-    });
+    }));
     const { suffix, branchName, targetPath } = identity;
-    const canonicalTargetPath = await canonicalFuturePath(targetPath);
-    if (snapshot.worktrees.some((worktree) => {
-      const registeredPath = resolve(worktree.canonicalPath || worktree.path);
-      return registeredPath !== canonicalTargetPath && pathContains(registeredPath, canonicalTargetPath);
-    })) {
-      throw new Error("The managed Task Worktree root must not be nested inside another Git Worktree.");
+    if (await pathExists(targetPath)) {
+      const existingSnapshot = await this.operationSnapshot(targetPath, input).catch(() => {
+        throw new Error(`The worktree target path already exists: ${targetPath}`);
+      });
+      snapshot.worktrees = existingSnapshot.worktrees;
+      this.store.upsertGitWorkspaceSnapshot(existingSnapshot);
     }
     const matchingBranch = (worktree) => worktree.branchName === branchName;
     const matchingPath = (worktree) => resolve(worktree.path) === targetPath;
@@ -1510,8 +1808,8 @@ export class GitWorkspaceManager {
     }
 
     if (existing) {
-      await this.runGit(main.path, ["worktree", "prune"]);
-      snapshot = await createGitWorkspaceSnapshot(main.path);
+      await measureStartup(timing, "git.prune-stale-worktree", () => this.runGit(main.path, ["worktree", "prune"]));
+      snapshot = await measureStartup(timing, "git.inventory.after-prune", () => this.operationSnapshot(main.path, input));
       this.store.upsertGitWorkspaceSnapshot(snapshot);
       main = snapshot.worktrees.find((worktree) => worktree.isMain && worktree.availability === "available");
       if (!main) throw new Error("The repository's main worktree is unavailable.");
@@ -1523,27 +1821,24 @@ export class GitWorkspaceManager {
 
     await mkdir(worktreesRoot, { recursive: true });
     await assertPathMissing(targetPath);
-    const branchExists = await this.gitSucceeds(main.path, [
+    const branchExists = await measureStartup(timing, "git.branch-exists", () => this.gitSucceeds(main.path, [
       "show-ref", "--verify", `refs/heads/${branchName}`
-    ]);
-    if (baseContext && !branchExists && this.store.getTaskDeliveryBinding(taskId)) {
-      throw integrationGitError("CHILD_SOURCE_MISSING", "The delivered child branch is missing; it cannot be recreated as new work.");
-    }
+    ]));
     const args = branchExists
       ? [targetPath, branchName]
-      : ["-b", branchName, targetPath, baseContext?.baseCommitOid ?? main.headOid];
+      : ["-b", branchName, targetPath, main.headOid];
     try {
       this.invalidateInspectionCache(input.repositoryId, "create_task_worktree");
-      await this.execFile(
+      await measureStartup(timing, "git.worktree-add", () => this.execFile(
         "git",
         ["-C", main.path, "worktree", "add", ...args],
         { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 }
-      );
+      ));
     } catch (error) {
       throw new Error(safeGitError(error, "Could not create the Task Worktree"));
     }
 
-    const updated = await createGitWorkspaceSnapshot(targetPath);
+    const updated = await measureStartup(timing, "git.inventory.after-create", () => this.operationSnapshot(targetPath, input));
     this.store.upsertGitWorkspaceSnapshot(updated);
     const created = resolveExisting(updated.worktrees);
     if (!created || created.availability !== "available") {
@@ -1552,11 +1847,11 @@ export class GitWorkspaceManager {
     if (identity.compact) {
       await this.runGit(main.path, ["config", taskWorkspaceOwnerKey(suffix), taskId]);
     }
-    const sharedAgentConfiguration = await linkSharedAgentConfiguration({
+    const sharedAgentConfiguration = await measureStartup(timing, "git.link-agent-config", () => linkSharedAgentConfiguration({
       mainPath: main.canonicalPath || main.path,
       targetPath: created.canonicalPath || created.path,
       commonGitDir: updated.repository.commonGitDirCanonicalPath
-    });
+    }));
     return presentEnsuredTaskWorkspace(created, false, sharedAgentConfiguration);
   }
 
@@ -1564,7 +1859,7 @@ export class GitWorkspaceManager {
     const legacySuffix = taskWorkspaceSuffix(taskId);
     const legacyBranch = `task/${legacySuffix}`;
     const legacyPath = resolve(worktreesRoot, legacySuffix);
-    if (worktrees.some((worktree) =>
+    if (await pathExists(legacyPath) || worktrees.some((worktree) =>
       worktree.branchName === legacyBranch || resolve(worktree.path) === legacyPath)) {
       return { suffix: legacySuffix, branchName: legacyBranch, targetPath: legacyPath, compact: false };
     }
@@ -1589,7 +1884,10 @@ export class GitWorkspaceManager {
         }
         continue;
       }
-      if (await pathExists(targetPath)) continue;
+      if (await pathExists(targetPath)) {
+        if (configuredOwner === taskId) return { suffix, branchName, targetPath, compact: true };
+        continue;
+      }
       const branchExists = await this.gitSucceeds(mainPath, [
         "show-ref", "--verify", `refs/heads/${branchName}`
       ]);
@@ -1600,11 +1898,12 @@ export class GitWorkspaceManager {
   }
 
   async prepareIntegrationConflictResolutionForProject(input) {
-    const snapshot = await createGitWorkspaceSnapshot(absolutePath(input.workingDirectory));
+    const snapshot = await this.operationSnapshot(absolutePath(input.workingDirectory), input);
     if (snapshot.repository.id !== input.repositoryId) {
       throw integrationGitError("REPOSITORY_IDENTITY_CHANGED", "The integration project identity changed.");
     }
-    const main = snapshot.worktrees.find((worktree) => worktree.isMain && worktree.availability === "available");
+    const main = await this.#resolveIntegrationTarget({ ...input, expectedMainHead: undefined,
+      expectedTargetHead: undefined, targetPath: input.targetPath ?? input.mainPath ?? input.workingDirectory }, snapshot);
     if (!main) throw integrationGitError("MAIN_UNAVAILABLE", "The repository's main worktree is unavailable.");
     const operationState = await this.integrationOperationState(main.path);
     if (operationState && operationState !== "merge") {
@@ -1623,13 +1922,21 @@ export class GitWorkspaceManager {
         );
       }
       if (await this.gitSucceeds(main.path, ["merge-base", "--is-ancestor", input.sourceHead, "HEAD"])) {
-        return { alreadyResolved: true, mainHead };
+        const parents = (await this.gitOutput(main.path, ["rev-list", "--parents", "-n", "1", "HEAD"])).trim().split(/\s+/).slice(1);
+        if (mainHead === input.expectedMainHead || (parents.length === 2
+          && parents[0] === input.expectedMainHead && parents[1] === input.sourceHead)) {
+          return { alreadyResolved: true, mainHead };
+        }
       }
-      return this.createIntegrationWorktreeForProject({
+      if (mainHead !== input.expectedMainHead) throw integrationGitError("MAIN_HEAD_CHANGED",
+        `Integration target ${main.branchName} changed.\nExpected HEAD: ${input.expectedMainHead}\nActual HEAD: ${mainHead}`);
+      const workspace = await this.createIntegrationWorktreeForProject({
         repositoryId: input.repositoryId,
         workingDirectory: main.path,
+        targetWorktreeId: main.worktreeId, targetPath: main.path, expectedTargetHead: input.expectedMainHead,
         runId: input.jobId
       });
+      return input.snapshotBase ? prepareSnapshotConflictWorkspace(this,input,workspace) : workspace;
     }
     const mergeHead = (await this.gitOutput(main.path, ["rev-parse", "--verify", "MERGE_HEAD"])).trim();
     if (mergeHead !== input.sourceHead) {
@@ -1646,7 +1953,7 @@ export class GitWorkspaceManager {
     if (conflicts.length === 0) {
       return { readyForRetry: true, mainHead };
     }
-    await this.runGit(main.path, ["merge", "--abort"]);
+    await this.abortIntegrationMerge({ ...input, mainPath: main.path });
     const status = (await this.gitOutput(main.path, ["status", "--porcelain=v1"])).trim();
     if (status) {
       throw integrationGitError(
@@ -1657,6 +1964,7 @@ export class GitWorkspaceManager {
     return this.createIntegrationWorktreeForProject({
       repositoryId: input.repositoryId,
       workingDirectory: main.path,
+      targetWorktreeId: main.worktreeId, targetPath: main.path, expectedTargetHead: input.expectedMainHead,
       runId: input.jobId
     });
   }
@@ -1671,17 +1979,17 @@ export class GitWorkspaceManager {
         "The dedicated conflict-resolution Worktree no longer exists. Restart conflict handling to create a replacement Worktree."
       );
     }
-    const snapshot = await createGitWorkspaceSnapshot(workspacePath);
+    const snapshot = await this.operationSnapshot(workspacePath, input);
     if (snapshot.repository.id !== input.repositoryId) {
       throw integrationGitError("RESOLUTION_REPOSITORY_CHANGED", "The conflict-resolution Worktree belongs to a different repository.");
     }
-    const main = snapshot.worktrees.find((worktree) => worktree.isMain && worktree.availability === "available");
+    const main = await this.#resolveIntegrationTarget(input, snapshot);
     const workspace = snapshot.worktrees.find((worktree) => (
       worktree.availability === "available"
         && (worktree.worktreeId === input.workspace?.worktreeId || resolve(worktree.path) === workspacePath)
     ));
     if (!main) throw integrationGitError("MAIN_UNAVAILABLE", "The repository's main worktree is unavailable.");
-    if (!workspace || workspace.isMain) {
+    if (!workspace || workspace.isMain || workspace.worktreeId === main.worktreeId) {
       throw integrationGitError("RESOLUTION_WORKTREE_UNAVAILABLE", "The dedicated conflict-resolution Worktree is unavailable.");
     }
     if (input.workspace?.branchName && workspace.branchName !== input.workspace.branchName) {
@@ -1694,7 +2002,7 @@ export class GitWorkspaceManager {
     if (mainOperation || mainStatus || mainHead !== input.expectedMainHead) {
       throw integrationGitError(
         mainStatus ? "MAIN_DIRTY" : (mainHead !== input.expectedMainHead ? "MAIN_HEAD_CHANGED" : "GIT_OPERATION_IN_PROGRESS"),
-        "main changed while the conflict Agent was working. Corptie did not promote the Agent result; preserve main manually, then re-preflight."
+        "The recorded integration target changed while the conflict Session was working. The result was preserved; review a fresh plan before continuing."
       );
     }
 
@@ -1713,7 +2021,7 @@ export class GitWorkspaceManager {
 
     const resolvedHead = (await this.gitOutput(workspace.path, ["rev-parse", "--verify", "HEAD"])).trim();
     if (!await this.gitSucceeds(workspace.path, ["merge-base", "--is-ancestor", input.expectedMainHead, resolvedHead])) {
-      throw integrationGitError("RESOLUTION_BASE_MISSING", "The Agent result is not based on the recorded main revision.");
+      throw integrationGitError("RESOLUTION_BASE_MISSING", "The Agent result is not based on the recorded integration target revision.");
     }
     if (!await this.gitSucceeds(workspace.path, ["merge-base", "--is-ancestor", input.sourceHead, resolvedHead])) {
       throw integrationGitError("RESOLUTION_SOURCE_MISSING", "The Agent result does not contain the conflicted source changes.");
@@ -1746,7 +2054,7 @@ export class GitWorkspaceManager {
     if (!input.repositoryId || !input.workingDirectory || !sourceWorktreeId) {
       throw new Error("The Session is not attached to a mergeable Git worktree.");
     }
-    const snapshot = await createGitWorkspaceSnapshot(input.workingDirectory);
+    const snapshot = await this.operationSnapshot(input.workingDirectory, input);
     if (snapshot.repository.id !== input.repositoryId) {
       throw new Error("The active workspace no longer belongs to the registered repository.");
     }
@@ -1811,7 +2119,7 @@ export class GitWorkspaceManager {
         throw new Error(safeGitError(error, "Merged into main, but could not synchronize the retained worktree"));
       }
     }
-    const updated = await createGitWorkspaceSnapshot(main.path);
+    const updated = await this.operationSnapshot(main.path, input);
     this.store.upsertGitWorkspaceSnapshot(updated);
     return {
       merged: !alreadyMerged,
@@ -1844,7 +2152,7 @@ export class GitWorkspaceManager {
     if (!input.repositoryId || !input.workingDirectory || !sourceWorktreeId) {
       throw new Error("The Session is not attached to a synchronizable Git worktree.");
     }
-    const snapshot = await createGitWorkspaceSnapshot(input.workingDirectory);
+    const snapshot = await this.operationSnapshot(input.workingDirectory, input);
     if (snapshot.repository.id !== input.repositoryId) {
       throw new Error("The active workspace no longer belongs to the registered repository.");
     }
@@ -1876,7 +2184,7 @@ export class GitWorkspaceManager {
         throw new Error(safeGitError(error, "Could not synchronize the worktree with main"));
       }
     }
-    const updated = await createGitWorkspaceSnapshot(main.path);
+    const updated = await this.operationSnapshot(main.path, input);
     this.store.upsertGitWorkspaceSnapshot(updated);
     return {
       synchronized: !alreadySynchronized,
@@ -1901,7 +2209,7 @@ export class GitWorkspaceManager {
     if (!input.repositoryId || !input.workingDirectory || !input.sourceWorktreeId) {
       throw new Error("The Session is not attached to a committable Git repository.");
     }
-    const snapshot = await createGitWorkspaceSnapshot(input.workingDirectory);
+    const snapshot = await this.operationSnapshot(this.store.getGitWorktree(input.sourceWorktreeId)?.path ?? input.workingDirectory, { ...input, includeMain: false });
     if (snapshot.repository.id !== input.repositoryId) {
       throw new Error("The active workspace no longer belongs to the registered repository.");
     }
@@ -1924,7 +2232,7 @@ export class GitWorkspaceManager {
       throw new Error(safeGitError(error, "Could not commit the worktree changes"));
     }
     const headOid = (await this.gitOutput(source.path, ["rev-parse", "--verify", "HEAD"])).trim();
-    const updated = await createGitWorkspaceSnapshot(source.path);
+    const updated = await this.operationSnapshot(source.path, { ...input, includeMain: false });
     this.store.upsertGitWorkspaceSnapshot(updated);
     return {
       committed: true,
@@ -1952,8 +2260,98 @@ export class GitWorkspaceManager {
     });
   }
 
+  async staleRegistrationCapability(tree, workingDirectory) {
+    const action = await staleRegistrationAction(tree);
+    if (!action) return null;
+    let blocker = null;
+    if (this.store.listLogicalSessionsByWorkspaceId(tree.worktreeId).length
+      || this.store.selectOne("SELECT 1 FROM task_delivery_worktrees WHERE worktree_id=? LIMIT 1", [tree.worktreeId])) {
+      blocker = { code: "WORKTREE_IN_USE", reason: "The stale registration still has a Session or Task binding." };
+    } else if ((this.store.listWorktreeIntegrationJobsForWorktree?.(tree.repositoryId, tree.worktreeId) ?? [])
+      .some(job => ["queued", "running", "paused", "cancellation_requested", "replanning"].includes(job.status))) {
+      blocker = { code: "ACTIVE_WORKTREE_INTEGRATION_JOB", reason: "An integration job still uses this Worktree." };
+    } else if (tree.headOid && !(await this.gitOutput(workingDirectory,
+      ["for-each-ref", `--contains=${tree.headOid}`, "--format=%(refname)"])).trim()) {
+      blocker = { code: "UNREFERENCED_WORKTREE_HEAD", reason: "Preserve the Worktree commit in a branch before cleaning its registration." };
+    }
+    return { ...action, available: !blocker, blocker };
+  }
+
+  async removeStaleWorktreeRegistration(input) {
+    return withWorktreeOperationLock(input.workingDirectory, async () => {
+      this.store.assertStandaloneWorktreeMutation?.({ worktreeIds: [input.sourceWorktreeId] });
+      const snapshot = await this.operationSnapshot(input.workingDirectory, input);
+      if (snapshot.repository.id !== input.repositoryId) throw deletionSafetyError("WORKTREE_SCOPE_CHANGED", "The repository identity changed. Refresh and retry.");
+      const stored = this.store.getGitWorktree(input.sourceWorktreeId);
+      const tree = snapshot.worktrees.find(entry => entry.path === stored?.path);
+      if (!tree || !(await staleRegistrationAction(tree))) {
+        throw deletionSafetyError("WORKTREE_SCOPE_CHANGED", "The Worktree is no longer a removable stale registration. Refresh and retry.");
+      }
+      if (!stored || stored.repositoryId !== input.repositoryId || stored.path !== tree.path) {
+        throw deletionSafetyError("WORKTREE_SCOPE_CHANGED", "The Worktree identity changed. Refresh and retry.");
+      }
+      // Preserve every binding, including settled Sessions, for this operation.
+      if (this.store.listLogicalSessionsByWorkspaceId(input.sourceWorktreeId).length
+        || this.store.selectOne("SELECT 1 FROM task_delivery_worktrees WHERE worktree_id=? LIMIT 1", [input.sourceWorktreeId])) {
+        throw deletionSafetyError("WORKTREE_IN_USE", "The stale registration still has a Session or Task binding.");
+      }
+      const jobs = this.store.listWorktreeIntegrationJobsForWorktree?.(input.repositoryId, input.sourceWorktreeId) ?? [];
+      if (jobs.some(job => ["queued", "running", "paused", "cancellation_requested", "replanning"].includes(job.status))) {
+        throw deletionSafetyError("ACTIVE_WORKTREE_INTEGRATION_JOB", "An integration job still uses this Worktree.");
+      }
+      // A detached HEAD may be the last reference to unmerged work. Do not
+      // remove that registration unless another ref already retains its commit.
+      if (tree.headOid && !(await this.gitOutput(input.workingDirectory,
+        ["for-each-ref", `--contains=${tree.headOid}`, "--format=%(refname)"])).trim()) {
+        throw deletionSafetyError("UNREFERENCED_WORKTREE_HEAD", "Preserve the Worktree commit in a branch before cleaning its registration.");
+      }
+      await this.runGit(input.workingDirectory, ["worktree", "remove", tree.path]);
+      this.store.upsertGitWorkspaceSnapshot({ ...snapshot, worktrees: snapshot.worktrees.map(entry =>
+        entry.path === tree.path ? { ...entry, availability: "missing", isPrunable: false, pruneReason: null } : entry) });
+      return { removed: true, registrationOnly: true, branchDeleted: false };
+    });
+  }
+
   async removeWorktreeForProject(input) {
-    this.store.assertStandaloneWorktreeMutation?.({worktreeIds:[input.sourceWorktreeId]});
+    this.store.assertStandaloneWorktreeMutation?.({worktreeIds:[input.sourceWorktreeId], taskDeletionOperationId: input.taskDeletionOperationId});
+    const operation = input.taskDeletionOperationId && this.store.getTaskDeletionOperation(input.taskDeletionOperationId);
+    const target = operation?.input?.target;
+    if (input.taskDeletionOperationId && (!target || operation.state !== "running" || operation.taskId !== target.taskId
+      || target.worktreeId !== input.sourceWorktreeId || target.repositoryId !== input.repositoryId)) {
+      throw deletionSafetyError("TASK_DELETE_SCOPE_INVALID", "删除作业不拥有这个 Worktree。");
+    }
+    if (target) {
+      const task = this.store.getTask(target.taskId);
+      const binding = this.store.getTaskDeliveryBinding?.(target.taskId);
+      if (task?.deletion_status !== "deleting" || (binding && binding.worktree_id !== input.sourceWorktreeId)) {
+        throw deletionSafetyError("TASK_DELETE_SCOPE_INVALID", "删除作业与当前 Task 的 Worktree 不符。");
+      }
+      for (const route of this.store.listLogicalSessionsByWorkspaceId(target.worktreeId)) {
+        const session = this.store.getSession(route.legacySessionId);
+        if ((route.taskId ?? session?.taskId) !== target.taskId || this.store.getSessionRuntimeBlocker?.(route.legacySessionId, { includeQueued: true })
+          || ["running", "blocked"].includes(session?.status)) throw deletionSafetyError("WORKTREE_IN_USE", "工作区仍被其他任务或运行中的会话占用。");
+      }
+    }
+    const activeJob = this.store.listWorktreeIntegrationJobsForWorktree?.(input.repositoryId,input.sourceWorktreeId)
+      .find(job=>["queued","running","paused","cancellation_requested","replanning"].includes(job.status))
+      ?? this.store.getLatestWorktreeIntegrationJob?.(input.repositoryId);
+    const reserved = activeJob?.details?.plan?.reservedWorktreeIds ?? activeJob?.details?.plan?.items?.map(item => item.worktreeId) ?? [];
+    if (activeJob && ["queued", "running", "paused", "cancellation_requested", "replanning"].includes(activeJob.status)
+      && reserved.includes(input.sourceWorktreeId)) {
+      throw deletionSafetyError("ACTIVE_WORKTREE_INTEGRATION_JOB", "仓库正执行 Git 作业，请等待结束后重试。");
+    }
+    const checkpoint = operation?.result?.cleanup ?? operation?.input?.resumeCleanup;
+    if (checkpoint?.worktreeRemoved) {
+      const snapshot = await this.operationSnapshot(input.workingDirectory, input);
+      if (snapshot.worktrees.some(tree => tree.availability !== "missing" && (tree.worktreeId === target.worktreeId || tree.path === target.path
+        || tree.branchName === target.branchName))) throw deletionSafetyError("TASK_DELETE_SCOPE_INVALID", "清理目标已被重新使用，请重新检查。");
+      const exists = await this.gitSucceeds(input.workingDirectory, ["show-ref", "--verify", `refs/heads/${target.branchName}`]);
+      if (exists) {
+        await this.runGit(input.workingDirectory, ["branch", "-D", target.branchName]);
+      }
+      this.store.upsertGitWorkspaceSnapshot(await this.operationSnapshot(input.workingDirectory, input));
+      return { ...checkpoint, removed: true, branchDeleted: true };
+    }
     const sourceWorktreeId = input.sourceWorktreeId;
     const source = this.store.getGitWorktree(sourceWorktreeId);
     if (!source || source.repositoryId !== input.repositoryId || source.isMain) {
@@ -1968,7 +2366,7 @@ export class GitWorkspaceManager {
       error.code = "WORKTREE_IN_USE";
       throw error;
     }
-    const snapshot = await createGitWorkspaceSnapshot(input.workingDirectory);
+    const snapshot = await this.operationSnapshot(input.workingDirectory, input);
     const main = snapshot.worktrees.find((worktree) => worktree.isMain && worktree.availability === "available");
     if (!main) throw new Error("The repository's main worktree is unavailable.");
     const currentSource = snapshot.worktrees.find((worktree) => {
@@ -1982,12 +2380,15 @@ export class GitWorkspaceManager {
     const operationState = await this.integrationOperationState(currentSource.path);
     const conflicts = (await this.gitOutput(currentSource.path, ["diff", "--name-only", "--diff-filter=U"]))
       .split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-    const merged = await this.gitSucceeds(main.path, [
+    let merged = await this.gitSucceeds(main.path, [
       "merge-base",
       "--is-ancestor",
       currentSource.headOid,
       main.headOid
     ]);
+    if (target && this.store.getTask(target.taskId)?.parent_task_id) {
+      merged = (await this.taskDeletionDeliveryComparison(target.taskId, currentSource)).delivered;
+    }
     let discardedCommitCount = 0;
     if (!merged) {
       const counts = await this.gitOutput(main.path, [
@@ -2007,31 +2408,30 @@ export class GitWorkspaceManager {
       else if (currentSource.isDetached || !currentSource.branchName) error = deletionSafetyError("WORKTREE_BRANCH_AMBIGUOUS", "The branch for this Worktree cannot be determined safely.");
       if (error) throw error;
     }
-    if (requiresForceConfirmation) {
-      const confirmedBranchName = String(input.confirmedBranchName ?? "");
-      const forceConfirmed = input.forceDeleteUnmerged === true
-        && input.acknowledgeIrrecoverable === true
-        && currentSource.branchName
-        && confirmedBranchName === currentSource.branchName;
-      if (!forceConfirmed) {
-        const error = new Error(
-          `The worktree has ${discardedCommitCount} commits that are not merged into main${dirty ? " and uncommitted changes" : ""}. Confirm the full branch name to delete it permanently.`
-        );
-        error.code = "UNMERGED_WORKTREE_CONFIRMATION_REQUIRED";
-        error.unmergedCommitCount = discardedCommitCount;
-        error.branchName = currentSource.branchName;
-        throw error;
-      }
-    }
-    await this.runGit(main.path, [
-      "worktree", "remove", ...(dirty ? ["--force"] : []), currentSource.path
-    ]);
+    await this.runGit(main.path, ["worktree", "remove", "--force", "--force", currentSource.path]);
+    if (operation) this.store.updateTaskDeletionOperation(operation.operationId, {
+      stage: "branch_cleanup", result: { ...operation.result, cleanup: { worktreeRemoved: true,
+        sourceWorktreeId, sourcePath: currentSource.path, sourceBranch: currentSource.branchName,
+        forced: requiresForceConfirmation, discardedCommitCount } }
+    });
     let branchDeleted = false;
     if (input.deleteBranch !== false && currentSource.branchName) {
-      await this.runGit(main.path, ["branch", merged ? "-d" : "-D", currentSource.branchName]);
+      // Parent-delivered commits need not be on main. The service has already
+      // verified the exact child ref, so -D here removes only that local ref.
+      await this.runGit(main.path, ["branch", target ? "-D" : merged ? "-d" : "-D", currentSource.branchName]);
       branchDeleted = true;
     }
-    const updated = await createGitWorkspaceSnapshot(main.path);
+    if (branchDeleted && this.store.selectAll) {
+      const operations=this.store.selectAll("SELECT startup_operation_id,worktree_base_context_json FROM work_session_startup_operations WHERE worktree_id=?",[sourceWorktreeId]);
+      for (const startup of operations) {
+        const base=startup.worktree_base_context_json && JSON.parse(startup.worktree_base_context_json);
+        const expectedRef=`refs/corptie/workspace-snapshots/${Buffer.from(startup.startup_operation_id).toString("hex")}`;
+        if(base?.snapshotRef===expectedRef && await this.gitOptionalOutput(main.path,["rev-parse","--verify",expectedRef])) {
+          await this.runGit(main.path,["update-ref","-d",expectedRef,base.baseCommitOid]);
+        }
+      }
+    }
+    const updated = await this.operationSnapshot(main.path, input);
     this.store.upsertGitWorkspaceSnapshot(updated);
     return {
       removed: true,
@@ -2075,7 +2475,7 @@ export class GitWorkspaceManager {
     } catch (error) {
       throw new Error(safeGitError(error, "Could not rebuild the missing worktree"));
     }
-    const updated = await createGitWorkspaceSnapshot(knownMain.path);
+    const updated = await this.operationSnapshot(source.path, input);
     this.store.upsertGitWorkspaceSnapshot(updated);
     const restored = updated.worktrees.find((worktree) => worktree.path === source.path);
     if (!restored || restored.availability !== "available") {
@@ -2100,7 +2500,7 @@ export class GitWorkspaceManager {
       return { requiresWorktreeMerge: false };
     }
 
-    const snapshot = await createGitWorkspaceSnapshot(activeCwd);
+    const snapshot = await this.operationSnapshot(activeCwd, { sourceWorktreeId: logical.activeWorkspaceId });
     if (snapshot.repository.id !== logical.repositoryId) {
       throw new Error("The active workspace no longer belongs to the registered repository.");
     }
@@ -2254,6 +2654,11 @@ export class GitWorkspaceManager {
   }
 
   async runGit(cwd, arguments_) {
+    if (gitArgumentsMutateWorkspace(arguments_)) return withWorktreeOperationLock(cwd,()=>this.runGitLocked(cwd,arguments_));
+    return this.runGitLocked(cwd,arguments_);
+  }
+
+  async runGitLocked(cwd, arguments_) {
     if (["commit", "merge", "cherry-pick", "rebase", "am"].includes(arguments_?.[0])) {
       await this.ensureCommitGate?.(cwd);
     }
@@ -2274,14 +2679,8 @@ export class GitWorkspaceManager {
 
   #repositoryIdForPath(cwd) {
     const target = resolve(cwd);
-    for (const repository of this.store.listGitRepositories?.() ?? []) {
-      const worktree = this.store.listGitWorktrees(repository.id).find((candidate) => {
-        return [candidate.path, candidate.canonicalPath].filter(Boolean)
-          .some((path) => resolve(path) === target);
-      });
-      if (worktree) return repository.id;
-    }
-    return null;
+    return this.store.selectOne?.("SELECT repository_id FROM git_worktrees WHERE path=? OR canonical_path=? LIMIT 1",
+      [target, target])?.repository_id ?? null;
   }
 
   async gitOutput(cwd, arguments_) {
@@ -2289,7 +2688,7 @@ export class GitWorkspaceManager {
       const result = await this.runGit(cwd, arguments_);
       return String(result?.stdout ?? "");
     } catch (error) {
-      throw new Error(safeGitError(error, `git ${arguments_[0]} failed`));
+      throw new Error(safeGitError(error, `git ${arguments_[0]} failed`), { cause: error });
     }
   }
 
@@ -2458,10 +2857,10 @@ function roundedMilliseconds(value) {
   return Math.round(value * 10) / 10;
 }
 
-function integrationGitError(code, message) {
+function integrationGitError(code, message, details = {}) {
   const error = new Error(message);
   error.code = code;
-  return error;
+  return Object.assign(error, details);
 }
 
 function requiredBranch(value) {
@@ -2484,5 +2883,7 @@ function safeGitError(error, fallback) {
     .filter((value, index, values) => value && values.indexOf(value) === index)
     .join("\n");
   const detail = diagnostics || String(error?.message ?? "Git command failed").trim();
-  return `${fallback}:\n${detail.slice(0, 2_000)}`;
+  const capture = error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+    ? `\nOutput capture limit reached: ${error.message}. The command output below is incomplete.\n` : "\n";
+  return redactInlineSecrets(`${fallback}:${capture}${detail}`);
 }

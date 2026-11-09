@@ -1,3 +1,18 @@
+// A send receipt confirms admission, not Turn completion. Providers retain
+// their compatible result fields, but product code consumes only this contract.
+export function validateConversationSendReceipt(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)
+    || typeof result.turnId !== "string" || !result.turnId.trim() || result.turnId !== result.turnId.trim()
+    || !["accepted", "unknown"].includes(result.delivery)) {
+    // Validation happens after dispatch: malformed acknowledgement is never
+    // evidence that sending did not happen and must not cause an automatic retry.
+    throw Object.assign(new Error("The Provider returned an invalid conversation send receipt; delivery may have occurred."), {
+      code: "PROVIDER_SEND_RECEIPT_INVALID", dispatchState: "unknown", stage: "provider_dispatch"
+    });
+  }
+  return result;
+}
+
 export const AGENT_PROVIDER_CAPABILITIES = Object.freeze({
   SESSION_CREATE: "session.create",
   SESSION_FORK: "session.fork",
@@ -214,9 +229,16 @@ export function normalizeTurnLivenessDescriptor(input) {
       { field: "descriptor.metadata.turnLiveness.supportsStatusProbe" }
     );
   }
+  if (input.managesConnectionRetries != null && typeof input.managesConnectionRetries !== "boolean") {
+    throw new AgentProviderContractError(
+      "descriptor.metadata.turnLiveness.managesConnectionRetries must be a boolean.",
+      { field: "descriptor.metadata.turnLiveness.managesConnectionRetries" }
+    );
+  }
   return Object.freeze({
     heartbeat,
-    supportsStatusProbe: input.supportsStatusProbe === true
+    supportsStatusProbe: input.supportsStatusProbe === true,
+    managesConnectionRetries: input.managesConnectionRetries === true
   });
 }
 

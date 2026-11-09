@@ -8,6 +8,12 @@ private struct PadWorktreeLocalStateTarget: Identifiable {
     var id: String { "\(repositoryID):\(worktree.worktreeId)" }
 }
 
+private struct PadPendingGitOperation: Identifiable {
+    let worktree: ClientManagedWorktree
+    let action: String
+    var id: String { "\(worktree.worktreeId):\(action)" }
+}
+
 private struct PadWorktreeLocalStateSheet: View {
     let repositoryID: String
     let worktree: ClientManagedWorktree
@@ -66,6 +72,9 @@ struct PadWorktreeManagementView: View {
     @State private var operationDraft: PadWorktreeOperationDraft?
     @State private var pendingDelete: ClientManagedWorktree?
     @State private var localStateWorktree: PadWorktreeLocalStateTarget?
+    @State private var markdownJob: ClientWorktreeJob?
+    @State private var rollbackJob: ClientWorktreeJob?
+    @State private var pendingGitOperation: PadPendingGitOperation?
     @State private var pendingSync: ClientManagedWorktree?
     @State private var pendingCleanup: [ClientManagedWorktree] = []
     @State private var showingPlan = false
@@ -116,6 +125,37 @@ struct PadWorktreeManagementView: View {
         .sheet(item: $localStateWorktree) { target in
             PadWorktreeLocalStateSheet(repositoryID: target.repositoryID, worktree: target.worktree, connection: connection)
         }
+        .sheet(item: $markdownJob) { target in
+            PadWorktreeMarkdownSheet(jobID: target.id, manager: manager, connection: connection)
+        }
+        .sheet(item: $rollbackJob) { selected in
+            WorktreeRollbackReviewView(prepare: {
+                try await manager.prepareRollback(jobID: selected.id, connection: connection)
+            }, confirm: { reviewID, discardChanges, includeAdditional in
+                try await manager.confirmRollback(jobID: selected.id, reviewID: reviewID,
+                    discardChanges: discardChanges, includeAdditionalCommits: includeAdditional, connection: connection)
+            }, resume: {
+                guard manager.job?.id == selected.id,
+                      await manager.jobAction("resume", connection: connection) else {
+                    throw NSError(domain: "CorptieWorktree", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: manager.errorMessage ?? "任务已变化，请返回当前任务。"])
+                }
+            })
+        }
+        .confirmationDialog("处理当前 Git 操作", isPresented: Binding(
+            get: { pendingGitOperation != nil }, set: { if !$0 { pendingGitOperation = nil } }
+        ), titleVisibility: .visible, presenting: pendingGitOperation) { request in
+            Button(request.action == "abort" ? "中止 Git 操作" : "继续 Git 操作",
+                   role: request.action == "abort" ? .destructive : nil) {
+                pendingGitOperation = nil
+                Task { await manager.recoverGitOperation(request.worktree, action: request.action, connection: connection) }
+            }
+            Button("返回", role: .cancel) {}
+        } message: { request in
+            Text("\(request.worktree.branchName ?? request.worktree.path)\n" + (request.action == "abort"
+                ? "中止当前未完成的 Git 操作会撤销该操作中的冲突解决修改。此操作不会撤销此前已经完成的其他合并。"
+                : "请先解决并暂存所有冲突。完成后可回到集成任务继续验证。"))
+        }
         .sheet(isPresented: $showingPlan, onDismiss: {
             planSheetDismissed = true
             if reviewAfterPlanDismissal {
@@ -145,20 +185,22 @@ struct PadWorktreeManagementView: View {
                     cancel: { await manager.jobAction("cancel", reviewedJob: job, connection: connection) })
             }
         }
-        .confirmationDialog("删除 Worktree？", isPresented: Binding(
+        .confirmationDialog(pendingDelete?.isStaleRegistration == true ? "清理失效登记？" : "删除 Worktree？", isPresented: Binding(
             get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }
         ), titleVisibility: .visible) {
             if let worktree = pendingDelete {
-                Button("删除 Worktree 与本地分支", role: .destructive) {
+                Button(worktree.isStaleRegistration ? "清理失效登记" : "删除 Worktree 与本地分支", role: .destructive) {
                     pendingDelete = nil
                     Task { await manager.delete(worktree, connection: connection) }
                 }
             }
             Button("取消", role: .cancel) { pendingDelete = nil }
         } message: {
-            Text("不会执行远程 Git 推送，也不会删除 GitHub 上的分支。")
+            Text(pendingDelete?.isStaleRegistration == true
+                ? "目录已不存在，将仅清理 Git 登记，保留本地分支。\n" + (pendingDelete?.path ?? "")
+                : "不会执行远程 Git 推送，也不会删除 GitHub 上的分支。")
         }
-        .confirmationDialog("清理已合并 Worktree？", isPresented: Binding(
+        .confirmationDialog(pendingCleanup.first?.isStaleRegistration == true ? "清理失效登记？" : "清理已合并 Worktree？", isPresented: Binding(
             get: { !pendingCleanup.isEmpty }, set: { if !$0 { pendingCleanup = [] } }
         ), titleVisibility: .visible) {
             Button("清理 \(pendingCleanup.count) 个 Worktree", role: .destructive) {
@@ -168,7 +210,7 @@ struct PadWorktreeManagementView: View {
             Button("取消", role: .cancel) { pendingCleanup = [] }
         } message: {
             Text("将删除：\n" + pendingCleanup.map { "\($0.branchName ?? $0.worktreeId) · \($0.path)" }.joined(separator: "\n")
-                + "\n不会删除远程分支。")
+                + (pendingCleanup.first?.isStaleRegistration == true ? "\n仅清理 Git 登记，保留本地分支。" : "\n不会删除远程分支。"))
         }
         .confirmationDialog("与主分支同步？", isPresented: Binding(
             get: { pendingSync != nil }, set: { if !$0 { pendingSync = nil } }
@@ -181,10 +223,18 @@ struct PadWorktreeManagementView: View {
             }
             Button("取消", role: .cancel) { pendingSync = nil }
         } message: { Text("将更新本地分支，不会推送到远程。") }
-        .alert("Worktree 操作提示", isPresented: Binding(
-            get: { manager.errorMessage != nil },
-            set: { if !$0 { manager.errorMessage = nil } }
-        )) { Button("好", role: .cancel) {} } message: { Text(manager.errorMessage ?? "") }
+        .safeAreaInset(edge: .bottom) {
+            if let error = manager.errorMessage {
+                VStack(alignment: .leading) {
+                    HStack {
+                        Text("Worktree 操作失败").font(.headline)
+                        Spacer()
+                        Button("关闭") { manager.errorMessage = nil }
+                    }
+                    WorktreeErrorDetailsView(error)
+                }.padding().background(.background)
+            }
+        }
         .alert("操作完成", isPresented: Binding(
             get: { manager.notice != nil }, set: { if !$0 { manager.notice = nil } }
         )) { Button("好", role: .cancel) {} } message: { Text(manager.notice ?? "") }
@@ -194,6 +244,9 @@ struct PadWorktreeManagementView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             if manager.loading || manager.planning { ProgressView().controlSize(.small) }
             Menu {
+                if let targets = manager.detail?.project.worktrees.filter({ $0.isStaleRegistration && deletionBlocker($0) == nil }), !targets.isEmpty {
+                    Button("清理 \(targets.count) 个失效登记", systemImage: "trash", role: .destructive) { pendingCleanup = targets }
+                }
                 if let targets = cleanupTargets, !targets.isEmpty {
                     Button("清理 \(targets.count) 个已合并 Worktree", systemImage: "trash", role: .destructive) {
                         pendingCleanup = targets
@@ -387,13 +440,21 @@ struct PadWorktreeManagementView: View {
                 .disabled(worktree.availability != "available")
                 .accessibilityIdentifier("worktree.local-state.inspect")
             let busy = manager.busyWorktreeIDs.contains(worktree.worktreeId)
+            if worktree.operationState != nil {
+                Button("继续 Git 操作", systemImage: "play.fill") {
+                    pendingGitOperation = .init(worktree: worktree, action: "continue")
+                }.disabled(busy || !worktree.conflictFiles.isEmpty)
+                Button("中止 Git 操作", systemImage: "xmark.circle", role: .destructive) {
+                    pendingGitOperation = .init(worktree: worktree, action: "abort")
+                }.disabled(busy)
+            }
             if let hierarchy=worktree.hierarchy {
                 ConversationHierarchyActions(hierarchy:hierarchy,api:{
                     ClientTaskHierarchyAPI(transport:try await connection.transport(),surface:.pairedDevice)
                 },prepare:{action,receipt in
                     await manager.prepareHierarchy(worktree,action:action,receiptID:receipt,connection:connection)
                     if manager.job?.status == "awaiting_confirmation" { showingJobReview=true }
-                })
+                },openParent:openSession)
             } else if worktree.isMain {
                 Button("提交主 Worktree 修改", systemImage: "checkmark.circle") { prepare(worktree) }
                     .disabled(busy || worktree.dirty != true)
@@ -412,7 +473,7 @@ struct PadWorktreeManagementView: View {
                 if let error = push.error { Text(error).font(.caption).foregroundStyle(.orange) }
             }
             Divider()
-            Button("删除 Worktree 与本地分支", systemImage: "trash", role: .destructive) {
+            Button(worktree.isStaleRegistration ? "清理失效登记" : "删除 Worktree 与本地分支", systemImage: "trash", role: .destructive) {
                 if deletionBlocker(worktree) == nil { pendingDelete = worktree }
                 else { manager.errorMessage = deletionBlocker(worktree) }
             }.disabled(busy || worktree.isMain)
@@ -464,7 +525,34 @@ struct PadWorktreeManagementView: View {
                 Text("\(job.progress.completed) / \(job.progress.total)").foregroundStyle(.secondary)
             }
             ProgressView(value: job.progress.fraction)
-            Text("阶段：\(job.phase)").font(.footnote).foregroundStyle(.secondary)
+            if job.phase == "canceled_rolled_back" {
+                Text("本轮合并已取消并回滚，来源 Worktree 提交已保留。")
+                    .font(.footnote).foregroundStyle(.green)
+            }
+            if job.status == "completed" {
+                if let evidence = job.completionEvidence {
+                    Text("\(evidence.branchName ?? "main") @ \(evidence.mainHead)\n\(evidence.verifiedAt)")
+                        .font(.caption.monospaced()).textSelection(.enabled)
+                } else {
+                    Text("后端报告完成，未提供核验证据。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+            if job.availableActions == nil, !["completed", "canceled", "cancelled"].contains(job.status) {
+                Text("后端未声明当前可用操作，请刷新状态；若仍未提供，请更新 Mac 服务端。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            if job.phase != "awaiting_integration_acceptance" {
+                Text("阶段：\(job.phase)").font(.footnote).foregroundStyle(.secondary)
+            }
+            if job.phase == "awaiting_integration_acceptance",let taskID=job.graphExecution?.acceptanceTaskID {
+                ConversationIntegrationAcceptance(taskID:taskID,api:{
+                    ClientTaskHierarchyAPI(transport:try await connection.transport(),surface:.pairedDevice)
+                },openParent:openSession) { status in
+                    Button("继续合并到主分支") { Task { await manager.jobAction("retry",connection:connection) } }
+                        .disabled(status?.mayPromote != true || manager.jobBusy)
+                }
+            }
             ForEach(job.plan.blockingRisks, id: \.code) { risk in
                 Label(risk.message, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.orange)
             }
@@ -484,30 +572,54 @@ struct PadWorktreeManagementView: View {
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.footnote).foregroundStyle(.orange)
             }
-            if let error = job.error { Text(error).font(.footnote).foregroundStyle(.red) }
+            if let diagnostic = job.diagnosticText ?? job.error {
+                WorktreeErrorDetailsView(diagnostic, summary: job.errorSummary)
+            }
             HStack {
                 if job.status == "awaiting_confirmation" {
                     Button("查看并确认计划", systemImage: "checkmark.seal") { showingJobReview = true }
                 }
-                if job.status == "paused" {
+                if job.supports("repreflight") {
+                    Button("重新校验并生成后续计划", systemImage: "arrow.triangle.merge") {
+                        Task {
+                            if await manager.jobAction("repreflight", connection: connection),
+                               manager.job?.status == "awaiting_confirmation" { showingJobReview = true }
+                        }
+                    }
+                } else if job.supports("resolve_commit_policy") || job.supports("resolve_commit_policy_residue") {
+                    Button("处理 Markdown 并继续", systemImage: "doc.badge.gearshape") {
+                        markdownJob = job
+                    }
+                    .accessibilityIdentifier("worktree.commit-policy.open")
+                } else if job.status == "paused",job.phase != "awaiting_integration_acceptance" {
+                    if job.supports("retry") {
                     Button("重新验证并继续", systemImage: "arrow.clockwise") {
                         Task { await manager.jobAction("retry", connection: connection) }
                     }
-                    if job.hasMergeConflict {
-                        Button("交给 Agent 解决冲突", systemImage: "person.crop.circle.badge.gearshape") {
+                    }
+                    if job.supports("resolve_conflict_with_agent") {
+                        Button("交给角色解决冲突", systemImage: "person.crop.circle.badge.gearshape") {
                             Task { await manager.jobAction("resolve-conflict", connection: connection) }
                         }
                     }
                 }
+                if job.supports("resume") {
+                    Button("继续合并") { Task { await manager.jobAction("resume", connection: connection) } }
+                }
                 if job.canCancel {
-                    Button("取消任务", role: .destructive) {
-                        Task { await manager.jobAction("cancel", connection: connection) }
+                    Button(job.supports("rollback") ? "查看回滚范围" : "取消任务", role: .destructive) {
+                        if job.plan.operationType == "sync" || job.status == "awaiting_confirmation" {
+                            Task { await manager.jobAction("cancel", connection: connection) }
+                        } else {
+                            rollbackJob = job
+                        }
                     }
                 }
             }.disabled(manager.jobBusy || manager.planning)
             if let session = job.conflictResolution?.sessionId ?? job.conflictAutomation?.sessionId {
                 Button("查看冲突处理会话", systemImage: "bubble.left.and.bubble.right") { openSession(session) }
             }
+            if let recovery = job.recovery { Text(recovery.message).font(.footnote).textSelection(.enabled) }
         }
     }
 
@@ -522,13 +634,14 @@ struct PadWorktreeManagementView: View {
     }
 
     private var cleanupTargets: [ClientManagedWorktree]? {
-        manager.detail?.project.worktrees.filter { !$0.isMain && deletionBlocker($0) == nil }
+        manager.detail?.project.worktrees.filter { !$0.isMain && !$0.isStaleRegistration && deletionBlocker($0) == nil }
     }
 
     private func deletionBlocker(_ worktree: ClientManagedWorktree) -> String? {
         if worktree.hierarchy != nil { return "父子 Worktree 仍有集成依赖，暂不能通过独立清理入口删除。" }
         if let blocker = worktree.deletionBlocker { return blocker.reason }
         if worktree.isMain { return "主 Worktree 不能删除。" }
+        if worktree.isStaleRegistration, worktree.cleanupAction?.available == true { return nil }
         if worktree.availability != "available" { return "Worktree 当前不可用。" }
         if worktree.isLocked { return worktree.lockReason ?? "Worktree 已锁定。" }
         if worktree.operationState != nil { return "Worktree 正在进行 Git 操作。" }
@@ -540,6 +653,7 @@ struct PadWorktreeManagementView: View {
     }
 
     private func worktreeLabel(_ worktree: ClientManagedWorktree) -> String {
+        if worktree.isStaleRegistration { return "登记失效" }
         if worktree.availability != "available" { return "不可用" }
         if worktree.operationState != nil { return "操作中" }
         if worktree.dirty == true { return "未提交" }
@@ -603,7 +717,7 @@ struct PadWorktreeManagementView: View {
     private func jobStatus(_ value: String) -> String {
         ["awaiting_confirmation": "等待确认", "queued": "已排队", "running": "执行中",
          "paused": "已暂停", "completed": "已完成", "failed": "失败",
-         "cancellation_requested": "正在取消", "cancelled": "已取消", "replanning": "正在重建计划"][value] ?? value
+         "cancellation_requested": "正在取消", "canceled": "已取消", "cancelled": "已取消", "replanning": "正在重建计划"][value] ?? value
     }
 
     private func card<Content: View>(_ title: String, systemImage: String, @ViewBuilder content: () -> Content) -> some View {

@@ -25,6 +25,18 @@ export function handleProviderModelsHttpRequest({ request, response, url, sessio
 export function handleProviderSetupHttpRequest({
   request, response, url, agentProviderRegistry, firstRunSetup, readJson, sendJson, errorStatus, store
 }) {
+  const accountsMatch = url.pathname.match(/^\/providers\/([^/]+)\/accounts$/);
+  if (accountsMatch && ["GET", "POST"].includes(request.method)) {
+    Promise.resolve().then(async () => firstRunSetup.accountOperation(decodeURIComponent(accountsMatch[1]),
+      request.method === "POST" ? await readJson(request) : null))
+      .then(result => sendJson(response, 200, result))
+      .catch(error => sendJson(response, error.statusCode ?? 400, {
+        error: error.code && !error.statusCode ? "无法完成账号操作，请检查本地运行目录和权限。" : error.message,
+        code: error.code ?? null
+      }));
+    return true;
+  }
+
   const providerConfigurationActionMatch = url.pathname.match(
     /^\/providers\/([^/]+)\/(configuration\/validate|connection-test)$/
   );
@@ -55,8 +67,11 @@ export function handleProviderSetupHttpRequest({
       .catch((error) => sendJson(response, 400, { error: error.message }));
     return true;
   }
-  if (request.method === "POST" && ["/first-run/provider", "/first-run/check", "/first-run/check/cancel", "/first-run/programs", "/first-run/authentication", "/first-run/assistant", "/first-run/complete"].includes(url.pathname)) {
+  if (request.method === "POST" && ["/first-run/settings", "/first-run/provider", "/first-run/credentials", "/first-run/program", "/first-run/check", "/first-run/check/cancel", "/first-run/programs", "/first-run/authentication", "/first-run/assistant", "/first-run/complete"].includes(url.pathname)) {
     readJson(request).then(async (input) => {
+      if (url.pathname === "/first-run/settings") return firstRunSetup.saveSettings(input);
+      if (url.pathname === "/first-run/program") return firstRunSetup.setProgram(input);
+      if (url.pathname === "/first-run/credentials") return firstRunSetup.saveCredentialSource(input);
       if (url.pathname === "/first-run/programs") return firstRunSetup.scanPrograms(input);
       if (url.pathname === "/first-run/check/cancel") return firstRunSetup.cancelCheck(input);
       if (url.pathname === "/first-run/check") return firstRunSetup.check(input);

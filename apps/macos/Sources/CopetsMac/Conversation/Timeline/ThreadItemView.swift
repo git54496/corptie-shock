@@ -459,7 +459,7 @@ struct ThreadItemView: View {
     }
 
     private var collaborationPresentationText: String {
-        nonEmpty(item.presentationText) ?? "协作消息正文不可用"
+        nonEmpty(item.presentationText) ?? nonEmpty(item.text) ?? L10n("协作消息正文不可用")
     }
 
     private var collaborationSourceSessionName: String {
@@ -485,7 +485,7 @@ struct ThreadItemView: View {
             name: item.collaborationSourceWorkName,
             id: item.collaborationSourceWorkId,
             fallback: L10n("来源 Work")
-        ) ?? L10n("来源 Work")
+        ) ?? L10n("未关联 Work")
     }
 
     private var collaborationTargetWorkName: String {
@@ -493,7 +493,7 @@ struct ThreadItemView: View {
             name: item.collaborationTargetWorkName,
             id: item.collaborationTargetWorkId,
             fallback: L10n("目标 Work")
-        ) ?? L10n("目标 Work")
+        ) ?? L10n("未关联 Work")
     }
 
     private var collaborationKindLabel: String {
@@ -815,7 +815,7 @@ struct ThreadItemView: View {
         case "userMessage":
             return L10n("User")
         case "agentMessage":
-            return L10n("Agent")
+            return L10n("Session")
         default:
             return L10n("System")
         }
@@ -902,6 +902,7 @@ struct ThreadItemView: View {
                 return L10nFormat("Queued · position %lld", Int64(position))
             }
             return L10n("Queued for processing")
+        case .preparing: return L10n("Preparing")
         case .processing: return L10n("Processing")
         case .failed: return L10n("Processing failed")
         case .cancelled: return L10n("Cancelled before processing")
@@ -916,6 +917,7 @@ struct ThreadItemView: View {
     private var userMessageStatusIcon: String {
         switch item.authoritativeUserMessageState {
         case .queued: "clock.fill"
+        case .preparing: "hourglass"
         case .processing: "clock.arrow.circlepath"
         case .failed: "exclamationmark.circle.fill"
         case .cancelled: "xmark.circle.fill"
@@ -925,7 +927,7 @@ struct ThreadItemView: View {
 
     private var userMessageStatusColor: Color {
         switch item.authoritativeUserMessageState {
-        case .queued: CorptiePalette.amber
+        case .queued, .preparing: CorptiePalette.amber
         case .processing: CorptiePalette.running
         case .failed, .cancelled: .red
         case .consumed, .none: CorptiePalette.secondaryText

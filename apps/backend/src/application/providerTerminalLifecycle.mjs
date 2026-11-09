@@ -1,6 +1,6 @@
 export function createProviderTerminalLifecycle({
-  store, emitEvent, recordWorkSettled, settleEntityTaskFromSession,
-  collaborationCore, refreshWorkspaceInventoryAfterTurn,
+  store, emitEvent, recordWorkSettled, sessionMailbox, settleEntityTaskFromSession,
+  collaborationCore,
   continuePendingWorkspaceTransition, continuePendingProviderSwitch,
   resumeWorkAfterTransition, scheduleAgentWorkDrain
 }) {
@@ -14,8 +14,9 @@ export function createProviderTerminalLifecycle({
     const failed = terminalStatus === "failed";
     const cancelled = terminalStatus === "cancelled";
 
+    const runningWork = store.getRunningAgentTaskForSession(nextSession.id);
     const completedWork = store.getAgentTaskForTurn(nextSession.id, event.turnId)
-      ?? store.getRunningAgentTaskForSession(nextSession.id);
+      ?? (runningWork && (!runningWork.targetTurnId || runningWork.targetTurnId === event.turnId) ? runningWork : null);
     if (completedWork?.status === "running") {
       const updatedWork = store.updateAgentTask(completedWork.taskId, {
         status: failed ? "failed" : (cancelled ? "cancelled" : "completed"),
@@ -27,13 +28,13 @@ export function createProviderTerminalLifecycle({
       });
       recordWorkSettled(updatedWork);
     }
+    sessionMailbox?.settleAdopted(nextSession.id, event.turnId, terminalStatus);
     settleEntityTaskFromSession(nextSession);
     // Recovered execution state does not prove the final business result was
     // delivered. Require user review before advancing queued work.
     if (event.payload?.suppressAutomaticContinuation === true) return;
     const agent = collaborationCore.getAgentForSession(nextSession.id);
     if (!failed && !cancelled) {
-      refreshWorkspaceInventoryAfterTurn(logicalRoute);
       const continuation = continuePendingWorkspaceTransition(logicalRoute, event.turnId);
       const providerSwitch = continuePendingProviderSwitch(logicalRoute);
       resumeWorkAfterTransition(continuation, () => {

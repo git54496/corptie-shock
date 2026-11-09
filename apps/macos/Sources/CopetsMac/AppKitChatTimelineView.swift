@@ -22,6 +22,8 @@ struct AppKitChatTimelineView: NSViewRepresentable {
     var onPositionChange: (AppKitChatTimelinePosition) -> Void = { _ in }
     var searchRowID: String? = nil
     var searchRowRevision = 0
+    var navigationRowID: String? = nil
+    var navigationRevision = 0
     var scrollToTurnID: String? = nil
     var scrollToTurnRevision: Int = 0
     var historyRequestEpoch: Int = 0
@@ -31,6 +33,7 @@ struct AppKitChatTimelineView: NSViewRepresentable {
     /// The full-height clip view lets earlier rows pass beneath the glass.
     var bottomClearance: CGFloat = 0
     var reservesVerticalScrollerGutter = true
+    var trailingScrollerExtension: CGFloat = 0
 
     nonisolated static func rowIndex(forTurnID turnID: String, in rows: [AppKitChatTimelineRow]) -> Int? {
         rows.firstIndex(where: {
@@ -76,6 +79,7 @@ struct AppKitChatTimelineView: NSViewRepresentable {
         let tableView = Self.makeTableView()
         let scrollView = Self.makeScrollView(tableView: tableView)
 
+        (scrollView as? FirstLayoutRestoringScrollView)?.trailingScrollerExtension = trailingScrollerExtension
         context.coordinator.setReservesVerticalScrollerGutter(reservesVerticalScrollerGutter)
         context.coordinator.attach(tableView: tableView, scrollView: scrollView)
         context.coordinator.setProcessClockEnabled(canAdvanceProcessClock)
@@ -91,6 +95,7 @@ struct AppKitChatTimelineView: NSViewRepresentable {
         context.coordinator.lastScrollToTurnRevision = scrollToTurnRevision
         context.coordinator.lastHistoryRequestEpoch = historyRequestEpoch
         context.coordinator.applySearchTarget(rowID: searchRowID, revision: searchRowRevision)
+        context.coordinator.applyMessageNavigation(rowID: navigationRowID, revision: navigationRevision)
         return scrollView
     }
 
@@ -112,18 +117,16 @@ struct AppKitChatTimelineView: NSViewRepresentable {
         tableView.backgroundColor = .clear
         tableView.gridStyleMask = []
         tableView.intercellSpacing = NSSize(width: 0, height: 6)
-        tableView.rowHeight = 30
-        // Every row has an exact cached height from the delegate. Automatic
-        // row heights make NSTableView assign its 120pt estimate to offscreen
-        // rows; a direct scrollbar jump can then land in an unmaterialized
-        // blank region before those estimates are corrected.
-        tableView.usesAutomaticRowHeights = false
+        tableView.rowHeight = 100 // SDK estimate for unmounted rows.
+        tableView.usesAutomaticRowHeights = true
         tableView.selectionHighlightStyle = .none
         tableView.allowsEmptySelection = true
         tableView.focusRingType = .none
-        tableView.columnAutoresizingStyle = .noColumnAutoresizing
+        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         let column = NSTableColumn(identifier: Coordinator.columnIdentifier)
-        column.resizingMask = []
+        column.resizingMask = .autoresizingMask
+        column.minWidth = 0
+        column.maxWidth = CGFloat.greatestFiniteMagnitude
         tableView.addTableColumn(column)
         return tableView
     }
@@ -143,6 +146,8 @@ struct AppKitChatTimelineView: NSViewRepresentable {
         scrollView.verticalScrollElasticity = .none
         scrollView.horizontalScrollElasticity = .none
         let documentView = TimelineScrollDocumentView()
+        documentView.autoresizingMask = [.width]
+        tableView.autoresizingMask = [.width]
         documentView.addSubview(tableView)
         scrollView.documentView = documentView
         return scrollView
@@ -156,6 +161,7 @@ struct AppKitChatTimelineView: NSViewRepresentable {
             initialPosition: initialPosition,
             deferReloadUntilRowsArrive: true
         )
+        (scrollView as? FirstLayoutRestoringScrollView)?.trailingScrollerExtension = trailingScrollerExtension
         context.coordinator.setReservesVerticalScrollerGutter(reservesVerticalScrollerGutter)
         context.coordinator.updateSkin(skin)
         context.coordinator.updateBaseDirectory(baseDirectory)
@@ -180,6 +186,7 @@ struct AppKitChatTimelineView: NSViewRepresentable {
             context.coordinator.jumpToLatest()
         }
         context.coordinator.applySearchTarget(rowID: searchRowID, revision: searchRowRevision)
+        context.coordinator.applyMessageNavigation(rowID: navigationRowID, revision: navigationRevision)
         if context.coordinator.lastScrollToTurnRevision != scrollToTurnRevision {
             context.coordinator.lastScrollToTurnRevision = scrollToTurnRevision
             if let scrollToTurnID { context.coordinator.scrollToTurn(scrollToTurnID) }
@@ -195,6 +202,6 @@ struct AppKitChatTimelineView: NSViewRepresentable {
 
 /// The table owns only message rows. Its enclosing document owns scrollable
 /// clearance under the overlaid header and composer.
-private final class TimelineScrollDocumentView: NSView {
+final class TimelineScrollDocumentView: NSView {
     override var isFlipped: Bool { true }
 }

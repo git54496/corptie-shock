@@ -7,6 +7,7 @@ const DOMAIN_PROFILES = Object.freeze({
     ["artifact", "artifacts", "artifact management", "work artifact", "产物", "工件", "文档"],
     "corptie_artifact_search"
   ),
+  mailbox: profile(["mailbox", "inbox", "信箱", "收件箱", "外来消息", "领取消息"], "corptie_mailbox_list"),
   collaboration: profile(
     [
       "collaboration", "channel", "peer session", "peer message", "send message", "@session",
@@ -35,6 +36,7 @@ const DOMAIN_PROFILES = Object.freeze({
     ["skill", "skills", "agent skill", "技能", "能力包"],
     "corptie_skill_search"
   ),
+  "execution-checklist": profile(["execution checklist", "todo", "清单", "执行清单", "待办"], "corptie_execution_checklist_manage"),
   "scheduled-tasks": profile(
     [
       "scheduled-tasks", "scheduled task", "scheduled tasks", "automation", "automations",
@@ -46,7 +48,7 @@ const DOMAIN_PROFILES = Object.freeze({
     "corptie_automations_create"
   ),
   platform: profile(
-    ["platform", "platform administration", "Corptie administration", "平台", "平台管理"],
+    ["platform", "platform administration", "Corptie administration", "role", "roles", "role management", "agent management", "角色", "角色管理", "平台", "平台管理"],
     "corptie_platform_capabilities"
   ),
   "work-chat": profile(
@@ -73,6 +75,11 @@ const COMPATIBILITY = Object.freeze({
 });
 
 const EXAMPLE_OVERRIDES = Object.freeze({
+  corptie_task_dispatch: Object.freeze({ items: [{ action: "create", text: "Implement the scoped change and report the result.", idempotency_key: "dispatch:example", creation: { title: "Child_task", agent_id: "agent:example" } }] }),
+  corptie_collaboration_tasks_create: Object.freeze({
+    title:"Child_task",agent_id:"agent:example",parent_task_id:"task:example",
+    idempotency_key:"child:example"
+  }),
   corptie_artifact_materialize: Object.freeze({
     artifact_id: "artifact:example", version: 1, content_hash: "0".repeat(64), path: "artifacts/example.md"
   }),
@@ -109,7 +116,7 @@ export function toolDiscoveryContract(entry, domainProfile = domainDiscoveryProf
     recommended: entry.canonicalName === domainProfile.recommendedTool,
     stability: compatibility?.status ?? "canonical",
     compatibility,
-    sideEffect: sideEffect(entry.canonicalName),
+    sideEffect: entry.executionEffect === "read" ? false : sideEffect(entry.canonicalName),
     inputSchema: schema,
     fieldDescriptions: fieldDescriptions(schema),
     constraints: Object.freeze({
@@ -153,9 +160,10 @@ export function parseDiscoveryIntent(intent) {
   const create = /\b(?:create|new)\b|创建|新建/u.test(text);
   const task = /tasks?|任务/u.test(text);
   const channel = /channel|send message|发消息|发送.*消息|会话.*消息/u.test(text);
+  const role = /\broles?\b|角色|agent management|管理.*agent|agent.*(?:管理|配置)/u.test(text);
   const stopwords = new Set(["the", "for", "with", "and", "current", "call", "tool", "in", "to", "a", "an", "of"]);
   return { text, terms: [...new Set(positive.split(/\s+/u).filter((term) => term.length > 1 && !stopwords.has(term)))],
-    excludesAutomation, operation: channel ? "channel" : automation ? "automation" : create && task ? "task-create" : null };
+    excludesAutomation, operation: channel ? "channel" : automation ? "automation" : create && task ? "task-create" : role ? "role-management" : null };
 }
 
 export function rankDiscoveryCandidates(candidates, { intent = "", domainHint = "" } = {}) {
@@ -177,8 +185,11 @@ export function rankDiscoveryCandidates(candidates, { intent = "", domainHint = 
     })) score += 1;
     if (!exact && !aliasExact) {
       if (query.operation === "task-create" && name === "corptie_collaboration_tasks_create") score += 100;
+      if (query.operation === "task-create" && name === "corptie_collaboration_tasks_create_batch"
+        && /(?:batch|bulk|批量|多个|[2-9二三四五六七八九十]\s*个)/iu.test(String(intent))) score += 120;
       if (query.operation === "channel" && name === "corptie_collaboration_channel_open") score += 100;
       if (query.operation === "automation" && name === "corptie_automations_create") score += 100;
+      if (query.operation === "role-management" && name === "corptie_platform_agents_manage") score += 100;
       if ((query.excludesAutomation || query.operation === "task-create") && domainId === "scheduled-tasks") score = 0;
     }
     const hintMatched = Boolean(hint && (domainText.includes(hint) || normalizeDiscoveryText(domainId) === hint));

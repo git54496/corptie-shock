@@ -22,7 +22,8 @@ struct DetailHeaderView: View {
             projectStatus: supplementaryData.selectedSessionID == session?.id ? supplementaryData.selectedProjectWorktreeStatus : nil,
             showsHistoricalThread: backendClient.sessionSelectionController.selectedSessionID == session?.id && backendClient.viewingHistoricalThreadId != nil,
             hasPendingScheduledWake: session?.taskId.flatMap { id in entityClient.tasks.first { $0.id == id } }?.hasPendingScheduledWake == true,
-            providers: modelCatalog.agentProviders)
+            providers: modelCatalog.agentProviders,
+            workName: session?.workId.flatMap { AppStateStore.shared.work($0)?.name })
     }
 }
 
@@ -40,9 +41,12 @@ struct SessionConversationHeaderSurface: View {
     private let backendClient: BackendClient
     @Environment(\.isLiquidGlass) private var isLiquidGlass
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showsMailbox = false
     @State private var didCopySessionTitle = false
     @State private var sessionTitleCopyFeedbackTask: Task<Void, Never>?
     @State private var didCopyWorkspacePath = false
+    @State private var workspacePathCopyFeedbackTask: Task<Void, Never>?
     struct ProjectStatusSnapshot {
         let serverID: String
         let sessionID: String?
@@ -61,17 +65,19 @@ struct SessionConversationHeaderSurface: View {
     private let hasPendingScheduledWake: Bool
     private let providers: [AgentProviderDescriptor]
     private let renderInputs: SessionPageRenderInputs?
+    private let workName: String?
 
     init(session: TaskSession?, historicalWorkspacePath: String? = nil,
          activity: ConversationDetailPresentationActivity? = nil, backendClient: BackendClient,
          projectStatus: ProjectWorktreeStatusResponse?, showsHistoricalThread: Bool,
          hasPendingScheduledWake: Bool, providers: [AgentProviderDescriptor],
-         renderInputs: SessionPageRenderInputs? = nil) {
+         renderInputs: SessionPageRenderInputs? = nil, workName: String? = nil) {
         self.session = session; self.historicalWorkspacePath = historicalWorkspacePath
         self.activity = renderInputs?.activity ?? activity; self.backendClient = backendClient
         self.incomingProjectStatus = projectStatus; self.showsHistoricalThread = showsHistoricalThread
         self.hasPendingScheduledWake = hasPendingScheduledWake; self.providers = providers
         self.renderInputs = renderInputs
+        self.workName = workName ?? renderInputs?.workName
     }
 
     var body: some View {
@@ -81,7 +87,7 @@ struct SessionConversationHeaderSurface: View {
                 guard let status else { return }
                 lastProjectStatus = ProjectStatusSnapshot(serverID: backendClient.baseURL.absoluteString, sessionID: session?.id, workspacePath: workspacePath, status: status)
             }
-            .onReceive(backendClient.gitHubPushController.$preparation.dropFirst()) { preparation in
+            .onReceive(backendClient.gitHubPushController.$preparation.dropFirst().whilePresented(isPresentationActive)) { preparation in
                 guard canAct else { return }
                 if let preparation {
                     GitHubPushConfirmationWindowManager.shared.show(
@@ -92,19 +98,43 @@ struct SessionConversationHeaderSurface: View {
                     GitHubPushConfirmationWindowManager.shared.close()
                 }
             }
+            .sheet(isPresented: $showsMailbox) {
+                if let session {
+                    VStack(spacing: 12) {
+                        HStack {
+                            Text("会话信箱").font(.headline)
+                            Spacer()
+                            Button("关闭") { showsMailbox = false }
+                        }
+                        SessionMailboxPanel(sessionID: session.id,
+                            pendingRevision: "\(session.mailboxPendingCount ?? 0):\(session.executionStatus ?? session.status.rawValue)",
+                            activity: activity)
+                    }
+                    .padding(16)
+                    .frame(minWidth: 520, idealWidth: 620, minHeight: 400, idealHeight: 560)
+                }
+            }
             .onChange(of: session?.id) { _, _ in
+                showsMailbox = false
                 sessionTitleCopyFeedbackTask?.cancel()
                 sessionTitleCopyFeedbackTask = nil
                 didCopySessionTitle = false
+                workspacePathCopyFeedbackTask?.cancel(); workspacePathCopyFeedbackTask = nil
+                didCopyWorkspacePath = false
             }
             .onChange(of: isPresentationActive) { _, active in
                 guard !active else { return }
+                showsMailbox = false
                 sessionTitleCopyFeedbackTask?.cancel(); sessionTitleCopyFeedbackTask = nil
+                workspacePathCopyFeedbackTask?.cancel(); workspacePathCopyFeedbackTask = nil
                 didCopySessionTitle = false; didCopyWorkspacePath = false
             }
             .onDisappear {
+                showsMailbox = false
                 sessionTitleCopyFeedbackTask?.cancel()
                 sessionTitleCopyFeedbackTask = nil
+                workspacePathCopyFeedbackTask?.cancel(); workspacePathCopyFeedbackTask = nil
+                didCopySessionTitle = false; didCopyWorkspacePath = false
             }
     }
 
@@ -118,7 +148,7 @@ struct SessionConversationHeaderSurface: View {
     }
 
     private var headerControlRow: some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .top, spacing: 10) {
             HStack {
                 if isLiquidGlass {
                     Button {
@@ -132,34 +162,40 @@ struct SessionConversationHeaderSurface: View {
                             .frame(width: 28, height: 28)
                     }
                     .buttonStyle(.plain)
-                    .platformGlassSurface(in: Circle(), interactive: true)
+
                     .help(L10n("Back to task list"))
                 }
             }
-            .frame(width: detailColumnVisibility == nil ? 66 : 104, alignment: .leading)
+            .frame(width: isLiquidGlass ? 28 : 0, alignment: .leading)
 
-            HStack {
-                Spacer(minLength: 0)
-                headerIdentityCapsule
-                Spacer(minLength: 0)
-            }
-            .frame(maxWidth: .infinity)
+            headerIdentityCapsule
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                if let action = primaryHeaderAction { headerActionButton(action) }
                 if session != nil {
                     if let visibility = detailColumnVisibility {
+                        Button {
+                            guard canAct else { return }
+                            showsMailbox = true
+                        } label: {
+                            HStack(spacing: 2) {
+                                Image(systemName: "envelope")
+                                if let count = session?.mailboxPendingCount, count > 0 { Text(count > 99 ? "99+" : "\(count)").font(.caption2) }
+                            }.frame(minWidth: 28, minHeight: 28)
+                        }.buttonStyle(.plain).help("打开会话信箱").accessibilityLabel("打开会话信箱")
                         Button {
                             visibility.wrappedValue.toggle()
                         } label: {
                             Image(systemName: "sidebar.right")
                                 .font(.system(size: 12, weight: .semibold))
                                 .frame(width: 28, height: 28)
-                                .platformGlassSurface(in: Circle(), interactive: true)
                         }
                         .buttonStyle(.plain)
                         .help(L10n(visibility.wrappedValue ? "Hide Detail" : "Show Detail"))
                         .accessibilityLabel(L10n(visibility.wrappedValue ? "Hide Detail" : "Show Detail"))
                         .accessibilityIdentifier("session.detail.toggle-column")
+                        .background(DetailToggleClickTarget())
                     }
                     Button {
                         guard canAct, let session else { return }
@@ -168,7 +204,6 @@ struct SessionConversationHeaderSurface: View {
                         Image(systemName: "macwindow.on.rectangle")
                             .font(.system(size: 12, weight: .semibold))
                             .frame(width: 28, height: 28)
-                            .platformGlassSurface(in: Circle(), interactive: true)
                     }
                     .buttonStyle(.plain)
                     .help(L10n("Open chat in floating window"))
@@ -176,18 +211,7 @@ struct SessionConversationHeaderSurface: View {
                     .accessibilityIdentifier("session.detail.detach")
 
                     Menu {
-                        Button(action: openWorkspaceInVSCode) {
-                            Label(
-                                L10n("Open in Visual Studio Code"),
-                                systemImage: "chevron.left.forwardslash.chevron.right"
-                            )
-                        }
-                        .disabled(workspacePath == nil)
-
-                        Button(action: openWorkspaceInFinder) {
-                            Label(L10n("Open in Finder"), systemImage: "folder")
-                        }
-                        .disabled(workspacePath == nil)
+                        headerActionMenu
                     } label: {
                         Image(systemName: "ellipsis")
                             .font(.system(size: 13, weight: .semibold))
@@ -196,108 +220,111 @@ struct SessionConversationHeaderSurface: View {
                     .menuStyle(.borderlessButton)
                     .menuIndicator(.hidden)
                     .frame(width: 28, height: 28)
-                    .platformGlassSurface(in: Circle(), interactive: true)
+
                     .help(L10n("Open workspace"))
                     .accessibilityLabel(L10n("Open workspace"))
                     .accessibilityIdentifier("session.detail.actions")
                 }
             }
-            .frame(width: detailColumnVisibility == nil ? 66 : 104, alignment: .trailing)
+            .fixedSize(horizontal: true, vertical: false)
+            .foregroundStyle(.secondary)
         }
     }
 
+    private var showsContinuationFailure: Bool {
+        session?.external?.workspace?.continuationState == "failed"
+    }
+
     private var headerIdentityCapsule: some View {
-        VStack(alignment: .center, spacing: 3) {
+        VStack(alignment: .leading, spacing: 2) {
             if let selectedTitle {
                 Button {
                     copySessionTitle(selectedTitle)
                 } label: {
                     HStack(spacing: 4) {
                         Text(selectedTitle)
-                            .font(.title3.weight(.semibold))
+                            .font(WorkbenchTypography.font(for: .conversationTitle))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
-                            .minimumScaleFactor(0.75)
                             .truncationMode(.tail)
-                            .multilineTextAlignment(.center)
+                            .multilineTextAlignment(.leading)
                             .accessibilityAddTraits(.isHeader)
                             .accessibilityIdentifier("conversation-task-title")
                         if hasPendingScheduledWake {
                             ConsoleScheduledWakeIcon(isActive: scenePhase == .active && isPresentationActive)
                                 .accessibilityIdentifier("conversation-task-scheduled-wake")
                         }
+                        // Status badges ride on the title row. A separate row
+                        // would make the capsule taller than the fixed header
+                        // accessory height and clip the path line underneath.
+                        if showsHistoricalThread {
+                            Label(L10n("Read-only history"), systemImage: "clock.arrow.circlepath")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: true, vertical: false)
+                        } else if showsContinuationFailure {
+                            Label(L10n("Worktree continuation failed"), systemImage: "exclamationmark.triangle.fill")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        copyConfirmation(visible: didCopySessionTitle)
                     }
                 }
                 .buttonStyle(.plain)
                 .help(L10n("Click to copy Session title"))
                 .accessibilityLabel(L10n("Copy Session title"))
                 .accessibilityValue(selectedTitle)
-
-                if didCopySessionTitle {
-                    Label(L10n("Copied"), systemImage: "checkmark")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(CorptiePalette.connected)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(CorptiePalette.connected.opacity(0.10), in: Capsule())
-                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
-                        .accessibilityHidden(true)
-                }
-            }
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                if showsHistoricalThread {
-                    Label(L10n("Read-only history"), systemImage: "clock.arrow.circlepath")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.orange)
-                } else if session?.external?.workspace?.continuationState == "failed" {
-                    Label(L10n("Worktree continuation failed"), systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.orange)
-                }
+                // 14pt text only needs ~17pt of line height. A 28pt box was
+                // padding the header vertically now that the metadata line
+                // sits 2pt below the title.
+                .frame(height: 20)
             }
             HStack(alignment: .center, spacing: 6) {
                 if let selectedSession = session {
                     SessionHeaderProviderIdentity(session: selectedSession, providers: providers)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(WorkbenchTypography.font(for: .conversationMetadata))
                 }
                 if let cwd = workspacePath, !cwd.isEmpty {
                     Button(action: copyWorkspacePath) {
                         HStack(spacing: 4) {
                             Text(projectName ?? URL(fileURLWithPath: cwd).lastPathComponent)
                                 .lineLimit(1)
-                            if didCopyWorkspacePath {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 8, weight: .bold))
-                                    .foregroundStyle(CorptiePalette.connected)
-                                    .transition(.opacity.combined(with: .scale))
-                            }
+                            copyConfirmation(visible: didCopyWorkspacePath)
                         }
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.primary)
+                        .font(WorkbenchTypography.font(for: .conversationMetadata))
+                        .foregroundStyle(.secondary)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help(L10nFormat("Copy full workspace path: %@", cwd))
+                }
+                if hasWorktreeTarget {
+                    headerActionButton(.manageWorktrees)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 if let status = displayedProjectStatus {
                     ProjectServiceStatusDot(status: status.service)
                         .help(projectServiceStatusHelp(status))
                 }
             }
-            if let action = primaryHeaderAction {
-                headerActionButton(action)
-                    .contextMenu { headerActionMenu }
-            }
+
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .frame(maxWidth: 560)
-        .fixedSize(horizontal: true, vertical: false)
-        .platformGlassSurface(in: Capsule())
+        .padding(.horizontal, 8)
+        .help(selectedTitle ?? "")
     }
 
     private var selectedTitle: String? {
-        session?.title
+        guard let session else { return nil }
+        return Self.displayTitle(session: session, workName: workName)
+    }
+
+    static func displayTitle(session: TaskSession, workName: String?) -> String {
+        guard session.resolvedSessionKind == .workChat else { return session.title }
+        guard let name = workName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else {
+            return L10n("Work Chat")
+        }
+        return "\(name) · \(L10n("Work Chat"))"
     }
 
     private var selectedSessionWorktree: ProjectWorktreeStatus? {
@@ -328,9 +355,6 @@ struct SessionConversationHeaderSurface: View {
         if canReconnectSelectedSession {
             return .reconnect
         }
-        if shouldSuggestWorktreeManagement {
-            return .manageWorktrees
-        }
         return nil
     }
 
@@ -339,14 +363,8 @@ struct SessionConversationHeaderSurface: View {
             && session?.isConnected == false
     }
 
-    private var shouldSuggestWorktreeManagement: Bool {
-        guard let project = displayedProjectStatus?.project else { return false }
-        return project.pendingWorktreeCount > 0 || project.worktrees.contains { worktree in
-            worktree.availability != "available"
-                || worktree.dirty == true
-                || worktree.pendingIntegration
-                || (worktree.behindMain ?? 0) > 0
-        }
+    private var hasWorktreeTarget: Bool {
+        session?.external?.workspace?.repositoryId != nil || displayedProjectStatus != nil
     }
 
     @ViewBuilder
@@ -374,15 +392,20 @@ struct SessionConversationHeaderSurface: View {
             .buttonStyle(.plain)
             .help(L10n("Reconnect session"))
         case .manageWorktrees:
-            if let status = displayedProjectStatus {
-                Button {
-                    openWorktreeManagement()
-                } label: {
+            Button {
+                openWorktreeManagement()
+            } label: {
+                if let status = displayedProjectStatus {
                     ProjectWorktreeStatusChip(status: status, showsSurface: false)
+                } else {
+                    Label("Worktree", systemImage: "arrow.triangle.branch")
+                        .font(WorkbenchTypography.font(for: .conversationMetadata))
                 }
-                .buttonStyle(.plain)
-                .help(L10n("Manage project worktrees and service"))
             }
+            .buttonStyle(.plain)
+            .help(L10n("Manage project worktrees and service"))
+            .accessibilityLabel(L10n("Manage project worktrees and service"))
+            .accessibilityIdentifier("session.detail.worktree")
         }
     }
 
@@ -411,7 +434,7 @@ struct SessionConversationHeaderSurface: View {
         } label: {
             Label(L10n("Manage project worktrees and service"), systemImage: "arrow.triangle.branch")
         }
-        .disabled(displayedProjectStatus == nil)
+        .disabled(!hasWorktreeTarget)
 
         Divider()
 
@@ -484,31 +507,37 @@ struct SessionConversationHeaderSurface: View {
         session?.canInterruptNow == true
     }
 
+    private func copyConfirmation(visible: Bool) -> some View {
+        Image(systemName: "checkmark")
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(CorptiePalette.connected)
+            .frame(width: 12, height: 12)
+            .opacity(visible ? 1 : 0)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: visible)
+            .accessibilityHidden(true)
+            .allowsHitTesting(false)
+    }
+
     private func copyWorkspacePath() {
         guard copySessionNameToPasteboard(workspacePath) else { return }
-        withAnimation(.easeOut(duration: 0.12)) {
-            didCopyWorkspacePath = true
-        }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 900_000_000)
-            withAnimation(.easeOut(duration: 0.12)) {
-                didCopyWorkspacePath = false
-            }
+        workspacePathCopyFeedbackTask?.cancel()
+        didCopyWorkspacePath = true
+        workspacePathCopyFeedbackTask = Task { @MainActor in
+            do { try await Task.sleep(for: .milliseconds(900)) }
+            catch { return }
+            didCopyWorkspacePath = false
+            workspacePathCopyFeedbackTask = nil
         }
     }
 
     private func copySessionTitle(_ title: String) {
         guard copySessionNameToPasteboard(title) else { return }
         sessionTitleCopyFeedbackTask?.cancel()
-        withAnimation(.easeOut(duration: 0.12)) {
-            didCopySessionTitle = true
-        }
+        didCopySessionTitle = true
         sessionTitleCopyFeedbackTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(900))
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.12)) {
-                didCopySessionTitle = false
-            }
+            do { try await Task.sleep(for: .milliseconds(900)) }
+            catch { return }
+            didCopySessionTitle = false
             sessionTitleCopyFeedbackTask = nil
         }
     }

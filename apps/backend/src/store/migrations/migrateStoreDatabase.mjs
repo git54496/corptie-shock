@@ -1,7 +1,12 @@
+import { migrateExecutionChecklist } from "./executionChecklistMigrations.mjs";
+import { migrateSessionMailbox } from "./sessionMailboxMigrations.mjs";
+import { migrateChannelMailbox } from "./channelMailboxMigrations.mjs";
 import { migrateTaskProjectionColumns, migrateTaskCreationOrigins, migrateTaskLifecycleGuards } from "./taskEvolutionMigrations.mjs";
 import { migrateArtifactTaxonomy } from "./artifactTaxonomyMigrations.mjs";
 import { migrateStartupOperations } from "./startupOperationMigrations.mjs";
 import { migrateTaskHierarchy } from "./taskHierarchyMigrations.mjs";
+import { migrateChildTaskDelivery } from "./childTaskDeliveryMigrations.mjs";
+import { migrateTaskCoordination } from "./taskCoordinationMigrations.mjs";
 import { migrateTaskCreationState } from "./taskCreationStateMigrations.mjs";
 import { migrateCollaborationProtocol } from "./collaborationProtocolMigrations.mjs";
 import { migrateSessionEventStorage } from "./sessionEventEvolutionMigrations.mjs";
@@ -14,6 +19,7 @@ import { sessionRuntimeSchemaSql, workDomainSchemaSql } from "./index.mjs";
 import { migrateTaskDomainV1, migrateTaskGoalRemovalV1 } from "../taskSchemaMigration.mjs";
 import { migrateSshWorkspaces } from "../sshWorkspaceRepository.mjs";
 import { migrateAutomationTimelineV2 } from "./automationTimelineV2.mjs";
+import { migrateMailboxTimeline } from "./mailboxTimelineMigrations.mjs";
 
 // Ordered schema/data upgrade composition. Store retains connection and transaction ownership.
 // Steps are explicit migration capabilities, not the Store object.
@@ -42,6 +48,7 @@ export function migrateStoreDatabase({ db, selectAll, selectOne, ensureColumn, r
 
     // --- 实体层：Work / Task / 依赖 DAG（净新增，见 15 Phase 1） ---
     db.run(workDomainSchemaSql);
+    migrateExecutionChecklist(db);
     ensureColumn("worktree_integration_jobs", "fingerprint_version", "INTEGER");
     ensureColumn("worktree_integration_jobs", "idempotency_key", "TEXT");
     ensureColumn("worktree_integration_jobs", "start_request_fingerprint", "TEXT");
@@ -49,30 +56,10 @@ export function migrateStoreDatabase({ db, selectAll, selectOne, ensureColumn, r
     db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_worktree_integration_jobs_idempotency
       ON worktree_integration_jobs(repository_id, idempotency_key)
       WHERE idempotency_key IS NOT NULL`);
-    const duplicateActiveExecutions = selectAll(
-      `SELECT repository_id, COUNT(*) AS active_count, GROUP_CONCAT(id) AS job_ids
-       FROM worktree_integration_jobs
-       WHERE status IN ('queued', 'running', 'paused', 'cancellation_requested', 'replanning')
-       GROUP BY repository_id HAVING COUNT(*) > 1`
-    );
-    if (duplicateActiveExecutions.length > 0) {
-      const summary = duplicateActiveExecutions.map((row) =>
-        `${row.repository_id}: ${row.active_count} active jobs (${row.job_ids})`).join("; ");
-      const error = new Error(
-        `WORKTREE_INTEGRATION_ACTIVE_ROWS_CONFLICT: resolve duplicate active Worktree integration jobs before migration: ${summary}`
-      );
-      error.code = "WORKTREE_INTEGRATION_ACTIVE_ROWS_CONFLICT";
-      throw error;
-    }
-    runDataMigrationOnce("worktree-integration-active-index-v1", () => {
-      db.run("DROP INDEX IF EXISTS idx_worktree_integration_jobs_active");
-      db.run(`CREATE UNIQUE INDEX idx_worktree_integration_jobs_active
-        ON worktree_integration_jobs(repository_id)
-        WHERE status IN ('queued', 'running', 'paused', 'cancellation_requested', 'replanning')`);
-    });
-    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_worktree_integration_jobs_active
-      ON worktree_integration_jobs(repository_id)
-      WHERE status IN ('queued', 'running', 'paused', 'cancellation_requested', 'replanning')`);
+    // Multiple jobs may be queued or operate on disjoint Worktrees. The
+    // application schedules overlapping write scopes; repository identity is
+    // not an exclusive execution lease.
+    db.run("DROP INDEX IF EXISTS idx_worktree_integration_jobs_active");
 
     ensureMemoryFoundationTables({ db: db });
     ensureColumn("memories", "primary_topic", "TEXT");
@@ -118,6 +105,8 @@ export function migrateStoreDatabase({ db, selectAll, selectOne, ensureColumn, r
     );
     db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_operations_channel_delivery
       ON agent_operations(channel_delivery_id) WHERE channel_delivery_id IS NOT NULL`);
+    migrateChannelMailbox({ db, ensureColumn });
+    migrateSessionMailbox({ db });
     migrateTaskProjectionColumns({
       ensureColumn: (...args) => ensureColumn(...args),
       db: db,
@@ -245,6 +234,7 @@ export function migrateStoreDatabase({ db, selectAll, selectOne, ensureColumn, r
     steps.ensureStateSyncTables();
     steps.ensureProviderEventPipelineTables();
     migrateAutomationTimelineV2({ db, selectAll, selectOne, runDataMigrationOnce });
+    migrateMailboxTimeline({ db, selectAll, selectOne, runDataMigrationOnce });
     runDataMigrationOnce("unreceived-message-delete-capability-v1", () => {
       db.run(`UPDATE session_items SET raw_metadata_json=json_set(
         CASE WHEN json_valid(raw_metadata_json) THEN raw_metadata_json ELSE '{}' END,
@@ -317,4 +307,8 @@ export function migrateStoreDatabase({ db, selectAll, selectOne, ensureColumn, r
              AND m.message_type = 'question'
          )`
     );
+    // Rebuilding the intent CHECK constraint requires all trigger-referenced
+    // Session columns to exist (including on a fresh database).
+    migrateChildTaskDelivery({ db, selectOne, runDataMigrationOnce });
+    migrateTaskCoordination({ db, ensureColumn });
 }

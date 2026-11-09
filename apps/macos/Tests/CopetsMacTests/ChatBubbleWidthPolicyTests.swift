@@ -4,35 +4,32 @@ import CorptieConversation
 
 @MainActor
 final class ChatBubbleWidthPolicyTests: XCTestCase {
-    func testReadingLayoutCacheReplacesOldMetricsAndRestoresClassicExactly() {
+    func testIntrinsicContentRestoresClassicTypographyAndAttributedContent() {
         let text = "模型回复 English **bold**\n\n" + String(repeating: "Wrapped 中文 text ", count: 40)
         let row = AppKitChatTimelineRow(id: "reading-cache", contentRevision: 1, nativeText: text,
             copyText: text, nativeStyle: .agent, title: "", metadata: "", expandableTurnId: nil, isExpanded: false,
             showsHeader: false)
         for width: CGFloat in [320, 900] {
-            let classic = NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: width)
-            let reading = NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: width, typography: .codexReading)
-            XCTAssertEqual((reading.attributedText.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)?.pointSize, 16)
-            XCTAssertGreaterThan(reading.rowHeight, classic.rowHeight)
-            XCTAssertEqual(reading.textHeight, NativeTextKitLayout.height(of: reading.attributedText, width: reading.cardWidth - 20))
-            XCTAssertEqual(reading.rowHeight, reading.cardHeight + 12)
-            let restored = NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: width)
-            XCTAssertEqual(restored.rowHeight, classic.rowHeight)
+            let classic = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: width, skin: .classic)
+            let reading = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: width, skin: .codexFlat)
+            XCTAssertEqual((classic.attributedText.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)?.pointSize, 11)
+            XCTAssertEqual((reading.attributedText.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)?.pointSize, 14)
+            let restored = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: width, skin: .classic)
             XCTAssertTrue(restored.attributedText.isEqual(to: classic.attributedText))
+            XCTAssertEqual(restored.cardWidth, classic.cardWidth)
         }
     }
 
-    func testAssistantRepliesUseWideLaneInMeasuredTimelineLayout() {
+    func testAssistantRepliesUseTheSafeLaneInBothIntrinsicSkins() {
         let long = String(repeating: "Model response content ", count: 100)
         for text in [long, "```swift\nprint(\"Hello\")\n```", "| A | B |\n|---|---|\n| one | two |"] {
             let row = AppKitChatTimelineRow(id: "wide-reply-\(text)", contentRevision: 1,
                 nativeText: text, copyText: text, nativeStyle: .agent, title: "", metadata: "",
                 expandableTurnId: nil, isExpanded: false, showsHeader: false)
-            for (lane, expected) in [(CGFloat(2400), CGFloat(2396)), (1600, 1596), (1000, 996), (600, 596), (320, 316)] {
-                for typography: ConversationTypography in [.classic, .codexReading] {
-                    let layout = NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: lane, typography: typography)
-                    XCTAssertEqual(layout.cardWidth, expected)
-                    XCTAssertGreaterThan(layout.rowHeight, 0)
+            for lane: CGFloat in [2400, 1600, 1000, 600, 320] {
+                for skin in ConversationSkin.allCases {
+                    let layout = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: lane, skin: skin)
+                    XCTAssertEqual(layout.cardWidth, lane - (skin == .classic ? 14 : 4))
                 }
             }
         }
@@ -107,7 +104,7 @@ final class ChatBubbleWidthPolicyTests: XCTestCase {
             copyText: "Step details", nativeStyle: .process, title: "", metadata: "",
             expandableTurnId: "turn", isExpanded: true, processCount: 1
         )
-        XCTAssertEqual(NativeTimelineLayoutCache.shared.layout(
+        XCTAssertEqual(LegacyTimelineLayoutReference.shared.layout(
             for: process, columnWidth: 900).cardWidth, MessageBubbleWidthPolicy.maximumProcessWidth)
     }
 
@@ -125,6 +122,37 @@ final class ChatBubbleWidthPolicyTests: XCTestCase {
         XCTAssertEqual(MessageBubbleWidthPolicy.cardWidth(bodyWidth: 20, hasAttachments: true, laneWidth: 200), 196)
         XCTAssertTrue(MessageBubbleWidthPolicy.requiresFullWidthLayout("| A | B |\n|---|---|"))
         XCTAssertFalse(MessageBubbleWidthPolicy.requiresFullWidthLayout("plain **bold** text"))
+    }
+
+    func testResizeRetainsNaturalWidthPreparationAndInvalidatesContentFontAndHeader() throws {
+        for text in ["Plain **formatted** response", "```swift\nprint(1)\n```"] {
+            var row = AppKitChatTimelineRow(id: "width-preparation", contentRevision: 1,
+                nativeText: text, copyText: text, nativeStyle: .agent, title: "Assistant", metadata: "Now",
+                expandableTurnId: nil, isExpanded: false, showsHeader: false)
+            var layout = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: 900, skin: .classic)
+            let original = try XCTUnwrap(layout.naturalWidthMetrics)
+            for width: CGFloat in [800, 620, 320, 950] {
+                layout = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: width,
+                    skin: .classic, reusing: layout)
+                XCTAssertTrue(layout.naturalWidthMetrics === original)
+                let fresh = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: width, skin: .classic)
+                XCTAssertEqual(layout.cardWidth, fresh.cardWidth)
+            }
+            let reading = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: 950,
+                skin: .codexFlat, reusing: layout)
+            XCTAssertFalse(reading.naturalWidthMetrics === original)
+            let renamed = AppKitChatTimelineRow(id: row.id, contentRevision: row.contentRevision,
+                nativeText: text, copyText: text, nativeStyle: .agent, title: "A different heading", metadata: "Now",
+                expandableTurnId: nil, isExpanded: false, showsHeader: true)
+            let header = NativeTimelineLayoutCache.shared.intrinsicContent(for: renamed, columnWidth: 950,
+                skin: .classic, reusing: layout)
+            XCTAssertFalse(header.naturalWidthMetrics === original)
+            row.contentRevision += 1
+            row.nativeText += " changed"
+            let changed = NativeTimelineLayoutCache.shared.intrinsicContent(for: row, columnWidth: 950,
+                skin: .classic, reusing: layout)
+            XCTAssertFalse(changed.naturalWidthMetrics === original)
+        }
     }
 
     private func preferredWidth(

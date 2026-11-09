@@ -8,6 +8,66 @@ import AppKit
 #endif
 
 @MainActor struct DetailWidgetLayoutTests {
+    private final class MeasureCounts { var measurements = 0 }
+    private struct ExpensiveContent: Layout {
+        let counts: MeasureCounts
+        func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+            counts.measurements += 1
+            return CGSize(width: proposal.width ?? 100, height: 10_000)
+        }
+        func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {}
+    }
+
+    #if os(macOS)
+    private struct FixedSlot: NSViewRepresentable {
+        let index: Int
+        func makeNSView(context: Context) -> NSView {
+            let view = NSView(); view.identifier = .init("fixed-slot-\(index)"); return view
+        }
+        func updateNSView(_ view: NSView, context: Context) {}
+    }
+    @Test func fixedDesktopGeometrySurvivesWidthAndHeightProposals() async throws {
+        let host = NSHostingView(rootView: ScrollView {
+            DetailWidgetLayout(sizes: [.small, .small, .medium], fixedWidth: 300) {
+                ForEach(0..<3) { FixedSlot(index: $0) }
+            }.frame(width: 300).frame(maxWidth: .infinity, alignment: .leading)
+        })
+        let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 324, height: 500),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        func slots(_ view: NSView) -> [NSView] {
+            if view.identifier?.rawValue.hasPrefix("fixed-slot-") == true { return [view] }
+            return view.subviews.flatMap(slots)
+        }
+        var initial: [CGRect]?
+        for size in [CGSize(width: 324, height: 500), .init(width: 600, height: 300),
+                     .init(width: 260, height: 700), .init(width: 324, height: 400)] {
+            window.setContentSize(size); window.layoutIfNeeded(); host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(20))
+            let cells = slots(host).sorted { $0.identifier!.rawValue < $1.identifier!.rawValue }
+            #expect(cells.count == 3)
+            let frames = cells.map { $0.convert($0.bounds, to: host) }
+            #expect(frames.map(\.size) == [CGSize(width: 144, height: 144), .init(width: 144, height: 144), .init(width: 300, height: 144)])
+            if let initial { #expect(frames == initial, "Viewport changes must not move or resize fixed cards") }
+            else { initial = frames }
+        }
+    }
+
+    @Test func viewportIdealSizeProbesDoNotMeasureScrollingContent() {
+        let counts = MeasureCounts()
+        let host = NSHostingView(rootView: DetailWidgetViewport(size: .small) {
+            ExpensiveContent(counts: counts) { Color.clear }
+        })
+        // AppKit/SwiftUI ideal-size probes happen before actual placement.
+        for _ in 0..<100 {
+            let size = host.fittingSize
+            #expect(size.width == 144 && size.height == 144)
+        }
+        #expect(counts.measurements == 0)
+    }
+    #endif
+
     @Test func referenceSizesComposeSquaresIncludingTheirGaps() {
         let pair = DetailWidgetPlacement.make(width: 300, widgets: [.small, .small])
         #expect(pair.frames == [CGRect(x: 0, y: 0, width: 144, height: 144), CGRect(x: 156, y: 0, width: 144, height: 144)])
@@ -90,7 +150,7 @@ import AppKit
 
     @Test func sessionProviderAndCollapsedContentUseCompactProfiles() throws {
         let session = try decode(kind: "sessionInfo", data: ["sessionId": "session:1", "workName": "Work"])
-        #expect(DetailWidgetSizing.preferredSize(for: session) == .strip)
+        #expect(DetailWidgetSizing.preferredSize(for: session) == .fitted(height: 96))
         let provider = try decode(kind: "provider", data: ["providerId": "test", "name": "Provider", "model": "Model",
             "reasoning": "Medium", "switching": false, "providers": []])
         #expect(DetailWidgetSizing.preferredSize(for: provider) == .small)

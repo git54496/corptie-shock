@@ -1,3 +1,4 @@
+import { legacyAgentToRole, roleToLegacyAgentWire } from "../store/repositories/roleRepository.mjs";
 // 实体层 + hub 的 HTTP API（15 Phase 1-3 落地：work/task/memory/hub 路由）。
 // 自包含（sendJson/readJson/apiError 本地定义，不依赖 server.mjs），与 collaborationHttpApi 同风格。
 
@@ -21,6 +22,7 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import { createTaskAndSession } from "./taskCreationApplicationService.mjs";
 import { readTaskHierarchyPage } from "./taskHierarchyService.mjs";
+import { handleChildTaskDeliveryHttp } from "./childTaskDeliveryHttp.mjs";
 
 function encodeTaskCursor(cursor) {
   return cursor ? Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url") : null;
@@ -119,7 +121,8 @@ export function handleEntityHttpRequest({
   auditLog = (entry) => console.log(`[agent-create] ${JSON.stringify(entry)}`)
 }) {
   const path = url.pathname;
-  const presentAgent = (agent) => {
+  const presentRole = (role) => {
+    const agent = roleToLegacyAgentWire(role);
     if (!agent) return null;
     let availability = null;
     try {
@@ -134,7 +137,7 @@ export function handleEntityHttpRequest({
       ? suggestAgentSessionTitle(agent)
       : null;
     return {
-      ...agent,
+      ...role,
       status: unavailable ? "unavailable" : "available",
       statusReason: unavailable && typeof availability?.reason === "string"
         ? availability.reason.trim() || null
@@ -143,6 +146,8 @@ export function handleEntityHttpRequest({
       suggestedSessionTitle
     };
   };
+  // /agents remains the compatibility transport, not the business model.
+  const presentAgent = (agent) => roleToLegacyAgentWire(presentRole(legacyAgentToRole(agent)));
   const normalizeSkillIds = (value) => [...new Set((Array.isArray(value) ? value : [])
     .map((id) => String(id).trim()).filter(Boolean))];
   const validateSkillIds = (value) => {
@@ -326,11 +331,11 @@ export function handleEntityHttpRequest({
 
       // ---- Agent ----
       if (request.method === "GET" && path === "/agents") {
-        return sendJson(response, 200, { agents: workService.store.listAgents().map(presentAgent) });
+        return sendJson(response, 200, { agents: workService.store.listRoles().map(role => roleToLegacyAgentWire(presentRole(role))) });
       }
       if (request.method === "POST" && path === "/agents") {
         const input = await readJson(request);
-        const name = validateEntityName(input.name, "name", "Agent");
+        const name = validateEntityName(input.name, "name", "Role");
         const skillIds = validateSkillIds(input.skillIds);
         const requestId = boundedHeaderText(request, "x-request-id") || randomUUID();
         const idempotencyKey = boundedHeaderText(request, "idempotency-key");
@@ -366,11 +371,13 @@ export function handleEntityHttpRequest({
           }
         };
         try {
-          const result = workService.store.createAgentWithRegistrySkillsIdempotently(
+          const roleReceipt = workService.store.createRoleWithRegistrySkillsIdempotently(
             agentInput,
             skillIds,
             { idempotencyKey, requestHash, requestId, deviceId }
           );
+          const { role, ...receipt } = roleReceipt;
+          const result = { ...receipt, agent: roleToLegacyAgentWire(role) };
           auditLog({
             ...audit,
             outcome: result.replayed ? "replayed" : "created",
@@ -408,7 +415,7 @@ export function handleEntityHttpRequest({
         // 客户端无需也不应传 cwd。
         if (request.method === "POST") {
           const agent = workService.store.getAgent(id);
-          if (!agent) throw apiError("AGENT_NOT_FOUND", "Agent not found.", 404);
+          if (!agent) throw apiError("AGENT_NOT_FOUND", "Role not found.", 404);
           if (typeof launchAgentSession !== "function") {
             throw apiError("INTERNAL", "launchAgentSession is not configured.", 500);
           }
@@ -431,7 +438,7 @@ export function handleEntityHttpRequest({
         const id = decodeURIComponent(agentMatch[1]);
         if (request.method === "GET") {
           const agent = workService.store.getAgent(id);
-          if (!agent) throw apiError("AGENT_NOT_FOUND", "Agent not found.", 404);
+          if (!agent) throw apiError("AGENT_NOT_FOUND", "Role not found.", 404);
           return sendJson(response, 200, {
             agent: presentAgent(agent)
           });
@@ -439,7 +446,7 @@ export function handleEntityHttpRequest({
         if (request.method === "PATCH") {
           const input = await readJson(request);
           if (Object.prototype.hasOwnProperty.call(input, "name")) {
-            validateEntityName(input.name, "name", "Agent");
+            validateEntityName(input.name, "name", "Role");
           }
           // Fail before avatar file I/O so a mixed cosmetic + protected patch cannot leave orphaned files.
           if (isPlatformAssistant(id)) assertPlatformAssistantPatch(input);
@@ -458,12 +465,12 @@ export function handleEntityHttpRequest({
               input.avatarPath = null;
             }
           }
-          const agent = workService.store.updateAgentWithRegistrySkills(id, input, skillIds);
+          const agent = roleToLegacyAgentWire(workService.store.updateRoleWithRegistrySkills(id, input, skillIds));
           onEntityChanged?.("AgentChanged", { action: "updated", entity: agent });
           return sendJson(response, 200, { agent: presentAgent(workService.store.getAgent(id) ?? agent) });
         }
         if (request.method === "DELETE") {
-          workService.store.deleteAgent(id);
+          workService.store.deleteRole(id);
           onEntityChanged?.("AgentChanged", { action: "deleted", entity: { agentId: id } });
           return sendJson(response, 200, { ok: true });
         }
@@ -479,6 +486,24 @@ export function handleEntityHttpRequest({
         }
         if (request.method === "GET" && path === "/skills/duplicates") {
           return sendJson(response, 200, await skillRegistryService.duplicates());
+        }
+        const recoverOperationMatch = path.match(/^\/skills\/install-operations\/([^/]+)\/recover$/);
+        if (request.method === "POST" && recoverOperationMatch) {
+          try {
+            const operation = await skillRegistryService.recoverInstallation(decodeURIComponent(recoverOperationMatch[1]));
+            onEntityChanged?.("SkillChanged", { action: "recovered", entity: { skillId: operation.skillId } });
+            return sendJson(response, 200, { operation });
+          } catch (error) {
+            throw apiError(error.code ?? "SKILL_RECOVERY_FAILED", error.message, error.code === "NOT_FOUND" ? 404 : 409);
+          }
+        }
+        const installOperationMatch = path.match(/^\/skills\/install-operations\/([^/]+)$/);
+        if (request.method === "GET" && installOperationMatch) {
+          try {
+            return sendJson(response, 200, { operation: skillRegistryService.installationOperation(decodeURIComponent(installOperationMatch[1])) });
+          } catch (error) {
+            throw apiError(error.code ?? "SKILL_OPERATION_FAILED", error.message, error.code === "NOT_FOUND" ? 404 : 400);
+          }
         }
         if (request.method === "POST" && path === "/skills/install-preview") {
           const input = await readJson(request);
@@ -505,19 +530,26 @@ export function handleEntityHttpRequest({
         }
         if (request.method === "POST" && path === "/skills") {
           const input = await readJson(request);
-          const sourceType = input.sourceType === "git" ? "git" : "local";
+          const sourceType = input.sourceType ?? "local";
           const source = String(input.source ?? "").trim();
           if (!source) throw apiError("INVALID_INPUT", "source is required.", 400);
           try {
+            if (input.async === true) {
+              const operation = skillRegistryService.submitInstallation({ ...input, sourceType, source }, {
+                onCompleted: (skill) => onEntityChanged?.("SkillChanged", { action: "created", entity: skill })
+              });
+              return sendJson(response, 202, { operation });
+            }
             const skill = await skillRegistryService.register({
               name: input.name ?? "",
               description: input.description ?? "",
               sourceType,
               source,
               sourceSubpath: input.sourceSubpath ?? "",
+              requestId: input.requestId,
               assist: input.assist !== false
             });
-            onEntityChanged?.("SkillChanged", { action: "created", entity: skill });
+            if (!skill.idempotentReplay) onEntityChanged?.("SkillChanged", { action: "created", entity: skill });
             return sendJson(response, 201, { skill });
           } catch (error) {
             const wrapped = apiError(error?.code ?? "SKILL_REGISTER_FAILED", error?.message ?? "Skill 登记失败。",
@@ -565,8 +597,13 @@ export function handleEntityHttpRequest({
           if (request.method === "PATCH") {
             const input = await readJson(request);
             try {
+              if (input.async === true) {
+                const operation = skillRegistryService.submitInstallation(input, { skillId: id,
+                  onCompleted: (skill) => onEntityChanged?.("SkillChanged", { action: "updated", entity: skill }) });
+                return sendJson(response, 202, { operation });
+              }
               const skill = await skillRegistryService.update(id, input);
-              onEntityChanged?.("SkillChanged", { action: "updated", entity: skill });
+              if (!skill.idempotentReplay) onEntityChanged?.("SkillChanged", { action: "updated", entity: skill });
               return sendJson(response, 200, { skill });
             } catch (error) {
               const wrapped = apiError(error?.code ?? "SKILL_UPDATE_FAILED", error?.message ?? "Skill 更新失败。", 400);
@@ -793,6 +830,17 @@ export function handleEntityHttpRequest({
       }
       const hierarchyMatch = path.match(/^\/works\/([^/]+)\/task-hierarchy$/);
       const integrationMatch = path.match(/^\/tasks\/([^/]+)\/integration-(snapshots|acceptance)$/);
+      const userApprovalMatch = path.match(/^\/tasks\/([^/]+)\/integration-acceptance-(intents|confirmations)$/);
+      if (userApprovalMatch && request.method === "POST") {
+        // These product routes intentionally never accept an Agent-reported actor.
+        if (headerText(request,"origin") || headerText(request,"x-corptie-agent-id") || headerText(request,"x-corptie-logical-session-id")) throw apiError("DIRECT_USER_INTENT_REQUIRED","Use the native user acceptance action.",403);
+        const id=decodeURIComponent(userApprovalMatch[1]), input=await readJson(request);
+        const service=workService.integrationAcceptance;
+        const result=userApprovalMatch[2]==="intents"
+          ? await service.prepareUserApproval(id,input,localMacUserActor())
+          : await service.confirmUserApproval(id,input,localMacUserActor());
+        return sendJson(response,200,result);
+      }
       if (integrationMatch) {
         const id=decodeURIComponent(integrationMatch[1]);
         if(request.method==="GET" && integrationMatch[2]==="acceptance") return sendJson(response,200,await workService.integrationAcceptance.readStatus(id));
@@ -818,13 +866,12 @@ export function handleEntityHttpRequest({
           ?? workService.store.settings?.().newSessionDefaults?.taskCreation?.providerId ?? defaultSessionProviderId;
         const idempotencyKey = input.idempotencyKey ?? input.id;
         const { providerId: _providerId, sourceSessionId: _sourceSessionId,
-          model, reasoningLevel, expectedParentResourceVersion,
+          model, reasoningLevel, expectedParentResourceVersion: _legacyParentVersion,
           idempotencyKey: _idempotencyKey, ...taskInput } = input;
         const created = await createTaskAndSession({
           workService,
           startWorkSession,
           taskInput,
-          expectedParentResourceVersion,
           creationOrigin: {
             originType: "session",
             creatorSessionId: sourceSessionId,
@@ -942,8 +989,8 @@ export function handleEntityHttpRequest({
         if (typeof deleteTaskSafely !== "function") throw apiError("CAPABILITY_UNAVAILABLE", "Safe Task deletion is unavailable.", 503);
         const input = await readJson(request);
         rejectUnknownFields(input, new Set([
-          "mode", "acknowledgeDataLoss", "confirmedBranchName", "deleteWorktree", "artifactDisposition",
-          "idempotencyKey"
+          "mode", "acknowledgeDataLoss", "deleteWorktree", "artifactDisposition",
+          "stopRunning", "cancelStartup", "deleteAssociatedTasks", "cancelIntegration", "idempotencyKey"
         ]));
         return sendJson(response, 202, await deleteTaskSafely(
           decodeURIComponent(deleteTaskMatch[1]), input, localMacUserActor()
@@ -962,6 +1009,8 @@ export function handleEntityHttpRequest({
       }
 
       const completionIntentMatch = path.match(/^\/tasks\/([^/]+)\/completion-intents$/);
+      if(await handleChildTaskDeliveryHttp({request,response,url,service:workService.childTaskDeliveryService,
+        completion:taskCompletionService,actor:localMacUserActor(),revalidate:()=>{},readJson,sendJson})) return;
       if (request.method === "POST" && completionIntentMatch) {
         if (!taskCompletionService) throw apiError("CAPABILITY_UNAVAILABLE", "Task completion is unavailable.", 503);
         const input = await readJson(request);
@@ -982,8 +1031,9 @@ export function handleEntityHttpRequest({
         if (!taskCompletionService) throw apiError("CAPABILITY_UNAVAILABLE", "Task completion is unavailable.", 503);
         const result = await taskCompletionService.completeFromMacOS(id, input);
         return sendJson(response, 200, {
-          task: presentTaskWithScheduledWake(workService, result.task),
+          task: result.task ? presentTaskWithScheduledWake(workService, result.task) : null,
           operation: result.operation,
+          childDelivery: result.childDelivery ?? null,
           idempotentReplay: result.idempotentReplay
         });
       }
@@ -1757,8 +1807,11 @@ function presentTaskWithOrigin(workService, task, hierarchy = null) {
 }
 
 function presentTaskWithScheduledWake(workService, task, hierarchy = null) {
+  const summary = (hierarchy ?? workService.store.hierarchySummaries?.([task.id]))?.get(task.id);
   return presentTaskAcceptance(task, {
-    hierarchy: (hierarchy ?? workService.store.hierarchySummaries?.([task.id]))?.get(task.id),
+    hierarchy: summary,
+    coordinationDispatches: (task.coordination_enabled === 1 || summary?.childCount > 0)
+      ? workService.store.listTaskCoordinationDispatches?.(task.id) ?? [] : [],
     hasPendingScheduledWake: workService.store.hasPendingScheduledWakeForTask(task.id)
   });
 }

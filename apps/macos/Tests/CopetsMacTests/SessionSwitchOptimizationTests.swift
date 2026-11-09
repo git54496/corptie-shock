@@ -96,12 +96,11 @@ final class SessionSwitchOptimizationTests: XCTestCase {
     func testWorkHeaderEqualityRequiresActionScopeAndAllDisplayInputs() {
         let owner = NSObject(), otherOwner = NSObject()
         let work = Work(id: "work:header-equality", workspaceId: "workspace:test", name: "Work",
-            description: "", status: "active", profile: "general", tags: [], contributorAgentIds: [],
+            description: "", status: "active", profile: "general", tags: [], contributorRoleIds: [],
             createdAt: "", updatedAt: "")
         func header(_ scope: AnyObject?) -> ConsoleWorkOutlineHeader {
             ConsoleWorkOutlineHeader(work: work, isExpanded: false, isSelected: false,
-                isWorking: false, hasUnread: false, isChatSelected: false, isChatRunning: false,
-                hasUnreadChat: false, toggleExpanded: {}, openChat: {}, createTask: {}, actionOwner: scope ?? NSObject())
+                isWorking: false, hasUnread: false, toggleExpanded: {}, createTask: {}, actionOwner: scope ?? NSObject())
         }
         let baseline = header(owner)
         XCTAssertEqual(baseline, header(owner))
@@ -115,8 +114,7 @@ final class SessionSwitchOptimizationTests: XCTestCase {
         XCTAssertNotEqual(baseline, changed { $0.isActive = false })
         var renamedWork = work; renamedWork.name = "Renamed"
         let renamed = ConsoleWorkOutlineHeader(work: renamedWork, isExpanded: false, isSelected: false,
-            isWorking: false, hasUnread: false, isChatSelected: false, isChatRunning: false,
-            hasUnreadChat: false, toggleExpanded: {}, openChat: {}, createTask: {}, actionOwner: owner)
+            isWorking: false, hasUnread: false, toggleExpanded: {}, createTask: {}, actionOwner: owner)
         XCTAssertNotEqual(baseline, renamed)
     }
 
@@ -129,15 +127,12 @@ final class SessionSwitchOptimizationTests: XCTestCase {
         _ = NSApplication.shared
         let owner = NSObject()
         let work = Work(id: "work:header-render", workspaceId: "workspace:test", name: "Work",
-            description: "", status: "active", profile: "general", tags: [], contributorAgentIds: [],
+            description: "", status: "active", profile: "general", tags: [], contributorRoleIds: [],
             createdAt: "", updatedAt: "")
         func header(expanded: Bool = false, selected: Bool = false, working: Bool = false,
-                    unread: Bool = false, chatSelected: Bool = false, chatRunning: Bool = false,
-                    unreadChat: Bool = false) -> ConsoleWorkOutlineHeader {
+                    unread: Bool = false) -> ConsoleWorkOutlineHeader {
             ConsoleWorkOutlineHeader(work: work, isExpanded: expanded, isSelected: selected,
-                isWorking: working, hasUnread: unread, isChatSelected: chatSelected,
-                isChatRunning: chatRunning, hasUnreadChat: unreadChat,
-                toggleExpanded: {}, openChat: {}, createTask: {}, actionOwner: owner)
+                isWorking: working, hasUnread: unread, toggleExpanded: {}, createTask: {}, actionOwner: owner)
         }
         let host = NSHostingView(rootView: header().equatable())
         let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 400, height: 40),
@@ -155,8 +150,7 @@ final class SessionSwitchOptimizationTests: XCTestCase {
         host.rootView = header().equatable(); pump()
         XCTAssertEqual(trace.snapshot?.workHeaders[work.id]?.count, before)
         let changed = [header(expanded: true), header(selected: true), header(working: true),
-                       header(unread: true), header(chatSelected: true), header(chatRunning: true),
-                       header(unreadChat: true)]
+                       header(unread: true)]
         for value in changed {
             let previous = trace.snapshot?.workHeaders[work.id]?.count ?? 0
             host.rootView = value.equatable(); pump()
@@ -400,21 +394,21 @@ final class SessionSwitchOptimizationTests: XCTestCase {
             for id in ids { SessionTimelineRepository.shared.remove(id) }
             _ = store.apply(changeSet: .init(snapshotRequired: false, baseRevision: store.revision,
                 revision: store.revision + 1,
-                upserts: .init(sessions: [], tasks: [], works: [], agents: [], skills: [], repositories: [], integrationRuns: []),
-                deletes: .init(sessions: ids, tasks: taskIDs, works: workIDs, agents: [], skills: [], repositories: [], integrationRuns: [])))
+                upserts: .init(sessions: [], tasks: [], works: [], roles: [], skills: [], repositories: [], integrationRuns: []),
+                deletes: .init(sessions: ids, tasks: taskIDs, works: workIDs, roles: [], skills: [], repositories: [], integrationRuns: [])))
         }
         let fixture = ChatPerformanceFixture.make(configuration: .init(turnCount: 2, rawItemCount: 10, longMessageCharacters: 200))
         for index in ids.indices {
             let work = Work(id: workIDs[index], workspaceId: "workspace:" + workIDs[index], name: "Switch work \(index)",
-                description: "", status: "active", profile: "general", tags: [], contributorAgentIds: [],
+                description: "", status: "active", profile: "general", tags: [], contributorRoleIds: [],
                 createdAt: "2026-10-24", updatedAt: "2026-10-24")
             store.hydrate(works: [work])
             _ = store.acceptCorptieTask(CorptieTask(id: taskIDs[index], workId: workIDs[index],
                 title: "Switch task \(index)", description: "", acceptanceCriteria: "", priority: "medium",
-                lifecycleState: "todo", mainAgentId: nil, currentSessionId: ids[index], executionStatus: "idle",
+                lifecycleState: "todo", mainRoleId: nil, currentSessionId: ids[index], executionStatus: "idle",
                 createdAt: "2026-10-24", updatedAt: "2026-10-24"))
             _ = store.acceptCreatedSession(TaskSession(id: ids[index], title: "Switch task \(index)", agent: "Fixture",
-                agentId: nil, sessionKind: .worker, workId: workIDs[index], taskId: taskIDs[index], status: .complete,
+                roleId: nil, sessionKind: .worker, workId: workIDs[index], taskId: taskIDs[index], status: .complete,
                 progress: 1, summary: "", suggestedOptions: nil, suggestedPrompt: nil, activityStatus: nil,
                 updatedAt: "2026-10-24", accent: .cyan, archived: false, pinned: false, sortOrder: 0, capabilities: nil, external: nil))
             client.storeCachedDetail(fixture.detail, for: ids[index])
@@ -576,13 +570,13 @@ final class SessionSwitchOptimizationTests: XCTestCase {
 
     private func task(_ id: String = "task:one", current: String? = nil) -> CorptieTask {
         CorptieTask(id: id, workId: "work:one", title: id, description: "", acceptanceCriteria: "",
-            priority: "medium", lifecycleState: "todo", mainAgentId: nil, currentSessionId: current,
+            priority: "medium", lifecycleState: "todo", mainRoleId: nil, currentSessionId: current,
             executionStatus: "idle", createdAt: "2026-09-01", updatedAt: "2026-09-01")
     }
 
     private func session(_ id: String, taskID: String? = "task:one", archived: Bool = false,
                          updatedAt: String = "2026-09-01", status: TaskStatus = .complete) -> TaskSession {
-        TaskSession(id: id, title: id, agent: "Fixture", agentId: nil, sessionKind: .worker,
+        TaskSession(id: id, title: id, agent: "Fixture", roleId: nil, sessionKind: .worker,
             workId: "work:one", taskId: taskID, status: status, progress: 0, summary: "",
             suggestedOptions: nil, suggestedPrompt: nil, activityStatus: nil, updatedAt: updatedAt,
             accent: .cyan, archived: archived, pinned: false, sortOrder: 0, capabilities: nil, external: nil)
@@ -641,23 +635,51 @@ final class SessionSwitchOptimizationTests: XCTestCase {
         XCTAssertEqual(cache.peek("two"), 2)
     }
 
-    func testOutlineProjectionIgnoresSelectionAndInvalidatesEachInput() {
+    func testOutlineProjectionIgnoresSelectionAndInvalidatesEachInput() async {
         let store = ConsoleOutlineProjectionStore()
         let base = ConsoleOutlineProjectionKey(entityRevision: 1, sessionRevision: 1, search: "", sort: .standard)
-        var builds = 0
-        func make() -> ConsoleOutlineProjection {
-            builds += 1
-            return ConsoleOutlineProjection(tasksByWorkID: ["work:one": [task()]], works: [], processingWorkIDs: [])
+        for _ in 0..<100 {
+            await store.prepare(key: base, tasks: [task()], works: [], sessions: [])
+            XCTAssertEqual(store.prepared.tasksByWorkID["work:one"]?.count, 1)
         }
-        for _ in 0..<100 { XCTAssertEqual(store.value(for: base, make: make).tasksByWorkID["work:one"]?.count, 1) }
-        XCTAssertEqual(builds, 1)
+        XCTAssertEqual(store.computationCount, 1)
+        XCTAssertFalse(store.lastComputationUsedMainThread)
         for key in [
             ConsoleOutlineProjectionKey(entityRevision: 2, sessionRevision: 1, search: "", sort: .standard),
             ConsoleOutlineProjectionKey(entityRevision: 2, sessionRevision: 2, search: "", sort: .standard),
             ConsoleOutlineProjectionKey(entityRevision: 2, sessionRevision: 2, search: "query", sort: .standard),
-            ConsoleOutlineProjectionKey(entityRevision: 2, sessionRevision: 2, search: "query", sort: .updated)
-        ] { _ = store.value(for: key, make: make) }
-        XCTAssertEqual(builds, 5)
+            ConsoleOutlineProjectionKey(entityRevision: 2, sessionRevision: 2, search: "query", sort: .updated),
+            ConsoleOutlineProjectionKey(entityRevision: 2, sessionRevision: 2, search: "query", sort: .updated,
+                expandedTaskIDs: ["task:parent"])
+        ] { await store.prepare(key: key, tasks: [task()], works: [], sessions: []) }
+        XCTAssertEqual(store.computationCount, 6)
+    }
+
+    func testProjectionRejectsAnObsoleteInventoryBeforePublishing() async {
+        let store = ConsoleOutlineProjectionStore()
+        let key = ConsoleOutlineProjectionKey(entityRevision: 1, sessionRevision: 0, search: "", sort: .standard)
+        await store.prepare(key: key, tasks: [task()], works: [], sessions: [], isCurrent: { false })
+        XCTAssertNil(store.preparedKey)
+        XCTAssertEqual(store.computationCount, 0)
+        XCTAssertTrue(store.prepared.works.isEmpty)
+    }
+
+    func testArchiveProjectionPreparesDeduplicatedRowsAndSearchBeforeDisclosure() async {
+        var archivedTask = task("task:archive")
+        archivedTask.archived = true
+        let duplicate = session("duplicate", taskID: archivedTask.id, archived: true)
+        let history = session("history", taskID: "task:history", archived: true)
+        let rows = [SessionRowModel(session: duplicate), SessionRowModel(session: history)]
+        let store = ConsoleOutlineProjectionStore()
+        let key = ConsoleOutlineProjectionKey(entityRevision: 1, sessionRevision: 0, search: "", sort: .standard,
+            showsArchive: true)
+        await store.prepare(key: key, tasks: [archivedTask], works: [], sessions: [], archivedRows: rows)
+        XCTAssertEqual(store.prepared.archivedTasksByWorkID["work:one"]?.map(\.id), [archivedTask.id])
+        XCTAssertEqual(store.prepared.archivedRowsByWorkID["work:one"]?.map(\.id), [history.id])
+        await store.prepare(key: .init(entityRevision: 1, sessionRevision: 0, search: "history", sort: .standard,
+            showsArchive: true), tasks: [archivedTask], works: [], sessions: [], archivedRows: rows)
+        XCTAssertTrue(store.prepared.archivedTasksByWorkID.isEmpty)
+        XCTAssertEqual(store.prepared.archivedRowsByWorkID["work:one"]?.map(\.id), [history.id])
     }
 
     func testTaskLookupBenchmarkReportsEquivalentResults() {

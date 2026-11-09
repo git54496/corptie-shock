@@ -91,28 +91,68 @@ export const collaborationDynamicTools = Object.freeze([
   tool("corptie_collaboration_tasks_get", "Read one Task visible to this Session.", {
     task_id: taskIdSchema
   }, ["task_id"]),
-  tool("corptie_collaboration_tasks_create", "Create a Task and its companion Worker Session. Omit parent_task_id for an independent Task; specify it and expected_parent_resource_version for a child. Worker may create children only under its own bound root Task; Work Chat may select a root in its Work. Read the parent first. Never use platform administration tools as a fallback. Call only for an explicit current direct-user request to create Tasks, with authoritative turn evidence; planning, assistant initiative, collaboration and Automation are not authorization. Creation origin and parent relationship are independent.", {
+  tool("corptie_task_dispatch", "Quickly admit 1-100 asynchronous child instructions. The authenticated parent Session decides create versus reuse. Receipt means accepted, NOT started or completed. Return control to the user immediately; never poll waiting. Follow-up instructions use action=send with the original child Task id. Read authoritative Task/mailbox status rather than old chat status. Available in normal and coordination modes; each Session acts on its own direct children at any hierarchy level.", {
+    items: { type: "array", minItems: 1, maxItems: 100, items: { type: "object", additionalProperties: false,
+      properties: { action: { type: "string", enum: ["create", "send"] }, task_id: taskIdSchema,
+        text: { type: "string", minLength: 1, maxLength: 49152 }, idempotency_key: { type: "string", minLength: 1, maxLength: 200 },
+        creation: { type: "object", additionalProperties: false, properties: { title: { type: "string", minLength: 1 },
+          description: taskFieldsSchema.description, acceptance_criteria: taskFieldsSchema.acceptance_criteria,
+          verification_criteria: taskFieldsSchema.verification_criteria, priority: taskFieldsSchema.priority,
+          agent_id: agentIdSchema, provider_id: { type: "string", minLength: 1 },
+          artifact_reference: artifactReferenceSchema, file_reference: fileReferenceSchema }, required: ["title", "agent_id"] } },
+      required: ["action", "text", "idempotency_key"],
+      allOf: [{ if: { properties: { action: { const: "create" } } }, then: { required: ["creation"] }, else: { required: ["task_id"] } }] } }
+  }, ["items"]),
+  tool("corptie_task_dispatch_retry", "Retry failed child preparation with the original dispatch identity and frozen runtime settings. Existing mailbox/Provider receipts are reconciled first; an accepted or uncertain instruction is never blindly resent.", {
+    dispatch_id: { type: "string", minLength: 1 }
+  }, ["dispatch_id"]),
+  tool("corptie_collaboration_tasks_delete_child", "Inspect or autonomously delete a direct child Task and cascade descendants without user confirmation. Choose Artifact delete/work/retain; content loss needs no extra confirmation. stop_running stops execution; cancel_startup interrupts startup; delete_associated_tasks includes authorized Tasks sharing its Worktree; cancel_integration requests cancellation of the reported occupying job. Main Worktrees remain user-only. Busy execution and active integration remain blocked until stopping is verified. Receipt is asynchronous; never poll.", {
+    child_task_id: taskIdSchema, idempotency_key: { type: "string", minLength: 1, maxLength: 200 },
+    inspect_only: { type: "boolean" }, artifact_disposition: { type: "string", enum: ["delete", "work", "retain"] },
+    stop_running: { type: "boolean" }, cancel_startup: { type: "boolean" },
+    delete_associated_tasks: { type: "boolean" }, cancel_integration: { type: "boolean" }
+  }, ["child_task_id", "idempotency_key"]),
+  tool("corptie_collaboration_tasks_create", "Create a Task and its companion Worker Session. Child creation is autonomous: the authenticated parent Session decides when and how many children to create, without explicit user creation requests, message evidence, confirmation or a total creation quota. Specify parent_task_id; no parent version is needed; Worker may target only its bound root Task, Work Chat a root in its Work. Prefer create_batch for 1-10 children per call. Independent Tasks (parent omitted/null) still require an explicit current direct-user request and authoritative turn evidence. Never use platform administration as a fallback.", {
     title: { type: "string", minLength: 1 },
     description: taskFieldsSchema.description,
     acceptance_criteria: taskFieldsSchema.acceptance_criteria,
     verification_criteria: taskFieldsSchema.verification_criteria,
     parent_task_id: { type: ["string", "null"], minLength: 1, description: "Explicit same-Work root Task; omit/null for independent creation." },
-    expected_parent_resource_version: { type: "integer", minimum: 1, description: "Required for a non-null parent_task_id; use the parent's current resourceVersion." },
+    expected_parent_resource_version: { type: "integer", minimum: 1, description: "Deprecated optional compatibility field; ignored for creation." },
     priority: taskFieldsSchema.priority,
     agent_id: agentIdSchema,
     provider_id: { type: "string", minLength: 1, description: "Optional explicit Provider override. Omit to use the user's Task creation defaults, including configured model and reasoning. Do not infer this from the calling Session's Provider." },
     artifact_reference: artifactReferenceSchema,
     file_reference: fileReferenceSchema,
-    logical_session_id: { type: "string", minLength: 1, description: "Authoritative logical Session from the current Corptie direct-user evidence block; this is not a Provider Session id." },
-    user_message_event_id: { type: "string", minLength: 1, description: "Authoritative direct-user message event id from the current Corptie turn." },
-    user_message_sequence: { type: "integer", minimum: 1, description: "Authoritative direct-user message sequence from the current Corptie turn." },
-    turn_id: { type: "string", minLength: 1, description: "Authoritative current delivery/turn id from the direct-user evidence block." },
+    logical_session_id: { type: "string", minLength: 1, description: "Required only for independent Tasks: authoritative logical Session, not a Provider Session id." },
+    user_message_event_id: { type: "string", minLength: 1, description: "Required only for independent Tasks: authoritative direct-user message event id." },
+    user_message_sequence: { type: "integer", minimum: 1, description: "Required only for independent Tasks: direct-user message sequence." },
+    turn_id: { type: "string", minLength: 1, description: "Required only for independent Tasks: authoritative current delivery/turn id." },
     idempotency_key: { type: "string", minLength: 1 }
-  }, ["title", "agent_id", "logical_session_id", "user_message_event_id",
-    "user_message_sequence", "turn_id", "idempotency_key"], {
+  }, ["title", "agent_id", "idempotency_key"], {
       allOf: [{ if: { required: ["parent_task_id"], properties: { parent_task_id: { type: "string" } } },
-        then: { required: ["expected_parent_resource_version"] } }]
+        then: {},
+        else: {required:["logical_session_id","user_message_event_id","user_message_sequence","turn_id"]} }]
     }),
+  tool("corptie_collaboration_tasks_create_batch", "Autonomously create 1-10 child Tasks and companion Worker Sessions in ONE call. The parent Session decides when and how many; no explicit user creation request, message/turn evidence, confirmation or total child quota is required. Worker may target only its bound root Task; Work Chat a root in its Work. No parent version is needed. Each item needs a stable idempotency_key; retry failed items with the SAME keys. Returns per-item success/failure and recovery; partial success is not rolled back. Never fall back to platform administration.", {
+    parent_task_id: taskIdSchema,
+    expected_parent_resource_version: { type: "integer", minimum: 1 },
+    logical_session_id: { type: "string", minLength: 1 },
+    user_message_event_id: { type: "string", minLength: 1 },
+    user_message_sequence: { type: "integer", minimum: 1 },
+    turn_id: { type: "string", minLength: 1 },
+    items: { type: "array", minItems: 1, maxItems: 100, items: {
+      type: "object", additionalProperties: false,
+      properties: {
+        title: { type: "string", minLength: 1 }, description: taskFieldsSchema.description,
+        acceptance_criteria: taskFieldsSchema.acceptance_criteria, verification_criteria: taskFieldsSchema.verification_criteria,
+        priority: taskFieldsSchema.priority, agent_id: agentIdSchema,
+        provider_id: { type: "string", minLength: 1, description: "Optional override; omit to use configured creation defaults, not the caller's Provider." },
+        artifact_reference: artifactReferenceSchema, file_reference: fileReferenceSchema,
+        idempotency_key: { type: "string", minLength: 1, description: "Stable per-child key, preserved on retries and independent of batch position." }
+      }, required: ["title", "agent_id", "idempotency_key"]
+    } }
+  }, ["parent_task_id", "items"]),
   tool("corptie_collaboration_tasks_relate", "Establish an allowed source/parent/dependency relation inside the authenticated Work; Worker relations must include its bound Task.", {
     task_id: taskIdSchema,
     target_task_id: taskIdSchema,
@@ -139,7 +179,7 @@ export const collaborationDynamicTools = Object.freeze([
   tool("corptie_services_describe", "Describe a service, its owner, endpoint, version, metadata, and consumers.", {
     service_id: { type: "string", minLength: 1 }
   }, ["service_id"]),
-  tool("corptie_collaboration_channel_open", "Send a first or follow-up message directly to an exact @Session name, opening or reusing its durable Channel. Pass recipient_session_name immediately without pre-discovery; the server resolves exact names and aliases (with or without @). Only if it returns structured not-found or ambiguity details should you discover Sessions and retry with recipient_session_id. A missing target may be created only through explicit user confirmation.", {
+  tool("corptie_collaboration_channel_open", "Send a first or follow-up message directly to an exact @Session name, opening or reusing its durable Channel. Pass recipient_session_name immediately without pre-discovery; the server resolves exact names and aliases (with or without @). Only if it returns structured not-found or ambiguity details should you discover Sessions and retry with recipient_session_id. Current direct parent/child Sessions in the same Work auto-authorize in BOTH directions, including child-first contact: call normally without asking for separate approval. The server checks current bindings and respects revocation; unrelated pairs retain ordinary authorization. A missing target may be created only through explicit user confirmation.", {
     recipient_session_name: { type: "string", minLength: 1, description: "Exact Session name or alias, optionally prefixed with @. Prefer this direct route before Session discovery." },
     recipient_session_id: sessionIdSchema,
     session_agent_id: { ...agentIdSchema, description: "Agent resource used only when Corptie must create the target Worker Session." },
@@ -148,20 +188,24 @@ export const collaborationDynamicTools = Object.freeze([
     title: { type: "string", minLength: 1 },
     body: { type: "string", minLength: 1 },
     message_kind: { type: "string", enum: ["message", "question", "update"] },
+    delivery_intent: { type: "string", enum: ["action_required", "response_required", "notification", "acknowledgement"], description: "Default action_required. Use action_required/response_required for requests. Notifications and acknowledgements are saved but do not wake the recipient; no routine receipt reply is needed." },
     idempotency_key: { type: "string", minLength: 1 }
   }, ["body", "idempotency_key"]),
   tool("corptie_collaboration_channels_list", "List long-lived Channels containing this exact authenticated Session.", {
     status: { type: "array", items: { type: "string", enum: ["active", "revoked", "legacy_unresolved"] } },
     limit: { type: "integer", minimum: 1, maximum: 500 }
   }),
-  tool("corptie_collaboration_channel_get", "Get one Channel and its recent messages.", {
+  tool("corptie_collaboration_channel_get", "Get one Channel and its latest messages in chronological order; use cursors to page history. Reading does not consume queued deliveries.", {
     channel_id: { type: "string", minLength: 1 },
+    before_cursor: { type: "string", pattern: "^[1-9][0-9]*$" },
+    after_cursor: { type: "string", pattern: "^[1-9][0-9]*$" },
     limit: { type: "integer", minimum: 1, maximum: 500 }
   }, ["channel_id"]),
   tool("corptie_collaboration_message_send", "Send a bidirectional message over an active Channel without creating task state or acceptance workflow.", {
     channel_id: { type: "string", minLength: 1 },
     body: { type: "string", minLength: 1 },
     message_kind: { type: "string", enum: ["message", "question", "update"] },
+    delivery_intent: { type: "string", enum: ["action_required", "response_required", "notification", "acknowledgement"], description: "Default action_required. Use action_required/response_required for requests. Notifications and acknowledgements are saved but do not wake the recipient; no routine receipt reply is needed." },
     in_reply_to_message_id: { type: "string", minLength: 1 },
     idempotency_key: { type: "string", minLength: 1 }
   }, ["channel_id", "body", "idempotency_key"]),
@@ -181,33 +225,18 @@ export async function callCollaborationDynamicTool(client, name, input = {}) {
     corptie_sessions_get: () => client.get(`/internal/collaboration/sessions/${encodeURIComponent(input.session_id)}`),
     corptie_collaboration_tasks_list: () => client.get("/internal/collaboration/tasks"),
     corptie_collaboration_tasks_get: () => client.get(`/internal/collaboration/tasks/${encodeURIComponent(input.task_id)}`),
-    corptie_collaboration_tasks_create: () => client.post("/internal/collaboration/tasks", compact({
-      title: input.title,
-      description: input.description,
-      acceptanceCriteria: input.acceptance_criteria,
-      verificationCriteria: input.verification_criteria,
-      parentTaskId: input.parent_task_id,
-      expectedParentResourceVersion: input.expected_parent_resource_version,
-      priority: input.priority,
-      agentId: input.agent_id,
-      providerId: input.provider_id,
-      artifactReference: input.artifact_reference ? {
-        artifactId: input.artifact_reference.artifact_id,
-        relation: input.artifact_reference.relation,
-        required: input.artifact_reference.required,
-        versionPolicy: input.artifact_reference.version_policy,
-        version: input.artifact_reference.version
-      } : undefined,
-      fileReference: input.file_reference ? {
-        path: input.file_reference.path,
-        relation: input.file_reference.relation,
-        required: input.file_reference.required
-      } : undefined,
-      logicalSessionId: input.logical_session_id,
-      userMessageEventId: input.user_message_event_id,
-      userMessageSequence: input.user_message_sequence,
-      turnId: input.turn_id,
-      idempotencyKey: input.idempotency_key
+    corptie_task_dispatch: () => client.post("/internal/collaboration/tasks/dispatch", { items: input.items?.map(item => compact({
+      action: item.action, taskId: item.task_id, text: item.text, idempotencyKey: item.idempotency_key,
+      creation: item.creation ? taskCreationBody(item.creation) : undefined
+    })) }),
+    corptie_task_dispatch_retry: () => client.post("/internal/collaboration/tasks/dispatch/retry", { dispatchId: input.dispatch_id }),
+    corptie_collaboration_tasks_delete_child: () => client.post("/internal/collaboration/tasks/delete-child", { childTaskId: input.child_task_id, idempotencyKey: input.idempotency_key, inspectOnly: input.inspect_only, artifactDisposition: input.artifact_disposition, stopRunning: input.stop_running, cancelStartup: input.cancel_startup, deleteAssociatedTasks: input.delete_associated_tasks, cancelIntegration: input.cancel_integration }),
+    corptie_collaboration_tasks_create: () => client.post("/internal/collaboration/tasks", taskCreationBody(input)),
+    corptie_collaboration_tasks_create_batch: () => client.post("/internal/collaboration/tasks/batch", compact({
+      parentTaskId: input.parent_task_id, expectedParentResourceVersion: input.expected_parent_resource_version,
+      logicalSessionId: input.logical_session_id, userMessageEventId: input.user_message_event_id,
+      userMessageSequence: input.user_message_sequence, turnId: input.turn_id,
+      items: input.items.map(taskCreationBody)
     })),
     corptie_collaboration_tasks_relate: () => client.post("/internal/collaboration/task-relations", {
       taskId: input.task_id,
@@ -237,7 +266,7 @@ export async function callCollaborationDynamicTool(client, name, input = {}) {
       taskId: input.task_id,
       title: input.title,
       body: input.body,
-      messageKind: input.message_kind,
+      messageKind: input.message_kind, deliveryIntent: input.delivery_intent,
       idempotencyKey: input.idempotency_key
     })),
     corptie_collaboration_channels_list: () => client.get("/internal/collaboration/channels", {
@@ -245,11 +274,11 @@ export async function callCollaborationDynamicTool(client, name, input = {}) {
     }),
     corptie_collaboration_channel_get: () => client.get(
       `/internal/collaboration/channels/${encodeURIComponent(input.channel_id)}`,
-      { limit: input.limit ?? 100 }
+      { limit: input.limit ?? 100, beforeCursor: input.before_cursor, afterCursor: input.after_cursor }
     ),
     corptie_collaboration_message_send: () => client.post(
       `/internal/collaboration/channels/${encodeURIComponent(input.channel_id)}/messages`,
-      compact({ body: input.body, messageKind: input.message_kind,
+      compact({ body: input.body, messageKind: input.message_kind, deliveryIntent: input.delivery_intent,
         inReplyToMessageId: input.in_reply_to_message_id, idempotencyKey: input.idempotency_key })
     ),
     corptie_collaboration_channel_revoke: () => client.post(
@@ -266,16 +295,19 @@ export async function callCollaborationDynamicTool(client, name, input = {}) {
   const value = await handler();
   if (name === "corptie_collaboration_channel_open") requireChannelRequestReceipt(value);
   const pendingConfirmation = value?.request?.status === "pending";
+  const intent = value?.message?.deliveryIntent ?? value?.request?.message?.deliveryIntent ?? input.delivery_intent;
+  const silent = ["notification", "acknowledgement"].includes(intent);
   return afterSendToolNames.has(name)
     ? {
         ...value,
         coordination: {
-          delivery: pendingConfirmation ? "awaiting_user_confirmation" : "push",
+          delivery: pendingConfirmation ? "awaiting_user_confirmation" : silent ? "saved_without_wake" : "push",
           waitRequired: false,
           requiresUserAction: pendingConfirmation,
           nextAction: pendingConfirmation ? "end_current_turn" : "continue_current_turn",
           note: pendingConfirmation
             ? "Corptie will render and resolve confirmation programmatically. Do not write a confirmation message or continue this turn."
+            : silent ? "Message saved without waking the recipient. Continue independent work; no receipt reply or polling is needed."
             : "Continue the current user-requested work when independent steps remain. Sending does not require ending the turn or waiting for a peer reply. Do not resend this message or poll; Corptie pushes peer messages into this Session's unified queue. End normally if the user's request is fulfilled."
         }
       }
@@ -297,4 +329,18 @@ const afterSendToolNames = new Set([
 
 function compact(value) {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
+}
+
+function taskCreationBody(input) {
+  return compact({ title: input.title, description: input.description,
+    acceptanceCriteria: input.acceptance_criteria, verificationCriteria: input.verification_criteria,
+    parentTaskId: input.parent_task_id, expectedParentResourceVersion: input.expected_parent_resource_version,
+    priority: input.priority, agentId: input.agent_id, providerId: input.provider_id,
+    artifactReference: input.artifact_reference ? { artifactId: input.artifact_reference.artifact_id,
+      relation: input.artifact_reference.relation, required: input.artifact_reference.required,
+      versionPolicy: input.artifact_reference.version_policy, version: input.artifact_reference.version } : undefined,
+    fileReference: input.file_reference ? { path: input.file_reference.path,
+      relation: input.file_reference.relation, required: input.file_reference.required } : undefined,
+    logicalSessionId: input.logical_session_id, userMessageEventId: input.user_message_event_id,
+    userMessageSequence: input.user_message_sequence, turnId: input.turn_id, idempotencyKey: input.idempotency_key });
 }

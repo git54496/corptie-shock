@@ -10,6 +10,7 @@ import { ClientWorktreeManagementAPI } from "./clientWorktreeManagementAPI.mjs";
 import { ClientSessionAPI } from "./clientSessionAPI.mjs";
 import { pairedDeviceActor } from "./clientDeviceAuthority.mjs";
 import { TaskCreationSettingsService } from "./taskCreationSettingsService.mjs";
+import { readAutomationNotifications } from "../store/automationNotificationFeed.mjs";
 
 export function startClientDeviceGateway({
   store, environmentName, developmentPreview, worktreeIntegrationJobService, projectApplicationService, emitEvent,
@@ -23,11 +24,12 @@ export function startClientDeviceGateway({
   decorateSessionForClient, readSessionUsage, setTaskArchivedForEntityRoutes,
   restartTaskForEntityRoutes, taskDeletionService, clearWorkAvatarFile,
   sessionBindingRepository, createTaskAndSession, getClientDeviceGateway, onReady,
-  sessionPreparations = null, detailActionService = null, detailWritesAllowed = false
+  sessionPreparations = null, detailActionService = null, detailWritesAllowed = false, sessionAbilityPreferences = null
 }) {
   const startDeviceAccess = process.env.CORPTIE_REMOTE_ACCESS === "1" ? startConfiguredDeviceGateway : createDeviceSetup;
   void startDeviceAccess({ directory: join(store.dataRoot, "client-devices"), preview: developmentPreview,
     resourceWritesAllowed: !developmentPreview,
+    automationNotifications: (_identity, cursor) => readAutomationNotifications(store, environmentName, cursor),
     detailActionService, detailWritesAllowed: detailWritesAllowed === true && !developmentPreview,
     readAPI: new ClientReadAPI(store, { environmentName }),
     controlAPI: new ClientControlReadAPI({ resourceRevision: () => store.selectOne("SELECT revision FROM state_change_log WHERE entity_type = 'artifact' ORDER BY revision DESC LIMIT 1")?.revision ?? null, lists: {
@@ -48,8 +50,11 @@ export function startClientDeviceGateway({
       searchPage: query => getTimelineReadPool().readUnifiedSearch({ query: query.toString() }), readWindow: readSessionTimelineWindow,
       cancelQueuedMessage: cancelQueuedUserMessage,
       deleteUserMessage,
+      userMessageNavigation: input => getTimelineReadPool().readUserMessageNavigation(input),
       quickMessages: sessionId => getTimelineReadPool().readQuickMessages({ sessionId }),
       inspector: new ClientInspectorAPI({ store, resolveSession: requireSessionReference,
+        abilities: sessionAbilityPreferences,
+        onAbilitiesChanged: (scope, receipt) => emitEvent("SessionAbilitiesChanged", { sessionId: scope.sessionId, receipt }, { sessionId: scope.sessionId }),
         references: sessionContextReferenceService, artifacts: artifactService,
         schedules: scheduledSessionTaskService, observability: turnObservability,
         providers: () => agentProviderRegistry.descriptors().map(descriptor => ({ id: descriptor.id, name: descriptor.displayName,
@@ -126,11 +131,11 @@ export function startClientDeviceGateway({
             throw Object.assign(new Error("Provider does not support Work Sessions"), { code: "PROVIDER_CAPABILITY_UNAVAILABLE", status: 409 });
           }
         },
-        create: (id, { taskInput, providerId, model, reasoningLevel, expectedParentResourceVersion, operationID }) => {
+        create: (id, { taskInput, providerId, model, reasoningLevel, operationID }) => {
           const sourceSessionId = requireSessionReference(id).logicalSessionId;
           return createTaskAndSession({ workService,
             startWorkSession: input => workSessionStartApplicationService.start(input),
-            taskInput, sourceSessionId, providerId, model, reasoningLevel, expectedParentResourceVersion, idempotencyKey: operationID,
+            taskInput, sourceSessionId, providerId, model, reasoningLevel, idempotencyKey: operationID,
             creationOrigin: { originType: "session", creatorSessionId: sourceSessionId, operationId: operationID } });
         }
       },
@@ -179,6 +184,7 @@ export function startClientDeviceGateway({
         readSessionUsage(sessionId, undefined, { requireFreshAccount }),
       // Same services the desktop entity routes call; the device layer adds permission, DTO and receipt boundaries.
       entityCommands: {
+        childDelivery: { service:()=>workService.childTaskDeliveryService, completion:()=>workService.taskCompletionService },
         createWork: input => workInitializationService.createForClient(input),
         inspectWorkLocalState: workId => workInitializationService.localState(workId),
         repairWorkLocalState: workId => workInitializationService.localState(workId, { repair: true }),

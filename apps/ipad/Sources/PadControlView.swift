@@ -1,5 +1,6 @@
 import SwiftUI
 import CorptieClientCore
+import CorptieConversation
 
 struct PadControlView: View {
     let tab: PadTab
@@ -69,7 +70,7 @@ struct PadControlView: View {
                 if let item = store.items[route.kind]?.first(where: { $0.id == route.id }) {
                     detail(item, kind: route.kind)
                 } else if store.items[route.kind] == nil || store.loading.contains(route.kind) {
-                    ProgressView("正在同步…")
+                    CorptieBrandProgress("正在同步…", prominent: true)
                 } else {
                     ContentUnavailableView("此项目已不在当前列表中", systemImage: "doc.questionmark")
                 }
@@ -107,6 +108,9 @@ struct PadControlView: View {
                 }
                 Section("信息") {
                     if let type = item.kind ?? item.sourceType { LabeledContent("类型", value: type) }
+                    if kind == .skills {
+                        LabeledContent("安装方式", value: item.installationMode == "managed" ? "Corptie 托管安装" : "旧版来源引用")
+                    }
                     LabeledContent("ID", value: item.id).textSelection(.enabled)
                     if let date = item.updatedAt { LabeledContent("更新时间", value: PadControlPresentation.date(date)) }
                 }

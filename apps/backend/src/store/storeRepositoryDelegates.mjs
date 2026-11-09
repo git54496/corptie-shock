@@ -6,9 +6,11 @@ const foundationalDelegates = Object.freeze({
     "deleteRegistrySkill", "registrySkillDeletionImpact", "createSkillDeletionOperation",
     "updateSkillDeletionOperation", "getSkillDeletionOperation", "listRegistrySkillIdsForAgent",
     "listRegistrySkillsForAgent", "recordSkillRuntimeEvent", "getSkillRuntimeEvent",
-    "listSkillRuntimeEvents"
+    "listSkillRuntimeEvents", "createInstallOperation", "getInstallOperation", "advanceInstallOperation", "listPendingInstallOperations"
   ],
   agentRepository: [
+    "createRoleWithRegistrySkills", "createRoleWithRegistrySkillsIdempotently",
+    "updateRoleWithRegistrySkills", "setRoleRegistrySkills",
     "createAgentWithRegistrySkills", "createAgentWithRegistrySkillsIdempotently",
     "updateAgentWithRegistrySkills", "setAgentRegistrySkills"
   ],
@@ -133,6 +135,7 @@ const domainDelegates = Object.freeze({
     "getItemsForBinding"
   ],
   agentRepository: [
+    "listRoles", "getRole", "ensureAssistantRole", "createRole", "updateRole", "deleteRole",
     "listAgents", "getAgent", "ensureAssistantAgent",
     "migrateAgentAvailability", "createAgent", "updateAgent",
     "deleteAgent"
@@ -146,6 +149,7 @@ const domainDelegates = Object.freeze({
     "updateWork", "deleteWork", "assertWorkAssociations"
   ],
   taskRepository: [
+    "listTaskCoordinationDispatches",
     "createTask", "setTaskCreationState", "getTaskCreationOrigin", "listTasks",
     "listTasksByWork", "listTaskPage", "getTask",
     "getTaskWorkspaceContext", "getTaskBySessionId", "setTaskArchived",
@@ -179,7 +183,7 @@ const domainDelegates = Object.freeze({
     "getLatestProjectIntegrationRun", "updateProjectIntegrationRun", "updateProjectIntegrationItem",
     "createWorktreeIntegrationJob", "createWorktreeIntegrationJobIdempotently",
     "getWorktreeIntegrationJob", "getWorktreeIntegrationJobByIdempotencyKey", "listWorktreeIntegrationJobs",
-    "getLatestWorktreeIntegrationJob", "getActiveWorktreeIntegrationJobForConflictTask",
+    "getLatestWorktreeIntegrationJob", "listWorktreeIntegrationJobsForWorktree", "getActiveWorktreeIntegrationJobForConflictTask",
     "listRecoverableWorktreeIntegrationJobs", "updateWorktreeIntegrationJob"
   ],
   sessionEventRepository: [

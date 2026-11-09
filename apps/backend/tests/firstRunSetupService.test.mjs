@@ -1,3 +1,4 @@
+import { ProviderRuntimeSettings, jsonCredentialReader } from "../src/application/providerRuntimeSettings.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile, chmod, rm } from "node:fs/promises";
@@ -14,12 +15,14 @@ test("account changes invalidate connection proof without replacing provider or 
   await f.service.invalidateConnectionTest(id);
   const saved = f.service.state.providers[id];
   assert.equal(saved.probe.state, "unknown");
+  assert.equal((await f.service.status()).providers[0].enabled, true);
   assert.equal(saved.probe.code, "PROVIDER_ACCOUNT_CHANGED");
   assert.equal(saved.configuredPath, previous.providers[id].configuredPath);
   assert.equal(saved.enabled, previous.providers[id].enabled);
   assert.equal(saved.userDisabled, previous.providers[id].userDisabled);
   assert.equal(f.service.state.defaultProvider, previous.defaultProvider);
-  await assert.rejects(f.service.setEnabled({ providerId: id, path: f.binary, enabled: true }), /先完成回复检测/);
+  await f.service.setEnabled({ providerId: id, path: f.binary, enabled: true });
+  assert.equal((await f.service.status()).providers[0].checkState, "unknown");
 });
 
 test("automatic inventory adopts exactly the tested program; failed candidates and rescans preserve it", async t => {
@@ -129,6 +132,7 @@ test("environment checks commit only successful candidates and invalidate on Hom
   provider.probe = async () => { throw Object.assign(new Error("needs login"), { code: "PROVIDER_LOGIN_REQUIRED" }); };
   const failed = await f.service.check({ ...input, environment: candidate });
   assert.equal(failed.errorCode, "PROVIDER_LOGIN_REQUIRED");
+  assert.equal(failed.enabled, true);
   assert.equal(failed.environment.profileId, "new");
   assert.equal(current.profileId, "old");
   assert.equal((await f.service.status()).providers[0].enabled, true);
@@ -136,7 +140,8 @@ test("environment checks commit only successful candidates and invalidate on Hom
   assert.equal((await f.service.check({ ...input, environment: candidate })).enabled, true);
   assert.equal(current.profileId, "new");
   configRevision++;
-  assert.equal((await f.service.status()).providers[0].enabled, false);
+  assert.equal((await f.service.status()).providers[0].enabled, true);
+  assert.equal((await f.service.status()).providers[0].checkState, "unknown");
 });
 
 test("same CLI with different environments does not coalesce or commit stale results", async t => {
@@ -166,8 +171,9 @@ test("discovery and legacy user confirmation cannot substitute for a reply test"
   const f = await fixture(t);
   f.service.state.providers["codex-app-server"] = { path: f.binary, confirmed: true };
   assert.ok((await f.service.status()).providers.every(p => !p.enabled && p.checkState === "unknown"));
-  await assert.rejects(f.service.setEnabled({ providerId: "codex-app-server", path: f.binary, enabled: true }));
-  await assert.rejects(f.service.prepareAssistant());
+  await f.service.setEnabled({ providerId: "codex-app-server", path: f.binary, enabled: true });
+  assert.equal((await f.service.status()).providers[0].checkState, "unknown");
+  await f.service.prepareAssistant();
   assert.equal(f.probes.length, 0);
 });
 
@@ -184,7 +190,8 @@ for (const providerId of ["codex-app-server", "claude-sdk", "openclacky"]) {
     assert.equal((await restored.status()).providers.find(p => p.id === providerId).enabled, true);
     assert.equal(restored.command(providerId, () => "wrong"), f.binary);
     await chmod(f.binary, 0o600);
-    assert.equal((await restored.status()).providers.find(p => p.id === providerId).enabled, false);
+    assert.equal((await restored.status()).providers.find(p => p.id === providerId).enabled, true);
+    assert.equal((await restored.status()).providers.find(p => p.id === providerId).checkState, "missing");
     await assert.rejects(restored.prepareAssistant());
   });
 }
@@ -248,7 +255,7 @@ test("replaced executable invalidates persisted success", async t => {
   await writeFile(f.binary, "#!/bin/sh\nexit 1\n# different build\n");
   const row = (await f.service.status()).providers[2];
   assert.equal(row.checkState, "unknown");
-  assert.equal(row.enabled, false);
+  assert.equal(row.enabled, true);
 });
 
 test("concurrent Chat preparation and restart reuse the same Session", async t => {
@@ -345,4 +352,115 @@ test("completion rechecks binary availability after Session creation", async t =
   f.options.providers[0].prepare = async () => chmod(f.binary, 0o600);
   await assert.rejects(f.service.complete());
   assert.equal((await f.service.status()).completed, false);
+});
+
+for (const providerId of ["codex-app-server", "claude-sdk", "openclacky"]) {
+  test(`${providerId}: migrate existing use without claiming a successful reply test`, async t => {
+    const f = await fixture(t);
+    await writeFile(f.options.path(), JSON.stringify({ completed: true, providers: {} }));
+    const options = { ...f.options, hasProviderUsage: id => id === providerId };
+    const migrated = new FirstRunSetupService(options);
+    await migrated.initialize();
+    const row = (await migrated.status()).providers.find(p => p.id === providerId);
+    assert.equal(row.enabled, true);
+    assert.equal(row.checkState, "unknown");
+    assert.equal(f.probes.length, 0);
+    assert.equal(f.configured.length, 0);
+    await migrated.prepareAssistant();
+    assert.ok((await migrated.status()).providers.filter(p => p.id !== providerId).every(p => !p.enabled));
+    await migrated.setEnabled({ providerId, path: f.binary, enabled: false });
+    const restarted = new FirstRunSetupService(options);
+    await restarted.initialize();
+    assert.equal((await restarted.status()).providers.find(p => p.id === providerId).enabled, false);
+    assert.equal(restarted.state.providers[providerId].userDisabled, true);
+  });
+}
+
+test("failed rechecks and account invalidation retain enabled intent", async t => {
+  const f = await fixture(t);
+  const providerId = "claude-sdk";
+  await f.service.check({ providerId, path: f.binary });
+  f.options.providers[1].probe = async () => { throw new Error("disconnected"); };
+  const row = await f.service.check({ providerId, path: f.binary });
+  assert.equal(row.enabled, true);
+  assert.equal(row.checkState, "failed");
+  await f.service.prepareAssistant();
+  await f.service.setEnabled({ providerId, path: f.binary, enabled: false });
+  assert.equal((await f.service.status()).providers[1].enabled, false);
+});
+
+for (const providerId of ["codex-app-server", "claude-sdk", "openclacky"]) {
+  test(`${providerId}: local program adoption and enable intent do not require a paid reply`, async t => {
+    const f = await fixture(t);
+    await f.service.setProgram({ providerId, path: f.binary });
+    await f.service.setEnabled({ providerId, path: f.binary, enabled: true });
+    assert.equal(f.service.isEnabled(providerId), true);
+    assert.equal(f.probes.length, 0);
+    assert.equal((await f.service.row(f.service.provider(providerId))).checkState, "unknown");
+    await f.service.setEnabled({ providerId, path: f.binary, enabled: false });
+    assert.throws(() => f.service.assertExecutionAllowed(providerId), { code: "PROVIDER_DISABLED", dispatchState: "not_dispatched" });
+    assert.equal(f.service.state.defaultProviderId, providerId);
+  });
+}
+
+test('one settings submission adopts executable and enable intent with no paid checks', async t => {
+  const f = await fixture(t);
+  const status = await f.service.saveSettings({ providers: [{ providerId: 'codex-app-server', path: f.binary, enabled: true }] });
+  assert.equal(status.providers[0].enabled, true);
+  assert.equal(f.probes.length, 0);
+  assert.equal(f.service.command('codex-app-server', () => 'wrong'), f.binary);
+});
+
+test('invalid engine in a multi-engine form leaves earlier engine enable intent untouched', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.service.saveSettings({ providers: [
+    { providerId: 'codex-app-server', path: f.binary, enabled: true },
+    { providerId: 'claude-sdk', path: '/missing/claude', enabled: true }
+  ] }));
+  assert.equal(f.service.isEnabled('codex-app-server'), false);
+  assert.equal(f.configured.length, 0);
+  assert.equal(f.probes.length, 0);
+});
+
+test('page save applies credential source and enable state together without a model request', async t => {
+  const f = await fixture(t);
+  const source = `${f.binary}-official-auth.json`;
+  await writeFile(source, JSON.stringify({ token: 'synthetic-token' }));
+  const runtime = new ProviderRuntimeSettings({ path: () => `${f.binary}-sources.json`,
+    adapters: Object.fromEntries(f.options.providers.map(p => [p.id, {
+      runtimeDirectory: `${f.binary}-${p.id}-runtime`, target: `${f.binary}-${p.id}-runtime/auth.json`,
+      sourceKinds: ['file'], read: jsonCredentialReader({ fileName: 'auth.json', validate: value => Boolean(value.token) })
+    }])), onChanged: id => f.service.invalidateConnectionTest(id) });
+  await runtime.initialize();
+  f.service.runtimeSettings = runtime;
+  const status = await f.service.saveSettings({ providers: [{ providerId: 'codex-app-server', path: f.binary,
+    enabled: true, source: { kind: 'file', path: source } }] });
+  assert.equal(status.providers[0].enabled, true);
+  assert.equal(status.providers[0].runtime.source.path, source);
+  assert.equal(f.probes.length, 0);
+});
+
+test("account management is advertised only by providers that implement it, and default changes use settings save", async t => {
+  const f = await fixture(t);
+  const provider = f.options.providers[0];
+  let selectedAccountId = "old";
+  provider.accounts = {
+    list: async () => ({ selectedAccountId }),
+    validateSelection: async id => assert.equal(id, "new"),
+    select: async id => { selectedAccountId = id; },
+    operation: async input => ({ action: input.action })
+  };
+  assert.equal((await f.service.accountOperation(provider.id, null)).selectedAccountId, "old");
+  assert.deepEqual(await f.service.accountOperation(provider.id, { action: "rename" }), { action: "rename" });
+  const status = await f.service.status();
+  const row = status.providers.find(value => value.id === provider.id);
+  const other = status.providers.find(value => value.id !== provider.id);
+  assert.equal(row.accounts.selectedAccountId, "old");
+  assert.equal(other.accounts, undefined);
+  await assert.rejects(f.service.accountOperation(other.id, null), /不支持账号管理/);
+  await assert.rejects(f.service.saveCredentialSource({ providerId: provider.id }), /账号管理/);
+  const saved = await f.service.saveSettings({ providers: [
+    { providerId: provider.id, path: row.path, enabled: row.enabled, accountId: "new" }
+  ] });
+  assert.equal(saved.providers.find(value => value.id === provider.id).accounts.selectedAccountId, "new");
 });

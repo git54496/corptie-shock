@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import CorptieClientCore
 
 extension UnifiedConsoleView {
     func setTaskArchived(_ archived: Bool, task: CorptieTask) async {
@@ -28,16 +29,16 @@ extension UnifiedConsoleView {
 
     func prepareTaskChat(_ task: CorptieTask) {
         guard !pendingTaskChatIds.contains(task.id) else { return }
-        guard let agentId = task.mainAgentId,
+        guard let roleId = task.mainRoleId,
               let providerId = modelCatalog.defaultSessionProviderId else {
-            taskRestartError = L10n("无法准备聊天：请检查 Task 的 Agent 和默认 Provider 配置。")
+            taskRestartError = L10n("无法准备聊天：请检查 Task 的角色和默认 Provider 配置。")
             return
         }
         pendingTaskChatIds.insert(task.id)
         Task {
             defer { pendingTaskChatIds.remove(task.id) }
             let result = await entityClient.createSession(
-                taskId: task.id, agentId: agentId, providerId: providerId,
+                taskId: task.id, roleId: roleId, providerId: providerId,
                 title: task.title, dispatchInitialTurn: false
             )
             guard let session = result.session else {
@@ -57,13 +58,6 @@ extension UnifiedConsoleView {
         }
         let trace = SessionSwitchTrace.shared.start(.taskAction, sessionID: session?.id)
         defer { SessionSwitchTrace.shared.finish(trace) }
-        if Self.usesPageGateProof, let session,
-           case .selectSession = ConsoleTaskOpenDecision.resolve(task: task, session: session) {
-            // P0 keeps navigation-induced SwiftUI work behind the same native
-            // opening-page opportunity as business selection.
-            selectSessionAfterHighlight(session, focusComposer: true)
-            return
-        }
         cardSelectionExplicitlyCleared = false
         selectedWorkId = task.workId
         selectedCategory = .worker
@@ -105,9 +99,9 @@ extension UnifiedConsoleView {
     func deleteTask(
         _ task: CorptieTask,
         force: Bool,
-        confirmedBranchName: String?,
         deleteWorktree: Bool,
-        artifactDisposition: CorptieTaskArtifactDisposition
+        artifactDisposition: CorptieTaskArtifactDisposition,
+        options: ClientTaskDeletionOptions
     ) {
         guard !pendingTaskDeletionIds.contains(task.id) else { return }
         taskDeletionPresentation = nil
@@ -119,9 +113,8 @@ extension UnifiedConsoleView {
             let deleted = await entityClient.deleteCorptieTask(
                 taskId: task.id,
                 force: force,
-                confirmedBranchName: confirmedBranchName,
                 deleteWorktree: deleteWorktree,
-                artifactDisposition: artifactDisposition
+                artifactDisposition: artifactDisposition, options: options
             )
             pendingTaskDeletionIds.remove(task.id)
             if deleted {

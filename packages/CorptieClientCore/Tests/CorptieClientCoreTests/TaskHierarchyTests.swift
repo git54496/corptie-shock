@@ -3,12 +3,59 @@ import Testing
 @testable import CorptieClientCore
 
 struct TaskHierarchyTests {
+    @Test func childDeletionKeepsUnknownRisksAndAmbiguousTargetsBlocked() {
+        #expect(TaskDeletionConfirmationPolicy.canForceDelete(riskCodes: ["NOT_DELIVERED_TO_PARENT", "UNTRACKED_FILES"], branchName: "task/child"))
+        #expect(!TaskDeletionConfirmationPolicy.canForceDelete(riskCodes: ["FUTURE_RISK"], branchName: "task/child"))
+        #expect(!TaskDeletionConfirmationPolicy.canForceDelete(riskCodes: ["NOT_DELIVERED_TO_PARENT"], branchName: nil))
+        #expect(TaskDeletionConfirmationPolicy.isTaskLevelBlocker("SESSION_BUSY"))
+        #expect(TaskDeletionConfirmationPolicy.isTaskLevelBlocker("ACTIVE_WORKTREE_INTEGRATION_JOB"))
+        #expect(TaskDeletionConfirmationPolicy.isTaskLevelBlocker("UNKNOWN_BLOCKER"))
+        #expect(!TaskDeletionConfirmationPolicy.isTaskLevelBlocker("MAIN_WORKTREE"))
+    }
+    @Test func gitCapabilityIsIndependentOfApprovalState() throws {
+        let status = try JSONDecoder().decode(TaskIntegrationAcceptanceStatus.self,
+            from: Data(#"{"state":"future_state","canPromote":true,"reason":null,"receiptId":null,"testedHeadOid":null}"#.utf8))
+        #expect(status.mayPromote)
+    }
+    @Test func manualApprovalUsesUserEndpointsAndDoesNotCompleteTasksOrResumeJobs() async throws {
+        for surface in [ClientTaskHierarchyAPI.Surface.local, .pairedDevice] {
+            let transport = BackendTransport(endpoint: try BackendEndpoint(URL(string: "https://unit-test.invalid")!), data: { request in
+                let url = try #require(request.url)
+                let prefix = surface == .local ? "" : "/client/v1"
+                #expect(request.httpMethod == "POST")
+                let data = try #require(request.httpBody)
+                let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                #expect(body["sourceSessionId"] == nil)
+                #expect(body["actor"] == nil)
+                let response: String
+                if url.path.hasSuffix("intents") {
+                    #expect(url.path == prefix + "/tasks/task:p/integration-acceptance-intents")
+                    #expect(body["expectedHierarchyRevision"] as? Int == 4)
+                    #expect(body["expectedBindingRevision"] as? Int == 2)
+                    response = #"{"intentId":"intent:one","confirmationToken":"test-only","expiresAt":"2099-01-01T00:00:00Z","snapshotId":"snapshot:one","parentTaskId":"task:p","parentTaskTitle":"Parent","parentHeadOid":"abc","automatedVerification":"failed"}"#
+                } else {
+                    #expect(url.path == prefix + "/tasks/task:p/integration-acceptance-confirmations")
+                    #expect(body["confirmationToken"] as? String == "test-only")
+                    #expect(body["acknowledgedAutomatedFailure"] as? Bool == true)
+                    response = #"{"state":"passed","receiptId":"approval:one","testedHeadOid":null,"acceptedHeadOid":"abc","canPromote":true,"reason":null,"approvalSource":"manual_user","automatedVerification":"failed"}"#
+                }
+                return (Data(response.utf8), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }, bytes: { _ in throw ClientConnectionError.invalidResponse })
+            let api = ClientTaskHierarchyAPI(transport: transport, surface: surface)
+            let intent = try await api.prepareManualAcceptance(taskID: "task:p", requestID: "prepare_user_123", revision: 4, bindingRevision: 2)
+            let status = try await api.confirmManualAcceptance(intent, requestID: "confirm_user_123", acknowledgedFailure: true)
+            #expect(status.approvalSource == "manual_user")
+            #expect(status.testedHeadOid == nil)
+            #expect(status.automatedVerification == "failed")
+        }
+    }
+
     @Test func oldPayloadAndCreationStayCompatible() throws {
         let task = try JSONDecoder().decode(ClientTask.self, from: Data(#"{"id":"task:old","workId":"work:w","title":"Old","lifecycleState":"todo","executionStatus":"idle","updatedAt":"now"}"#.utf8))
         #expect(task.parentTaskId == nil)
         #expect(task.hierarchy == nil)
         #expect(task.resourceVersion == nil)
-        var creation = ClientTaskCreation(requestId: "request_1234", workId: "work:w", title: "Child", mainAgentId: "agent:a", providerId: "neutral")
+        var creation = ClientTaskCreation(requestId: "request_1234", workId: "work:w", title: "Child", mainRoleId: "agent:a", providerId: "neutral")
         let old = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(creation)) as? [String: Any])
         #expect(old["parentTaskId"] == nil)
         #expect(old["expectedParentResourceVersion"] == nil)
@@ -16,7 +63,11 @@ struct TaskHierarchyTests {
         creation.expectedParentResourceVersion = 7
         let child = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(creation)) as? [String: Any])
         #expect(child["parentTaskId"] as? String == "task:parent")
-        #expect(child["expectedParentResourceVersion"] as? Int == 7)
+        #expect(child["expectedParentResourceVersion"] == nil)
+        let legacy = try JSONDecoder().decode(ClientTaskCreation.self, from: Data(#"{"requestId":"request_legacy","workId":"work:w","title":"Child","mainAgentId":"agent:a","providerId":"neutral","parentTaskId":"task:parent","expectedParentResourceVersion":1}"#.utf8))
+        #expect(legacy.expectedParentResourceVersion == 1)
+        let encodedLegacy = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any])
+        #expect(encodedLegacy["expectedParentResourceVersion"] == nil)
     }
 
     @Test func indexDeduplicatesAncestorsWithoutPromotingOrphansOrTraversingCycles() {
@@ -32,7 +83,19 @@ struct TaskHierarchyTests {
         #expect(index.rootIDsByWork["w"] == ["p"])
         #expect(index.childrenByParentID["p"] == ["c"])
         #expect(index.unresolvedParentIDs == ["unloaded"])
-        #expect(index.invalidNodeIDs == ["cross", "grandchild", "loop-a", "loop-b"])
+        #expect(index.invalidNodeIDs == ["cross", "loop-a", "loop-b"])
+    }
+
+    @Test func multipleLevelsRespectEveryDisclosureAndExposeConstantTimeDepth() {
+        typealias Node = TaskHierarchyIndex.Node
+        let nodes = [Node(id: "root", workId: "w", parentTaskId: nil),
+                     Node(id: "child", workId: "w", parentTaskId: "root"),
+                     Node(id: "leaf", workId: "w", parentTaskId: "child")]
+        #expect(TaskHierarchyIndex.visibleOrder(nodes: nodes, expanded: ["root"]) == ["root", "child"])
+        #expect(TaskHierarchyIndex.visibleOrder(nodes: nodes, expanded: ["root", "child"]) == ["root", "child", "leaf"])
+        let index = TaskHierarchyIndex(nodes: nodes)
+        #expect(index.depthByTaskID["leaf"] == 2)
+        #expect(index.rootByTaskID["leaf"] == "root")
     }
 
     @Test func largeIndexPreservesStableServerOrder() {

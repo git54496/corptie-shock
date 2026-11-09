@@ -1,5 +1,77 @@
 import SwiftUI
 import CorptieClientCore
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
+
+/// Complete diagnostics are prepared off the UI thread when the error arrives.
+/// Only visible chunks are rendered; opening details never parses the full log.
+public struct WorktreeErrorDetailsView: View {
+    private let diagnosticText: String
+    private let summary: String
+    private let localize: (String) -> String
+    @State private var pages: [String] = []
+    @State private var expanded = false
+
+    public init(_ diagnosticText: String, summary: String? = nil, localize: @escaping (String) -> String = { $0 }) {
+        self.diagnosticText = diagnosticText
+        self.summary = summary ?? String(diagnosticText.prefix(240))
+        self.localize = localize
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(verbatim: summary).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            HStack {
+                Button(localize("复制完整诊断")) {
+                    #if os(macOS)
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(diagnosticText, forType: .string)
+                    #else
+                    UIPasteboard.general.string = diagnosticText
+                    #endif
+                }.buttonStyle(.borderless)
+                Button { expanded.toggle() } label: {
+                    Label(localize("完整错误详情"), systemImage: expanded ? "chevron.down" : "chevron.right")
+                }.buttonStyle(.borderless)
+                    .accessibilityValue(localize(expanded ? "已展开" : "已折叠"))
+                    .accessibilityIdentifier("worktree.error.disclosure")
+            }
+            if expanded {
+                if pages.isEmpty { ProgressView() }
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(pages.indices, id: \.self) { index in
+                            Text(verbatim: pages[index]).font(.caption.monospaced())
+                                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    #if os(macOS)
+                    .modifier(DetailScrollOwnerRegistration())
+                    #endif
+                }.frame(maxHeight: 260)
+            }
+        }
+        .task(id: diagnosticText) {
+            let text = diagnosticText
+            pages = []
+            let worker = Task.detached(priority: .utility) {
+                var result: [String] = []
+                var start = text.startIndex
+                while start < text.endIndex, !Task.isCancelled {
+                    let end = text.index(start, offsetBy: 2_048, limitedBy: text.endIndex) ?? text.endIndex
+                    result.append(String(text[start..<end]))
+                    start = end
+                }
+                return result
+            }
+            let prepared = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+            if !Task.isCancelled { pages = prepared }
+        }
+    }
+}
 
 /// The same component and operation flow on macOS, iPad and iPhone. It owns
 /// only visible-card state; Git, authorization and job recovery stay server-side.
@@ -10,6 +82,7 @@ public struct ConversationWorktreeCard: View {
     private let api: @MainActor () async throws -> ClientSessionWorktreeAPI
     private let onJob: @MainActor (ClientWorktreeJob) -> Void
     private let localize: (String) -> String
+    private let openParent: ((String) -> Void)?
     private let presentationState: ClientDetailWorktreeState?
     private let activity: ConversationDetailPresentationActivity?
     private var active: Bool { activity?.isActive ?? true }
@@ -45,7 +118,8 @@ public struct ConversationWorktreeCard: View {
                 initialDetail: ClientSessionWorktreeDetail? = nil,
                 state: ClientDetailWorktreeState? = nil, expectedWorktreeID: String? = nil,
                 presentationState: ClientDetailWorktreeState? = nil,
-                activity: ConversationDetailPresentationActivity? = nil) {
+                activity: ConversationDetailPresentationActivity? = nil,
+                openParent: ((String) -> Void)? = nil) {
         self.sessionID = sessionID; self.refreshID = refreshID
         self.expectedWorktreeID = expectedWorktreeID
         self.presentationState = presentationState; self.activity = activity
@@ -58,6 +132,7 @@ public struct ConversationWorktreeCard: View {
         }
         self.onJob = { value in guard activity?.allows(generation: activity?.generation ?? 0) ?? true else { return }; onJob(value) }
         self.localize = localize
+        self.openParent = openParent
         let retained = state ?? ClientDetailWorktreeState()
         if presentationState == nil {
             if let expectedWorktreeID { retained.bind(expectedWorktreeID) }
@@ -73,7 +148,8 @@ public struct ConversationWorktreeCard: View {
             HStack(spacing: 4) {
                 Button { expanded.toggle() } label: {
                     Label("Worktree", systemImage: expanded ? "chevron.down" : "arrow.triangle.branch")
-                        .font(.caption.weight(.semibold)).frame(maxWidth: .infinity, alignment: .leading)
+                        .font(WorkbenchTypography.font(for: .cardTitle)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .frame(minHeight: headerHeight).contentShape(Rectangle())
                 }.buttonStyle(.plain).accessibilityValue(localize(expanded ? "已展开" : "已收起"))
                 if detail?.worktree?.dirty == true {
@@ -91,8 +167,8 @@ public struct ConversationWorktreeCard: View {
             if loading && detail == nil { ProgressView() }
             if let tree = detail?.worktree {
                 Text("\(tree.branchName ?? localize("游离 HEAD")) → \(tree.hierarchy?.comparison.branchName ?? detail?.mainBranch ?? "—")")
-                    .font(.caption.monospaced()).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                Text(relation(tree)).font(.caption).foregroundStyle(.secondary)
+                    .font(WorkbenchTypography.font(for: .technical)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                Text(relation(tree)).font(WorkbenchTypography.font(for: .help)).foregroundStyle(.secondary)
                 if tree.dirty == true {
                     Text("\(localize("未提交修改")) · \(tree.changedFileCount ?? tree.changedFiles.count)").font(.caption).foregroundStyle(.orange)
                 }
@@ -122,7 +198,7 @@ public struct ConversationWorktreeCard: View {
                                 guard activity?.allows(generation: generation) ?? true else { return }
                                 job=next;review=next;onJob(next)
                             } catch { self.error=error.localizedDescription }
-                        },localize:localize)
+                        },openParent:openParent,localize:localize)
                     }
                     Text(tree.path).font(.caption2.monospaced()).textSelection(.enabled)
                     Text(localize("比较本地主分支；不会自动 fetch 或 push。"))
@@ -176,7 +252,12 @@ public struct ConversationWorktreeCard: View {
                         Text(localize("忽略并继续")).tag("ignore")
                         Text(localize("包含并继续")).tag("include")
                     }
-                    ScrollView { VStack(alignment: .leading) { ForEach(draft.protection.protectedPaths, id: \.self) { Text($0).font(.caption.monospaced()) } } }.frame(maxHeight: 140)
+                    ScrollView {
+                        VStack(alignment: .leading) { ForEach(draft.protection.protectedPaths, id: \.self) { Text($0).font(.caption.monospaced()) } }
+                            #if os(macOS)
+                            .modifier(DetailScrollOwnerRegistration())
+                            #endif
+                    }.frame(maxHeight: 140)
                 }
                 if let error { Text(error).font(.caption).foregroundStyle(.red) }
                 HStack {

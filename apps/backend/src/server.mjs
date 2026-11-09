@@ -1,3 +1,13 @@
+import { logError } from "./utils/errorDiagnostics.mjs";
+import { CodexAccountManager } from "./adapters/codexAccountManager.mjs";
+import { ProviderRuntimeSettings } from "./application/providerRuntimeSettings.mjs";
+import { createProviderCredentialAdapters, selectedCredentialEnvironment } from "./adapters/providerCredentialAdapters.mjs";
+import { worktreeDispatchBlocker } from "./application/worktreeExecutionBarrier.mjs";
+import { ExecutionChecklistService } from "./application/executionChecklistService.mjs";
+import { SessionMailboxService } from "./application/sessionMailboxService.mjs";
+import { TaskCoordinationService } from "./application/taskCoordinationService.mjs";
+import { CoordinationTurnService } from "./application/coordinationTurnService.mjs";
+import { SessionChannelMailboxService } from "./collaboration/sessionChannelMailboxService.mjs";
 import http from "node:http";
 import { deleteUnreceivedUserMessage } from "./application/userMessageDeletion.mjs";
 import { routeBackendHttpRequest } from "./application/backendHttpRouter.mjs";
@@ -6,9 +16,8 @@ import { NativeCodexContinuation } from "./application/nativeCodexContinuation.m
 import { detailServiceFor } from "./application/detailDocumentService.mjs";
 import { detailMigrationConfiguration } from "./application/detailMigrationConfiguration.mjs";
 import { parseDetailWebCards } from "./application/detailWebPresentation.mjs";
-import { createDetailBusinessActionService } from "./application/detailBusinessActionComposition.mjs";
+import { createLocalDetailBusinessActionService } from "./application/detailBusinessActionComposition.mjs";
 import { ClientSessionAPI } from "./application/clientSessionAPI.mjs";
-import { ClientInspectorAPI } from "./application/clientInspectorAPI.mjs";
 import { createDetailBusinessReadPorts } from "./application/detailBusinessReadPorts.mjs";
 import { createProductEventPublisher } from "./application/productEventPublisher.mjs";
 import { createStartupRecoveryOperations } from "./application/startupRecoveryOperations.mjs";
@@ -117,6 +126,7 @@ import { SkillMcpGateway } from "./application/skillMcpGateway.mjs";
 import { assignedCapabilitySummary } from "./application/skillMcpTurnContext.mjs";
 import { McpRegistryService } from "./application/mcpRegistryService.mjs";
 import { McpSessionAvailabilityService } from "./application/mcpSessionAvailabilityService.mjs";
+import { SessionAbilityPreferences } from "./application/sessionAbilityPreferences.mjs";
 import { handleMcpRegistryHttpRequest } from "./application/mcpRegistryHttpApi.mjs";
 import { handleSessionToolHttpRequest } from "./application/sessionToolHttpApi.mjs";
 import { requiredToolDomainsForSession as resolveSessionToolDomainRequirements } from "./application/sessionToolDomainRequirements.mjs";
@@ -150,6 +160,9 @@ import { createCollaborationHttpRoutes } from "./application/collaborationHttpCo
 import { WorkApplicationService } from "./application/workApplicationService.mjs";
 import { createTaskAndSession } from "./application/taskCreationApplicationService.mjs";
 import { TaskCompletionService } from "./application/taskCompletionService.mjs";
+import { ChildTaskDeliveryService } from "./application/childTaskDeliveryService.mjs";
+let childTaskDeliveryService = null;
+let taskCoordinationService = null;
 import { SessionRuntimeReleaseService } from "./application/sessionRuntimeReleaseService.mjs";
 import { HubService, createOpenAiEmbedder } from "./application/hubService.mjs";
 import { AgentContextService } from "./application/agentContextService.mjs";
@@ -184,6 +197,8 @@ import {
   broadcastDshHostFrame,
 } from "./dsh-adapter/dshWebSocket.mjs";
 import { createDshLivePublisher } from "./dsh-adapter/dshLivePublisher.mjs";
+import { rebaseCodexStoragePaths } from "./runtime/codexStorageRelocation.mjs";
+import { migrateDataRoot } from "./runtime/dataRootLayout.mjs";
 import { DataRootMigrationCoordinator } from "./runtime/dataRootMigrationCoordinator.mjs";
 import { BackendDataRootOwnership } from "./runtime/backendDataRootOwnership.mjs";
 import { ProviderEventIngestionService } from "./application/providerEventIngestionService.mjs";
@@ -497,17 +512,65 @@ const dataRootMigrationCoordinator = new DataRootMigrationCoordinator({
   environment: environmentName,
   inspectBlockers: inspectDataRootMigrationBlockers,
   quiesce: quiescePersistentRuntime,
-  resume: resumePersistentRuntime
+  resume: resumePersistentRuntime,
+  migrateRoot: options => migrateDataRoot({
+    ...options,
+    beforeCommit: ({ stagingLayout }) => rebaseCodexStoragePaths({ ...options, stagingLayout })
+  })
 });
 const workChatContextService = new WorkChatContextService({ store, artifactService });
 let workChatOperationService = null;
 let sessionCollaborationService = null;
 const sessionChannelService = new SessionChannelService({ store, collaborationCore });
+const channelMailbox = new SessionChannelMailboxService({
+  store, sessionChannelService, enabled: process.env.CORPTIE_CHANNEL_BATCHING_ENABLED !== "0"
+});
+
+const sessionMailbox = new SessionMailboxService({ store, channelService: sessionChannelService, channelMailbox,
+  resolveActor: id => collaborationCore.getAgentForSession(id)?.agentId,
+  wake: (sessionId, taskId) => {
+    if (taskId) scheduleAgentWorkDrain(sessionId, null, taskId);
+    else void tickAgentWorkQueue().catch(error => { logError("mailbox.tick", error, { stage: "tick" }); console.error(`[mailbox] ${error.code ?? error.message}`); });
+  },
+  changed: sessionId => emitEvent("SessionMailboxChanged", { sessionId, ...sessionMailbox.summary(sessionId) }, { sessionId }),
+  validateExternal: (row, authorization) => {
+    if (authorization.checklistTaskId) {
+      throw Object.assign(new Error("Legacy checklist continuation retired"), { code: "CHECKLIST_CONTINUATION_RETIRED" });
+    }
+    if (authorization.coordinationDispatchId) {
+      if (!taskCoordinationService) throw Object.assign(new Error("Coordination unavailable."), { code: "CAPABILITY_UNAVAILABLE" });
+      return taskCoordinationService.validateMailbox(row, authorization);
+    }
+    if (row.source_type === "automation") {
+      const task = store.getScheduledSessionTask(row.source_id);
+      const work = row.operation_id ? store.getAgentTask(row.operation_id) : null;
+      const run = work?.source?.scheduledRunId ? store.getScheduledSessionRun(work.source.scheduledRunId) : null;
+      if (!task || task.logicalSessionId !== row.recipient_session_id || task.status === "cancelled" || !run
+          || ["cancelled", "failed", "skipped", "missed"].includes(run.status)) {
+        throw Object.assign(new Error("MAILBOX_AUTOMATION_AUTHORIZATION_REVOKED"), { code: "MAILBOX_AUTOMATION_AUTHORIZATION_REVOKED" });
+      }
+      return authorizeScheduledSessionTask({ actor: { type: task.creatorType, id: task.creatorId },
+        logicalSessionId: row.recipient_session_id, environment: environmentName });
+    }
+    if (authorization.ownerLogicalSessionId !== row.recipient_session_id || authorization.sourceId !== row.source_id) {
+      throw Object.assign(new Error("MAILBOX_EVENT_SCOPE_REQUIRED"), { code: "MAILBOX_EVENT_SCOPE_REQUIRED" });
+    }
+  },
+  workEvent: (type, work) => {
+    scheduledSessionTaskService.handleAgentWorkEvent(type, work);
+    taskCoordinationService?.onRuntimeEvent(type, { task: work });
+  }
+});
+channelMailbox.sessionMailbox = sessionMailbox;
+const executionChecklistService = new ExecutionChecklistService({ store,
+  changed: value => emitEvent("ExecutionChecklistChanged", { taskId: value.taskId, revision: value.revision, checklist: executionChecklistService.display(value, false) },
+    { sessionId: store.getLogicalSession(value.logicalSessionId)?.legacySessionId })
+});
 const {
   dispatchSessionChannelDelivery, inspectCollaborationSession,
   resumeCollaborationSession, startCollaborationTurn
 } = createSessionChannelDeliveryOperation({
-  store, sessionChannelService, now,
+  store, sessionChannelService, now, channelMailbox,
   resumeSession: (sessionId, context) => sessionApplicationService.resumeSession(sessionId, context),
   sendMessage: sendUnifiedSessionMessage
 });
@@ -543,15 +606,14 @@ const memoryExtractionScheduler = new MemoryExtractionScheduler({ store, extract
       memoryIds: memories.map((memory) => memory.id) });
   } });
 const taskSessionProjection = createTaskSessionProjection({
-  store, memoryExtractor, memoryScheduler: memoryExtractionScheduler,
+  store, memoryExtractor, memoryScheduler: memoryExtractionScheduler, memoryTopicService,
   emitEvent, sessionWithLogicalWorkspace
 });
 const { settleEntityTaskFromSession, settleTaskForWorkspaceContinuation, reconcileEntityTasksAtStartup } = taskSessionProjection;
 const handleCommittedProviderTerminalLifecycle = createProviderTerminalLifecycle({
-  store, emitEvent,
+  store, emitEvent, sessionMailbox,
   recordWorkSettled: (task) => workspaceContinuationCoordinator.recordWorkSettled(task),
   settleEntityTaskFromSession, collaborationCore,
-  refreshWorkspaceInventoryAfterTurn: (...args) => refreshWorkspaceInventoryAfterTurn(...args),
   continuePendingWorkspaceTransition: (...args) => continuePendingWorkspaceTransition(...args),
   continuePendingProviderSwitch: (...args) => continuePendingProviderSwitch(...args),
   resumeWorkAfterTransition, scheduleAgentWorkDrain
@@ -578,6 +640,7 @@ const bundledGitCommitProtectionPath = fileURLToPath(new URL(
   "../resources/git-commit-protection.json",
   import.meta.url
 ));
+let providerRuntimeSettings;
 const corptieCodexRuntimePaths = resolveCorptieRuntimePaths({ environmentName });
 const corptieClaudeRuntimePaths = resolveCorptieClaudeRuntimePaths({ environmentName });
 const {
@@ -609,6 +672,7 @@ const managedOpenClackyRuntime = configuredOpenClackyBaseURL ? null : new OpenCl
 // 仅把 Skill 内容镜像到这些目录；Claude Code / Codex 运行时会自动扫描各自目录发现 Skill。
 const skillRegistryService = new SkillRegistryService({
   store,
+  packageRoot: join(store.dataRoot, "skill-packages"),
   skillsDirs: {
     "codex-app-server": corptieCodexRuntimePaths.skillsDir,
     "claude-sdk": join(corptieClaudeRuntimePaths.pluginPath, "skills")
@@ -626,20 +690,43 @@ function mcpAssignmentRevisionForAgent(agentId) {
   const standalone = mcpRegistryService.assignmentRevisionForAgent(agentId);
   return skill === "none" && standalone === "none" ? "none" : `${skill}:${standalone}`;
 }
+const sessionAbilityPreferences = new SessionAbilityPreferences({ store, registry: mcpRegistryService });
+skillRegistryService.sessionAbilityPreferences = sessionAbilityPreferences;
 const skillMcpGateway = new SkillMcpGateway({
   onRuntimeEvent: (event) => mcpRegistryService.recordRuntimeEvent(event),
-  resolveServers: async ({ actorId, providerId }) => ({
-    ...await skillRegistryService.mcpServersForAgent(actorId, providerId, { isolateFailures: true }),
-    ...mcpRegistryService.serversForAgent(actorId)
-  }),
+  resolveServers: async ({ actorId, providerId, context }) => {
+    const reference = context.logicalSessionId ?? context.sessionId;
+    const servers = {
+      ...await skillRegistryService.mcpServersForAgent(actorId, providerId, { isolateFailures: true, sessionReference: reference }),
+      ...mcpRegistryService.serversForAgent(actorId)
+    };
+    return Object.fromEntries(Object.entries(servers).filter(([, config]) =>
+      !config.serverId || !sessionAbilityPreferences.isDisabled(reference, "mcp", config.serverId)));
+  },
+  assertSessionEnabled: (input, target) => {
+    const reference = input.metadata?.logicalSessionId ?? input.metadata?.sessionId;
+    if (target.serverId) sessionAbilityPreferences.assertEnabled(reference, "mcp", target.serverId);
+    if (target.skillIds?.length && target.skillIds.every(id => sessionAbilityPreferences.isDisabled(reference, "skill", id))) {
+      sessionAbilityPreferences.assertEnabled(reference, "skill", target.skillIds[0]);
+    }
+  },
+  assertSessionRequest: input => {
+    const reference = input.metadata?.logicalSessionId ?? input.metadata?.sessionId;
+    if (!reference) return;
+    for (const id of sessionAbilityPreferences.preferences(reference).disabledMcpServerIds) {
+      if (String(input.tool).startsWith(`standalone_${id.slice(4).replaceAll("-", "")}__`)) {
+        sessionAbilityPreferences.assertEnabled(reference, "mcp", id);
+      }
+    }
+  },
   resolveRevision: mcpAssignmentRevisionForAgent
 });
 const mcpSessionAvailabilityService = new McpSessionAvailabilityService({
   store, gateway: skillMcpGateway, registry: mcpRegistryService
 });
 // 把「Agent 启用的 Skill 解析」注入 AgentContextService，使 Agent 初始化上下文包含 Skill 信息。
-agentContextService.resolveAgentSkills = (agentId) => {
-  return skillRegistryService.skillsForAgent(agentId);
+agentContextService.resolveAgentSkills = (agentId, scope) => {
+  return skillRegistryService.skillsForAgent(agentId, scope?.logicalSessionId ?? scope?.sessionId);
 };
 const collaborationDeliveryRouteResolver = new CollaborationDeliveryRouteResolver({
   core: collaborationCore,
@@ -669,7 +756,7 @@ const {
   authorizeScheduledSessionTask, enqueueScheduledSessionWork,
   scheduledSessionHttpActor, scheduledSessionHttpLogicalSessionId
 } = createScheduledSessionBoundary({
-  store, environmentName, collaborationCore, emitEvent, scheduleAgentWorkDrain,
+  store, environmentName, collaborationCore, emitEvent, scheduleAgentWorkDrain, sessionMailbox,
   canDeliverScheduledMessage: (deviceId) => clientDeviceGateway?.authority.canDeliverScheduledMessage(deviceId),
   registerRuntimeQueuedWork: (...args) => registerRuntimeQueuedWork(...args),
   runtimeQueuePosition: (...args) => runtimeQueuePosition(...args)
@@ -688,10 +775,20 @@ const scheduledSessionTaskService = new ScheduledSessionTaskService({
   enqueue: enqueueScheduledSessionWork,
   activate: async (payload) => {
     emitEvent("AutomationSessionActivationRequested", payload, { sessionId: payload.sessionId });
+    const owner = sessionMailbox.logical(payload.sessionId);
+    sessionMailbox.receiveEvent({ recipientSessionId: owner.logicalSessionId, sourceType: "system",
+      sourceId: payload.taskId ?? payload.runId, body: "自动化请求激活此会话。", intent: "notification",
+      idempotencyKey: `${payload.runId}:activation`,
+      authorization: { ownerLogicalSessionId: owner.logicalSessionId, sourceId: payload.taskId ?? payload.runId } });
     return { delivered: true };
   },
   notify: async (payload) => {
     emitEvent("AutomationLocalNotificationRequested", payload, { sessionId: payload.sessionId });
+    const owner = sessionMailbox.logical(payload.sessionId);
+    sessionMailbox.receiveEvent({ recipientSessionId: owner.logicalSessionId, sourceType: "system",
+      sourceId: payload.taskId ?? payload.runId, body: payload.body ?? payload.message ?? payload.title ?? "自动化通知。", intent: "notification",
+      idempotencyKey: `${payload.runId}:notification`,
+      authorization: { ownerLogicalSessionId: owner.logicalSessionId, sourceId: payload.taskId ?? payload.runId } });
     return { delivered: true };
   },
   onEvent: (type, payload) => emitEvent(type, payload, {
@@ -705,6 +802,7 @@ let platformOperationService = null;
 let toolMaterializationPort = null;
 const platformConfirmationService = new PlatformConfirmationService({ store });
 const hostToolCatalog = createHostToolCatalog({
+  executionChecklistService,
   mcpRegistryService, onIntegrationChanged: (type, payload) => emitEvent(type, payload),
   memoryOperationService, artifactService, callWorkspaceDynamicTool,
   validateProjectCodeHostRoute,
@@ -715,6 +813,7 @@ const hostToolCatalog = createHostToolCatalog({
   reviseTaskForSession, sceneService,
   getToolMaterializationPort: () => toolMaterializationPort,
   getPlatformOperationService: () => platformOperationService,
+  getSessionMailboxService: () => sessionMailbox,
   getWorkChatOperationService: () => workChatOperationService,
   contextReadService
 });
@@ -725,7 +824,7 @@ const codexEnvironmentRegistry = new CodexEnvironmentRegistry({
   isolatedHome: corptieCodexRuntimePaths.codexHome,
   hasExistingSessions: () => store.listSessions().some(session => session.external?.provider === "codex-app-server")
 });
-const codexRuntimeOptions = { environmentName, bundledMemoryPath: bundledAgentMemoryPath,
+const codexRuntimeOptions = { environmentName, corptieHome: store.dataRoot, bundledMemoryPath: bundledAgentMemoryPath,
   bundledSkillPath: bundledCollaborationSkillPath, bundledProjectToolsReferencePath: bundledProjectToolsetReferencePath,
   collaborationMcpServerPath };
 let managedCodexResources;
@@ -736,12 +835,15 @@ async function prepareCodexEnvironment(profile) {
   });
   const resources = await managedCodexResources;
   await codexEnvironmentRegistry.validate(profile);
+  if (profile.mode === "isolated" && profile.home !== corptieCodexRuntimePaths.codexHome) {
+    return ensureCorptieCodexRuntime({ ...codexRuntimeOptions, codexHome: profile.home });
+  }
   return resources;
 }
-const codexEnvironment = (profile, command = codexAppServerCommand()) => ({
+const codexEnvironment = (profile, command = codexAppServerCommand()) => selectedCredentialEnvironment({
   ...environmentForCommand(command),
   ...proxyEnvForProfile(store.settings().agentProxy?.codex), CODEX_HOME: profile.home
-});
+}, "codex-app-server", profile.mode === "isolated" ? {} : null);
 let nativeCodexInstructions;
 async function codexEnvironmentInstructions() {
   nativeCodexInstructions ??= Promise.all([
@@ -771,6 +873,8 @@ const { ensureCodexSessionPermissions, resolvedNewCodexRuntimeConfig } = createC
 });
 const codexRuntime = createCodexEnvironmentRuntime({
   registry: codexEnvironmentRegistry, environment: codexEnvironment,
+  assertProfileReady: (profile) => codexAccounts.assertProfileReady(profile),
+  accountAuthentication: (profile, refresh, storageProfile) => codexAccounts.executionAuthentication(profile, refresh, storageProfile),
   prepare: prepareCodexEnvironment, instructions: codexEnvironmentInstructions,
   canRelease: (profile) => !codexEnvironmentHasActiveSession(profile),
   resolveSourceThread: (input) => {
@@ -890,7 +994,7 @@ const providerSessionLifecycle = new ProviderSessionLifecycle({
 });
 const claudeProviderRuntime = createClaudeProviderRuntime({
   store,
-  environment: () => process.env,
+  environment: () => selectedCredentialEnvironment(process.env, "claude-sdk", providerRuntimeSettings?.sources["claude-sdk"]),
   prepareSessionInput: prepareClaudeProviderSessionInput,
   onProviderEvent: handleClaudeProviderEventSafely,
   listModels: loadClaudeModels,
@@ -1043,14 +1147,66 @@ const claudeNotificationReceiver = createClaudeNotificationReceiver({
   sessionStateDiagnostics, now, workspaceContinuationCoordinator,
   settleEntityTaskFromSession, collaborationCore, resumeWorkAfterTransition,
   scheduleAgentWorkDrain,
-  refreshWorkspaceInventoryAfterTurn: (...args) => refreshWorkspaceInventoryAfterTurn(...args),
   continuePendingWorkspaceTransition: (...args) => continuePendingWorkspaceTransition(...args),
   continuePendingProviderSwitch: (...args) => continuePendingProviderSwitch(...args)
 });
 
+providerRuntimeSettings = new ProviderRuntimeSettings({
+  path: () => join(store.layout.stateDirectory, "provider-credential-sources.json"),
+  adapters: createProviderCredentialAdapters({ codexPaths: corptieCodexRuntimePaths,
+    claudePaths: corptieClaudeRuntimePaths, openClackyPaths: corptieOpenClackyRuntimePaths,
+    nativeCodexHome: codexEnvironmentRegistry.nativeHome }),
+  isBusy: (providerId) => (agentProviderRegistry.activeExecutions.get(providerId) ?? 0) > 0
+    || store.listSessions().some(session => session.external?.provider === providerId
+      && (session.external?.activeTurnId || session.activeTurnId || session.rawStatus?.activeTurnId)),
+  onChanged: (providerId) => firstRunSetup.invalidateConnectionTest(providerId)
+});
+const codexCredentialReader = providerRuntimeSettings.adapters["codex-app-server"];
+const codexAccounts = new CodexAccountManager({
+  path: () => join(store.layout.stateDirectory, "codex-accounts.json"),
+  registry: codexEnvironmentRegistry,
+  readSource: (source) => codexCredentialReader.read(source),
+  sourceKinds: codexCredentialReader.sourceKinds,
+  candidates: codexCredentialReader.candidates,
+  prepare: prepareCodexEnvironment,
+  environment: codexEnvironment,
+  command: codexAppServerCommand,
+  isBusy: (profile) => !codexRuntime.canUpdateExecutionAccount(profile) || codexEnvironmentHasActiveSession(profile),
+  bindingCount: (profile) => {
+    const threads = new Set(Object.keys(codexEnvironmentRegistry.state.threads));
+    if (profile.profileId === codexEnvironmentRegistry.legacy.profileId) {
+      for (const archived of [false, true]) {
+        for (const session of store.listSessions({ archived })) {
+          if (session.external?.provider === "codex-app-server" && session.external.threadId) threads.add(session.external.threadId);
+        }
+      }
+    }
+    return [...threads].filter(id => codexEnvironmentRegistry.forThread(id).profileId === profile.profileId).length;
+  },
+  recycle: (profile) => codexRuntime.recycleExecutionAccount(profile),
+  onSelected: async (profile) => {
+    process.env.CODEX_HOME = profile.home;
+    await firstRunSetup.invalidateConnectionTest("codex-app-server");
+    sessionBindingReadinessProbe.invalidateProvider("codex-app-server");
+    for (const archived of [false, true]) {
+      for (const session of store.listSessions({ archived })) {
+        if (session.external?.provider === "codex-app-server") store.touchSessionProjectionDependency(session.id);
+      }
+    }
+  }
+});
+agentProviderRegistry.executionPolicy = {
+  isEnabled: (providerId) => firstRunSetup.isEnabled(providerId),
+  assertAllowed: (providerId) => firstRunSetup.assertExecutionAllowed(providerId),
+  prepare: (providerId, _capability, args) => firstRunSetup.provider(providerId).accounts
+    ? undefined : providerRuntimeSettings.prepareExecution(providerId, args)
+};
+
 const firstRunSetup = new FirstRunSetupService({
+  runtimeSettings: providerRuntimeSettings,
   path: () => join(store.dataRoot, "first-run-setup.json"),
   hasWorks: () => store.listWorks().length > 0,
+  hasProviderUsage: (providerId) => store.listSessions().some((session) => session.external?.provider === providerId),
   firstWorkSession: () => {
     const work = store.listWorks()[0];
     return work ? store.getWorkChatSession(work.id) : null;
@@ -1077,10 +1233,18 @@ const firstRunSetup = new FirstRunSetupService({
       withProgramTransition: async (path, probe, operation) => {
         const saved = firstRunSetup.state.providers["codex-app-server"];
         if (codexAppServerCommand() === path && saved?.probe?.fingerprint === probe.fingerprint) return operation();
-        codexEnvironmentSetup.assertNoPendingLogin();
+        codexAccounts.assertNoPendingLogin();
         return codexRuntime.withExecutableTransition(() => nativeCodexContinuation.withExecutableTransition(operation));
       },
       ...codexEnvironmentSetup,
+      accounts: codexAccounts,
+      authentication: undefined,
+      resolveEnvironment: () => codexEnvironmentRegistry.current,
+      configureEnvironment: () => {},
+      probe: async (path, options) => {
+        await codexAccounts.assertProfileReady(options.environment);
+        return codexEnvironmentSetup.probe(path, options);
+      },
       prepare: async () => {
         await prepareCodexEnvironment(codexEnvironmentRegistry.current);
         await codexRuntime.initialize();
@@ -1089,7 +1253,7 @@ const firstRunSetup = new FirstRunSetupService({
       configure: async (path, probe = {}) => {
         const saved = firstRunSetup.state.providers["codex-app-server"];
         if (codexAppServerCommand() === path && saved?.probe?.fingerprint === probe.fingerprint) return;
-        codexEnvironmentSetup.assertNoPendingLogin();
+        codexAccounts.assertNoPendingLogin();
         if (codexEnvironmentHasActiveSession(codexEnvironmentRegistry.current)) {
           throw new Error("此 Provider 正在执行，请结束后再更改程序。");
         }
@@ -1098,12 +1262,12 @@ const firstRunSetup = new FirstRunSetupService({
       } },
     { id: "claude-sdk", name: "Claude Code", discover: () => resolveExternalCommand("claude", { environmentVariables: ["CORPTIE_CLAUDE_PATH"] }),
       probe: createClaudeReplyProbe({ environment: async () => {
-        await ensureCorptieClaudeRuntime({ environmentName, bundledMemoryPath: bundledAgentMemoryPath,
+        await ensureCorptieClaudeRuntime({ environmentName, corptieHome: store.dataRoot, importAuthentication: false, bundledMemoryPath: bundledAgentMemoryPath,
           bundledSkillPath: bundledCollaborationSkillPath, bundledProjectToolsReferencePath: bundledProjectToolsetReferencePath });
-        return process.env;
+        return selectedCredentialEnvironment(process.env, "claude-sdk", providerRuntimeSettings?.sources["claude-sdk"]);
       } }),
       prepare: async () => {
-        await ensureCorptieClaudeRuntime({ environmentName, bundledMemoryPath: bundledAgentMemoryPath,
+        await ensureCorptieClaudeRuntime({ environmentName, corptieHome: store.dataRoot, importAuthentication: false, bundledMemoryPath: bundledAgentMemoryPath,
           bundledSkillPath: bundledCollaborationSkillPath, bundledProjectToolsReferencePath: bundledProjectToolsetReferencePath });
         setProviderRuntimeReadiness("claude-sdk", { state: "ready" });
       },
@@ -1132,8 +1296,8 @@ function assertSetupPathChangeAllowed(providerId, path) {
   const saved = firstRunSetup.state.providers?.[providerId];
   const previous = saved?.configuredPath ?? (saved?.confirmed ? saved.path : null);
   if (previous === path) return;
-  if (store.listSessions({ archived: false }).some((session) => session.external?.provider === providerId)) {
-    throw new Error("该 Provider 已有会话，请先保留当前路径完成引导。");
+  if (store.listSessions({ archived: false }).some((session) => session.external?.provider === providerId && sessionHasActiveRun(session))) {
+    throw new Error("该执行引擎正在运行，请等待当前请求结束后再更改程序。");
   }
 }
 
@@ -1155,6 +1319,10 @@ sessionCollaborationService = createSessionCollaborationComposition({
   defaultProviderId: agentProviderRegistry.defaultProviderId
 });
 const { setProviderRuntimeReadiness, decorateSessionForClient } = createSessionReadinessProjection({
+  readMailboxSummary: sessionId => {
+    const logical = store.getLogicalSessionByLegacySessionId(sessionId) ?? store.getLogicalSession(sessionId);
+    return logical ? sessionMailbox.summary(logical.logicalSessionId) : null;
+  },
   store, agentProviderRegistry, scheduleStateSyncPublish,
   readBindingProbe: () => sessionBindingReadinessProbe,
   readFallbackBindingReadiness: (logicalSessionId) => emptyCodexBindingPreflight.readiness(logicalSessionId)
@@ -1267,7 +1435,8 @@ const sessionApplicationService = createSessionApplicationComposition({
   requireSessionReference, workChatContextService,
   resolveContextReferences: (sessionId, options) => sessionContextReferenceService.resolve(sessionId, options),
   artifactService, memoryRecallService, memoryTopicService, mcpAssignmentRevisionForAgent,
-  resolveAssignedCapabilities: (agentId) => assignedCapabilitySummary(store, agentId),
+  resolveAssignedCapabilities: (agentId, reference) => assignedCapabilitySummary(store, agentId)
+    .map(entry => ({ ...entry, enabled: entry.enabled && !sessionAbilityPreferences.isDisabled(reference, entry.kind, entry.id) })),
   ensureCollaborationAgentForSession, ensureLogicalRouteForProviderSession,
   sessionWithLogicalWorkspace, collaborationCore, emitEvent
 });
@@ -1275,7 +1444,9 @@ observeSessionContextEvent = (context) => sessionApplicationService.observeSessi
 const { interruptUnifiedSession, respondUnifiedSessionApproval, respondUnifiedSessionUserInput } = createSessionInteractionCommands({
   store, requireSessionReference, sessionApplicationService, providerEventIngestion,
   handleCommittedProviderTerminalLifecycle, sendUnifiedSessionMessage, emitEvent, now,
-  onInterruptRequested: (entry) => turnExecutionProbe?.request(entry)
+  onInterruptRequested: (entry) => {
+    if (entry.turnId) turnExecutionProbe?.request(entry);
+  }
 });
 const { handleProviderResponseDelayed, handleProviderResponseTimeout } = createProviderResponseHandlers({
   store, providerEventIngestion, sessionApplicationService,
@@ -1368,6 +1539,11 @@ const backgroundAgentService = new BackgroundAgentService({
   defaultProviderId: agentProviderRegistry.defaultProviderId,
   resolveProviderId: (provider) => resolveSessionProviderId(provider),
   resolveAgentContext: (agentId, { intent } = {}) => agentContextService.buildAgentContext(agentId, { intent }),
+  onCompletionDelivery: input => {
+    const owner = sessionMailbox.logical(input.recipientSessionId);
+    return sessionMailbox.receiveEvent({ ...input, recipientSessionId: owner.logicalSessionId,
+      authorization: { ...input.authorization, ownerLogicalSessionId: owner.logicalSessionId } });
+  },
   onOperationEvent: (type, payload) => {
     emitEvent(type, payload);
     if (type === "BackgroundAgentCompleted" || type === "BackgroundAgentFailed") {
@@ -1474,7 +1650,7 @@ const { controlPlaneSnapshot, readControlPlaneEntity, presentTaskForClient } = c
   store, environmentName, decorateSessionForClient
 });
 const { readSessionUsage, getGatewayUsage } = createSessionUsageReader({
-  store, sessionApplicationService,
+  store, sessionApplicationService, readOnly: developmentPreview,
   publishTimeline: (sessionId) => clientDeviceGateway?.events.publishTimeline(sessionId),
   resetForecastForSession: (session) => session.external?.provider === "codex-app-server"
     ? codexResetForecastMonitor?.snapshot() ?? null : null
@@ -1485,7 +1661,7 @@ const { sessionDeletionPlan, sessionWorkspaceRecoveryStatus } = createSessionWor
 const taskWorkspaceService = new TaskWorkspaceService({
   store,
   requireProject: (repositoryId) => projectApplicationService.requireProject(repositoryId),
-  inspectProject: (mainPath, repositoryId) => gitWorkspaces.projectStatusForPath(mainPath, repositoryId),
+  inspectProject: (mainPath, repositoryId, options) => gitWorkspaces.projectStatusForPath(mainPath, repositoryId, options),
   ensureWorktree: (input) => gitWorkspaces.ensureTaskWorktreeForProject(input),
   restoreMissingWorktree: (input) => gitWorkspaces.restoreMissingWorktree(input)
 });
@@ -1517,9 +1693,42 @@ const {
   store, inspectTaskWorktree, removeTaskDeletionWorktree,
   sessionApplicationService, artifactService, emitEvent,
   workService, sessionRuntimeReleaseService, sessionWorktrees,
-  ensureTaskWorkspace
+  ensureTaskWorkspace,
+  cancelTaskStartup: taskId => workSessionStartApplicationService.cancelForTaskDeletion(taskId),
+  cleanupTaskExecutionSpaces: taskId => workSessionStartApplicationService.managedSandboxCoordinator?.cleanupForTaskDeletion(taskId),
+  cancelTaskIntegration: async (jobId, { actor, taskId }) => {
+    const job = store.getWorktreeIntegrationJob(jobId);
+    if (!job) return;
+    const task = store.getTask(taskId);
+    if (actor?.type === "parent_session" && job.workId && job.workId !== task?.work_id) throw Object.assign(new Error("集成作业不在当前 Work。"), { code: "TASK_DELETE_FORBIDDEN" });
+    return worktreeIntegrationJobService.cancel(jobId);
+  }
 });
 taskExecutionOrchestrator = composedTaskExecutionOrchestrator;
+taskCoordinationService = new TaskCoordinationService({ store, collaboration: sessionCollaborationService, emitEvent,
+  mailbox: sessionMailbox, deletion: taskDeletionService,
+  changed: taskId => { if (taskId) emitEvent("TaskChanged", { taskId, action: "coordination-state",
+    entity: { ...store.getTask(taskId), coordinationDispatches: store.listTaskCoordinationDispatches(taskId) } }); } });
+sessionCollaborationService.taskCoordinationService = taskCoordinationService;
+sessionApplicationService.coordinationTurns = new CoordinationTurnService({
+  store, registry: agentProviderRegistry, planner: backgroundAgentService,
+  dispatch: taskCoordinationService, contextRead: contextReadService, emitEvent, resolveReference: requireSessionReference,
+  onTerminal: ({ reference, turnId, status }) => handleCommittedProviderTerminalLifecycle({
+    event: { type: `turn.${status}`, turnId, source: "host-coordination" },
+    projection: { session: store.getSession(reference.sessionId), terminalStatus: status },
+    logicalRoute: store.getLogicalSession(reference.logicalSessionId)
+  })
+});
+workService.assertCoordinationCanEnable = task => sessionApplicationService.coordinationTurns.assertCanEnable(task);
+workService.onCoordinationChanged = taskId => sessionApplicationService.coordinationTurns.policyChanged(taskId);
+toolHostService.assertExecutionAllowed = input => {
+  const id = input.metadata?.logicalSessionId;
+  if (id && input.executionEffect !== "read" && sessionApplicationService.coordinationTurns.enabled(requireSessionReference(id))) {
+    throw Object.assign(new Error("协调会话可以执行已声明的只读查询；开发写入请派发给子任务。"), {
+      code: "COORDINATION_WRITE_REQUIRES_DISPATCH", statusCode: 403
+    });
+  }
+};
 ({ workSessionStartupCoordinator, workSessionStartApplicationService } = createWorkSessionStartupComposition({
   store, workService, agentProviderRegistry, sessionApplicationService,
   forkContextForTask: (taskId) => sessionForkService.contextForTask(taskId),
@@ -1536,7 +1745,7 @@ const { sessionForkService, prepareConversationForkWorkspace } = createSessionFo
   workSessionStartApplicationService, chatResourceService, collaborationCore,
   createSessionThroughApplication: (...args) => createSessionThroughApplication(...args),
   emitEvent, createForkWorktree,
-  createGitWorkspaceSnapshot, ensureArtifactCommitHook: ensureRepositoryArtifactCommitHook
+  ensureArtifactCommitHook: ensureRepositoryArtifactCommitHook
 });
 const { projectWorktreeIntegrationService, worktreeIntegrationJobService } = createWorktreeIntegrationServices({
   onDispatchReleased: worktreeIds => {
@@ -1570,12 +1779,17 @@ worktreeAutoFollowService = new WorktreeAutoFollowService({
   readHead: path => gitWorkspaces.gitOutput(path, ["rev-parse", "--verify", "HEAD"]),
   onEvent: emitEvent
 });
+childTaskDeliveryService = new ChildTaskDeliveryService({store,gitWorkspaces,jobs:worktreeIntegrationJobService,
+  artifactService,deletionService:taskDeletionService,prepareProtection:path=>gitCommitProtection.resolve(path),onEvent:emitEvent});
+taskCompletionService.childDelivery = childTaskDeliveryService;
+workService.childTaskDeliveryService = childTaskDeliveryService;
+workService.taskCompletionService = taskCompletionService;
 const {
   syncSessionChannelDeliveriesIntoAgentWorkQueue,
   syncCollaborationDeliveriesIntoAgentWorkQueue,
   resolveCollaborationDeliveryRoute
 } = createCollaborationDeliveryQueue({
-  store, sessionChannelService, collaborationCore, collaborationDispatcher,
+  store, sessionChannelService, collaborationCore, collaborationDispatcher, channelMailbox,
   collaborationDeliveryRouteResolver, emitEvent, scheduleAgentWorkDrain,
   registerRuntimeQueuedWork: (...args) => registerRuntimeQueuedWork(...args),
   moveRuntimeQueuedWork: (...args) => moveRuntimeQueuedWork(...args)
@@ -1586,11 +1800,11 @@ const { resolveCollaborationConfirmation, resolveSessionChannelRequest } = creat
 });
 const {
   continuePendingWorkspaceTransition, continuePendingProviderSwitch,
-  enqueueWorkspaceContinuationSafely, refreshWorkspaceInventoryAfterTurn, reconcileMovedWorkspaceRoutes
+  enqueueWorkspaceContinuationSafely, reconcileMovedWorkspaceRoutes
 } = createPostTurnWorkspaceOperations({
   store, workspaceTransitionRuntimeForLogicalSession, sessionBindingRepository,
   sessionProviderSwitchCoordinator, workspaceContinuationCoordinator,
-  createGitWorkspaceSnapshot, emitEvent
+  emitEvent
 });
 const { createSessionThroughApplication } = createSessionCreationOperation({
   store, sessionApplicationService, sessionForkService, sessionTitleReservations,
@@ -1624,11 +1838,17 @@ const {
   registerRuntimeQueuedWork, forgetRuntimeQueuedWork, moveRuntimeQueuedWork,
   runtimeQueuePosition, drainAgentWork, tickAgentWorkQueue
 } = createRuntimeAgentWorkQueue({
-  store, collaborationCore, sessionChannelService, collaborationDispatcher,
+  store, collaborationCore, sessionChannelService, collaborationDispatcher, channelMailbox, sessionMailbox,
+  providerDispatchDecision: (item) => {
+    const id = store.getSession(item.sessionId)?.external?.provider;
+    return !id || firstRunSetup.isEnabled(id) ? { allowed: true }
+      : { allowed: false, code: "PROVIDER_DISABLED", kind: "paused", message: "执行引擎已关闭，排队请求已暂停。" };
+  },
   workspaceContinuationCoordinator, inspectCollaborationSession, resolveCollaborationDeliveryRoute,
   scheduleAgentWorkDrain, dispatchSessionChannelDelivery, sendUnifiedSessionMessage, emitEvent,
   syncSessionChannelDeliveriesIntoAgentWorkQueue, syncCollaborationDeliveriesIntoAgentWorkQueue,
-  isWorkspaceMutationActive: sessionId => automaticWorktreeMutationActive(store, { sessionId })
+  isWorkspaceMutationActive: sessionId => automaticWorktreeMutationActive(store, { sessionId }),
+  inspectWorkspaceDispatchBlocker: sessionId => worktreeDispatchBlocker(store,{sessionId})
 });
 function cancelQueuedUserMessage(sessionId, taskId) {
   const routedSessionId = requireSessionReference(sessionId).sessionId;
@@ -1667,7 +1887,7 @@ function now() {
 }
 
 const providerSessionRouteBootstrap = createProviderSessionRouteBootstrap({
-  store, createGitWorkspaceSnapshot, inspectGitWorkspace,
+  store, inspectGitWorkspace,
   defaultWorkspacePath, normalizeSessionId, codexPermissionsForSession
 });
 const sessionProviderAttachments = createSessionProviderAttachments({
@@ -1710,6 +1930,8 @@ function sessionTitleErrorPayload(error, extra = {}) {
 
 
 function emitEvent(type, payload, options = {}) {
+  childTaskDeliveryService?.onRuntimeEvent(type,payload);
+  taskCoordinationService?.onRuntimeEvent(type,payload);
   productEventPublisher ??= createProductEventPublisher({
     store, eventLog, sseClients, now,
     getClientDeviceGateway: () => clientDeviceGateway,
@@ -1920,6 +2142,7 @@ function manageCodexTurnChanges(reference, turnId, action) {
 function projectSessionChannelMessageForSender(result) {
   const message = result?.message;
   if (!message?.messageId || !message.senderSessionId) return;
+  sessionMailbox.notify(sessionMailbox.logical(message.recipientSessionId));
   emitEvent("SessionChannelMessageSent", {
     sessionId: message.senderSessionId,
     channel: result.channel,
@@ -1947,6 +2170,7 @@ const sessionMessageOperation = createSessionMessageOperation({
   onTurnAccepted: (entry) => turnExecutionProbe.observe({ event: { ...entry, type: "turn.started" }, binding: entry }),
   ensureCollaborationAgentForSession, registerRuntimeQueuedWork,
   runtimeQueuePosition, publishProviderEventOutbox, scheduleAgentWorkDrain,
+  memoryTopicService,
   scheduleMemoryExtraction: (sessionId, reason) => memoryExtractionScheduler.request(sessionId, reason)
 });
 
@@ -1964,6 +2188,7 @@ function scheduleAgentWorkDrain(sessionId, latencyTrace = null, taskId = null) {
   queueMicrotask(() => {
     logSessionMessageLatency(latencyTrace, "queue_drain_dispatched");
     drainAgentWork(sessionId).catch((error) => {
+      logError("agent-work.drain", error, { sessionId, stage: "drain" });
       console.error(`[agent-work] session=${sessionId} drain failed: ${error.message}`);
     });
   });
@@ -2068,8 +2293,8 @@ async function projectWorktreeStatus(sessionId, options) {
   return projectWorktreeStatusReader.projectWorktreeStatus(sessionId, options);
 }
 
-async function ensureTaskWorkspace({ task, session = null, baseContext = null }) {
-  return taskWorkspaceService.ensure({ task, session, baseContext });
+async function ensureTaskWorkspace({ task, session = null, baseContext = null, startupTiming = null }) {
+  return taskWorkspaceService.ensure({ task, session, baseContext, startupTiming });
 }
 
 
@@ -2167,6 +2392,8 @@ const backendHttpPorts = Object.freeze({
   get handleSessionToolHttpRequest() { return handleSessionToolHttpRequest; },
   get collaborationCore() { return collaborationCore; },
   get toolHostService() { return toolHostService; },
+  get executionChecklistService() { return executionChecklistService; },
+  get sessionMailbox() { return sessionMailbox; },
   get sessionToolMetadata() { return sessionToolMetadata; },
   get handleCollaborationRoutes() { return handleCollaborationRoutes; },
   get handleArtifactHttpRequest() { return handleArtifactHttpRequest; },
@@ -2180,6 +2407,7 @@ const backendHttpPorts = Object.freeze({
   get handleMcpRegistryHttpRequest() { return handleMcpRegistryHttpRequest; },
   get mcpRegistryService() { return mcpRegistryService; },
   get mcpSessionAvailabilityService() { return mcpSessionAvailabilityService; },
+  get sessionAbilityPreferences() { return sessionAbilityPreferences; },
   get emitEvent() { return emitEvent; },
   get handleEntityRoutes() { return handleEntityRoutes; },
   get handleDshHttpRequest() { return handleDshHttpRequest; },
@@ -2351,9 +2579,12 @@ await migrateStoreOffMainThread({
   dataRoot: store.dataRoot
 });
 await store.initialize({ resolveDataPath: false, performMigrations: false });
+if (!developmentPreview) skillRegistryService.reconcileInterruptedInstallations();
 detailServiceFor(store, detailMigration);
+await providerRuntimeSettings.initialize();
 await firstRunSetup.initialize();
 await codexEnvironmentRegistry.initialize();
+await codexAccounts.initialize();
 if (firstRunSetup.state.defaultProviderId) {
   agentProviderRegistry.defaultProviderId = firstRunSetup.state.defaultProviderId;
   backgroundAgentService.defaultProviderId = firstRunSetup.state.defaultProviderId;
@@ -2365,16 +2596,17 @@ await seedDevelopmentFixtures({
   bundledCollaborationSkillPath, now, marker: developmentFixtureMarker,
   enabled: shouldSeedDevelopmentFixtures
 });
+detailServiceFor(store, detailMigration).coordinationState = id => sessionApplicationService.coordinationTurns.state(requireSessionReference(id));
 detailServiceFor(store, detailMigration).configureBusinessPorts(createDetailBusinessReadPorts({
   store, references: sessionContextReferenceService, artifacts: artifactService,
   schedules: scheduledSessionTaskService, observability: turnObservability,
   providerRegistry: agentProviderRegistry,
   readWorktree: id => projectWorktreeStatusReader.worktreeDetail(id)
 }));
-detailActionService = createDetailBusinessActionService({ commandAPI: new ClientSessionAPI({ store }),
-  documentService: detailServiceFor(store, detailMigration), inspector: new ClientInspectorAPI({ store,
-    resolveSession: requireSessionReference, references: sessionContextReferenceService,
-    artifacts: artifactService, schedules: scheduledSessionTaskService, observability: turnObservability }) });
+detailActionService = createLocalDetailBusinessActionService({ commandAPI: new ClientSessionAPI({ store }), workService, store,
+  documentService: detailServiceFor(store, detailMigration),
+  resolveSession: requireSessionReference, references: sessionContextReferenceService,
+  artifacts: artifactService, schedules: scheduledSessionTaskService, observability: turnObservability });
 detailServiceFor(store, detailMigration).configureBusinessActionRegistry(detailActionService.registry);
 
 await initializeBackendStoreReadiness({
@@ -2405,11 +2637,16 @@ function startBackendRuntime() {
     console.log("[development-preview] read-only browsing; recovery, providers, schedules and integrations disabled");
     return;
   }
+  channelMailbox.recoverInterruptedBatches();
+  sessionMailbox.importQueuedAutomations();
+  executionChecklistService.retireLegacyContinuations();
+  sessionApplicationService.coordinationTurns.recover(registerRuntimeQueuedWork);
   restoreTurnExecutionProbes();
   memoryExtractionScheduler.start();
   taskSummaryService.start();
   worktreeAutoFollowService.start();
   startClientDeviceGateway({
+    sessionAbilityPreferences,
     workInitializationService,
     detailActionService, detailWritesAllowed: detailMigration.detailWritesAllowed,
     sessionPreparations: sessionBindingReadinessProbe.preparations,
@@ -2435,7 +2672,7 @@ function startBackendRuntime() {
     knownActiveWorktrees, worktreeIntegrationJobService, reconcileEntityTasksAtStartup,
     reconcileWorkChatsAtStartup, scheduledSessionTaskService, runtimeActivity,
     tickAgentWorkQueue, emitEvent, artifactService, feishuGateway,
-    skillRegistryService, legacySessionHistoryRepairService
+    skillRegistryService, legacySessionHistoryRepairService, childTaskDeliveryService, taskCoordinationService
   });
 }
 
@@ -2467,7 +2704,7 @@ startBackendRuntime();
 
 const shutdownBackend = createBackendShutdown({
   nativeCodexContinuation,
-  backgroundAgentService, memoryExtractionScheduler, getClientDeviceGateway: () => clientDeviceGateway,
+  backgroundAgentService, memoryExtractionScheduler, memoryTopicService, getClientDeviceGateway: () => clientDeviceGateway,
   taskSummaryService, turnObservability, runtimeActivity, mcpCleanupInterval, turnExecutionProbe, mcpRegistryService,
   stateSyncPublisher, scheduledSessionTaskService,
   getResetForecastMonitor: () => codexResetForecastMonitor,
@@ -2479,7 +2716,7 @@ const shutdownBackend = createBackendShutdown({
 
 function shutdown() {
   worktreeAutoFollowService?.stop();
-  return shutdownBackend();
+  return codexAccounts.close().finally(() => shutdownBackend());
 }
 
 process.on("SIGINT", () => void shutdown());

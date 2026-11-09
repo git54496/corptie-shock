@@ -1,3 +1,4 @@
+import CorptieClientCore
 import Foundation
 
 private struct SessionTimelineRevisionIndex: Decodable {
@@ -28,6 +29,7 @@ final class SessionTimelineSyncController {
     private var sessions: [TaskSession] { activeSessions() }
     private var selectedSession: TaskSession? { currentSelectedSession() }
     private lazy var activeTimelineSyncEngine = ActiveTimelineSyncEngine(
+        foregroundSessionID: { [weak self] in self?.selectedSession?.id },
         localRevision: {
             SessionTimelineRepository.shared.detail(for: $0) == nil
                 ? -1
@@ -59,6 +61,10 @@ final class SessionTimelineSyncController {
         self.storeDetail = storeDetail
         self.reportSelectedLoadError = reportSelectedLoadError
         self.clearSelectedLoadError = clearSelectedLoadError
+    }
+
+    func foregroundDidChange() async {
+        await activeTimelineSyncEngine.foregroundDidChange()
     }
 
     func resetRouteTasks() {
@@ -100,6 +106,7 @@ final class SessionTimelineSyncController {
                 )
             }
         } catch {
+            ClientFailureDiagnostics.log(error, operation: "SessionTimelineSyncController.reconcileTimelineRevisionIndex")
             // The state stream remains independently authoritative for Session
             // lifecycle. A future timeline event or reconnect retries this
             // lightweight index without marking the whole backend offline.
@@ -108,6 +115,7 @@ final class SessionTimelineSyncController {
 
     func applyTimelineRevisionAdvance(sessionId: String, revision: Int) {
         guard revision > 0 else { return }
+        ChatPerformanceTrace.timelineStage("wake-received", sessionID: sessionId, revision: revision)
         let previous = knownTimelineRevisionBySessionID[sessionId] ?? 0
         knownTimelineRevisionBySessionID[sessionId] = max(previous, revision)
         // State patches and Timeline wake events race. Always let the sync
@@ -143,8 +151,11 @@ final class SessionTimelineSyncController {
             case .applied(let detail, let revision):
                 guard sessionRouteIsCurrent(session) else { return false }
                 let reconciledDetail = mergePending(detail)
+                SessionTimelineRepository.shared.state(for: session.id).discardRetainedContext(
+                    for: (envelope.changes ?? []).filter { $0.operation == "delete" }.map(\.itemId))
                 storeDetail(reconciledDetail, session.id, revision)
-                await warmPresentationCache(reconciledDetail, for: session.id)
+                ChatPerformanceTrace.timelineStage("published", sessionID: session.id, revision: revision)
+                await warmPresentationCache(for: session.id)
                 return true
             case .duplicate:
                 return true
@@ -157,6 +168,7 @@ final class SessionTimelineSyncController {
         case .success(let loaded):
             snapshot = loaded
         case .failure(let error):
+            ClientFailureDiagnostics.log(error, operation: "SessionTimelineSyncController.synchronize")
             if selectedSession?.id == session.id,
                SessionTimelineRepository.shared.detail(for: session.id) == nil {
                 reportSelectedLoadError(L10nFormat(
@@ -169,7 +181,8 @@ final class SessionTimelineSyncController {
         guard sessionRouteIsCurrent(session) else { return false }
         let reconciledDetail = mergePending(snapshot.detail)
         storeDetail(reconciledDetail, session.id, snapshot.timelineRevision)
-        await warmPresentationCache(reconciledDetail, for: session.id)
+        ChatPerformanceTrace.timelineStage("published", sessionID: session.id, revision: snapshot.timelineRevision)
+        await warmPresentationCache(for: session.id)
         if selectedSession?.id == session.id {
             clearSelectedLoadError()
         }
@@ -199,19 +212,32 @@ final class SessionTimelineSyncController {
         }
     }
 
-    private func warmPresentationCache(_ detail: CodexThreadDetail, for sessionID: String) async {
+    private func warmPresentationCache(for sessionID: String) async {
+        // The active page owns its projection. Prewarming it duplicates work
+        // and can overwrite a larger user-requested display window.
+        guard selectedSession?.id != sessionID else { return }
+        let state = SessionTimelineRepository.shared.state(for: sessionID)
+        guard let detail = state.presentationDetail else { return }
+        let revision = state.presentationRevision
         let visibleMessageLimit = ChatTimelineFeatureFlags.current.initialDisplayWeight
         let restorationAnchorRowID = SessionViewportController.shared.position(for: sessionID).flatMap {
             $0.followsLatest ? nil : $0.rowID
         }
-        let cache = await Task.detached(priority: .utility) {
+        let sourceSignature = "\(sessionID)|\(revision)|\(visibleMessageLimit)|\(restorationAnchorRowID ?? "latest")"
+        let worker = Task.detached(priority: .utility) {
             makeDetailDisplayCache(
                 for: detail,
                 sessionId: sessionID,
                 visibleMessageLimit: visibleMessageLimit,
-                restorationAnchorRowID: restorationAnchorRowID
+                restorationAnchorRowID: restorationAnchorRowID,
+                preparedSourceSignature: sourceSignature
             )
-        }.value
+        }
+        let cache = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: { worker.cancel() }
+        guard !Task.isCancelled, selectedSession?.id != sessionID,
+              state.presentationRevision == revision else { return }
         guard sessions.contains(where: { $0.id == sessionID })
                 || selectedSession?.id == sessionID else { return }
         SessionPresentationCache.shared.store(cache)

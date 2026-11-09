@@ -184,3 +184,29 @@ test("reports context, Provider, and total duration without exposing the transcr
   });
   assert.equal(Object.hasOwn(completed, "text"), false);
 });
+
+test("background completion enters the inbox only when a return Session is explicitly supplied", async () => {
+  const calls = [], deliveries = [];
+  const registry = new AgentProviderRegistry([provider("background", [AGENT_PROVIDER_CAPABILITIES.BACKGROUND_PROMPT], calls)]);
+  const service = new BackgroundAgentService({ registry, defaultProviderId: "background", onCompletionDelivery: message => deliveries.push(message) });
+  await service.run({ purpose: "summary", prompt: "hidden", cwd: "/isolated" });
+  assert.equal(deliveries.length, 0);
+  await service.run({ operationId: "background:delivery", purpose: "summary", prompt: "result", cwd: "/isolated",
+    completionDelivery: { recipientSessionId: "session:owner" } });
+  assert.equal(deliveries[0].sourceId, "background:delivery");
+  assert.equal(deliveries[0].authorization.ownerLogicalSessionId, "session:owner");
+  assert.equal(deliveries[0].idempotencyKey, "background:delivery:completed");
+});
+
+test('a disabled explicit background default cannot silently select another provider', async () => {
+  const calls = [];
+  const registry = new AgentProviderRegistry([
+    provider('disabled', [], calls),
+    provider('other', [AGENT_PROVIDER_CAPABILITIES.BACKGROUND_PROMPT], calls)
+  ], { executionPolicy: { assertAllowed: id => {
+    if (id === 'disabled') throw Object.assign(new Error('disabled'), { code: 'PROVIDER_DISABLED' });
+  } } });
+  const service = new BackgroundAgentService({ registry, defaultProviderId: 'disabled' });
+  await assert.rejects(service.run({ purpose: 'summary', cwd: '/tmp', prompt: 'test' }), { code: 'PROVIDER_DISABLED' });
+  assert.equal(calls.length, 0);
+});

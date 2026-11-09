@@ -31,6 +31,15 @@ export function createSessionApplicationComposition({
     },
     observeLifecycle: ({ type, sessionId, ...payload }) => {
       console.info(`[session-lifecycle] ${JSON.stringify({ type, sessionId, ...payload })}`);
+      if (type === "SessionToolPreparationWarning") {
+        const id = `tool-preparation-warning:${payload.bindingId}:${payload.turnId}`;
+        emitEvent(type, { ...payload, item: {
+          id, turnId: id, type: "system", title: "工具配置提示",
+          text: "工具配置暂未就绪，本次对话已继续；部分工具可能暂不可用。",
+          status: "completed", turnStatus: "completed", createdAt: new Date().toISOString()
+        } }, { sessionId, eventId: id });
+        return;
+      }
       emitEvent(type, payload, { sessionId });
     },
     toolHostService,
@@ -38,7 +47,7 @@ export function createSessionApplicationComposition({
     resolveRequiredToolDomains: requiredToolDomainsForSession,
     resolveSessionReference: (sessionId) => sessionBindingRepository.resolve(sessionId),
     resolveSessionBinding: (sessionId, bindingId) => sessionBindingRepository.resolveBinding(sessionId, bindingId),
-    assertMessageDispatchAllowed: (reference) => {
+    assertMessageDispatchAllowed: (reference, context) => {
       assertForkDispatchAllowed(reference.sessionId);
       assertNoAutomaticWorktreeMutation(store, reference);
       return assertSessionRecoveryMessageBoundary(reference);
@@ -82,11 +91,15 @@ export function createSessionApplicationComposition({
         reference.sessionId,
         normalizeConversationMessage(messageContext.message).mentions ?? []
       );
+      const ownership = session?.sessionKind === "worker"
+        ? store.assertLogicalWorkSessionBinding(reference.logicalSessionId) : null;
+      const assignedCapabilities = Promise.resolve().then(() => session?.agentId
+        ? resolveAssignedCapabilities(session.agentId, reference.logicalSessionId ?? reference.sessionId) : []).then(value => ({ value }), error => ({ error }));
       let baseContext = null;
       let referenceContext = null;
       if (session?.sessionKind === "workChat" && session.workId) {
         baseContext = workChatContextService.build(session.workId, session);
-        referenceContext = await resolveContextReferences(reference.sessionId, { characterBudget: 4_096 });
+        referenceContext = await resolveContextReferences(reference.sessionId);
         if (referenceContext?.prompt) {
           baseContext = { ...baseContext, prompt: `${baseContext.prompt}\n\n${referenceContext.prompt}`,
             contextSections: [...(baseContext.contextSections ?? [
@@ -100,7 +113,6 @@ export function createSessionApplicationComposition({
           prompt: [sessionResponsibilityInstructions("assistantChat"), baseContext?.prompt].filter(Boolean).join("\n\n")
         };
       } else if (session?.sessionKind === "worker") {
-        const ownership = store.assertLogicalWorkSessionBinding(reference.logicalSessionId);
         const task = store.getTask(ownership.taskId);
         const work = task?.work_id ? store.getWork(task.work_id) : null;
         const startupReceiptRow = store.selectOne(
@@ -120,12 +132,16 @@ export function createSessionApplicationComposition({
         );
         baseContext = buildWorkSessionContext({
           session, task, work,
+          coordination: task?.coordination_enabled === 1 ? {
+            children: store.selectAll("SELECT id,substr(title,1,120) AS title,current_session_id AS sessionId,lifecycle_state AS state,execution_status AS executionStatus FROM tasks WHERE parent_task_id=? AND COALESCE(deletion_status,'')<>'deleted' ORDER BY updated_at DESC LIMIT 20", [task.id]),
+            dispatches: store.selectAll("SELECT dispatch_id AS dispatchId,target_task_id AS taskId,status,error_code AS errorCode FROM task_coordination_dispatches WHERE parent_task_id=? ORDER BY created_at DESC LIMIT 20", [task.id])
+          } : null,
           artifactIndex: artifactService.indexForSession(session),
           startupReceipt: startupReceiptRow ? JSON.parse(startupReceiptRow.receipt_json) : null,
           toolDomains: appliedToolDomainIds(toolMaterialization),
           toolCatalogVersion: toolMaterialization?.appliedCatalogVersion ?? null
         });
-        referenceContext = await resolveContextReferences(reference.sessionId, { characterBudget: 4_096 });
+        referenceContext = await resolveContextReferences(reference.sessionId);
       }
       let memoryContext = null;
       let recallDecision = null;
@@ -138,7 +154,9 @@ export function createSessionApplicationComposition({
       } : null;
       const currentMessage = conversationMessageText(messageContext.message);
       const topicProfile = session && memoryTopicService
-        ? await memoryTopicService.update(session, currentMessage) : { topics: [], contexts: [], keywords: [] };
+        ? memoryTopicService.profileForMessage(session, currentMessage) : { topics: [], contexts: [], keywords: [] };
+      memoryTopicService?.requestUpdate(session, currentMessage,
+        messageContext.source?.messageId ?? messageContext.source?.deliveryId ?? messageContext.idempotencyKey ?? null);
       const globalPreferences = recallScope
         ? memoryRecallService?.applicablePreferences?.(recallScope, topicProfile) : null;
       if (globalPreferences?.memories.length) {
@@ -175,24 +193,25 @@ export function createSessionApplicationComposition({
           logicalSessionId: reference.logicalSessionId, providerId: reference.providerId,
           providerBindingId: reference.bindingId }
       });
+      const assigned = await assignedCapabilities;
+      if (assigned.error) throw assigned.error;
       const skillRoutingContext = { ...skillMcpTurnContext(
         mcpAssignmentRevisionForAgent(session?.agentId),
-        session?.agentId ? await resolveAssignedCapabilities(session.agentId) : []
+        assigned.value
       ), contextKey: "skill-routing", contextReusable: true };
       // Refresh presentation capabilities at Turn boundaries, including already
       // running/resumed Sessions whose Provider thread predates this contract.
       const presentationContext = { contextKey: "presentation", contextReusable: true,
-        prompt: `<corptie_message_presentation>\n${CHART_PRESENTATION_INSTRUCTIONS}\n</corptie_message_presentation>` };
+        prompt: `<corptie_message_presentation>\n${CHART_PRESENTATION_INSTRUCTIONS}\n</corptie_message_presentation>\n\nRole is reusable user configuration; Provider is the execution engine; Session is the only executor and authorization/collaboration actor. Historical Agent resource labels mean Role. Selecting a Role never grants permissions.` };
       if (globalPreferenceContext) globalPreferenceContext.contextKey = "global-preferences";
       const contexts = [baseContext, globalPreferenceContext, discoveryContext, skillRoutingContext,
         presentationContext, mentionContext, directUserIntentContext, memoryContext]
         .filter((item) => item?.prompt);
       const recordInjection = (globalIncluded, recallIncluded) => {
-        if (globalPreferences) memoryRecallService.markInjection?.(globalPreferences,
-          globalIncluded ? "context_included" : "budget_omitted");
+        if (globalPreferences && globalIncluded) memoryRecallService.markInjection?.(globalPreferences, "context_included");
         if (!recallDecision) return;
         const status = recallDecision.memories.length === 0 ? "not_selected"
-          : recallIncluded ? "context_included" : "budget_omitted";
+          : recallIncluded ? "context_included" : "not_selected";
         memoryRecallService.markInjection?.(recallDecision, status);
       };
       if (contexts.length === 0) {
@@ -206,7 +225,8 @@ export function createSessionApplicationComposition({
           memoryContext,
           mentionContext,
           referenceContext,
-          requiredContexts: [globalPreferenceContext, discoveryContext, skillRoutingContext, presentationContext].filter(Boolean)
+          requiredContexts: [globalPreferenceContext, discoveryContext, skillRoutingContext, presentationContext,
+            sessionApplicationService.coordinationTurns?.handoffContext(reference)].filter(Boolean)
         });
         recordInjection(Boolean(result), Boolean(result.memoryRecall));
         return { ...result, globalPreferenceRecall: globalPreferences };

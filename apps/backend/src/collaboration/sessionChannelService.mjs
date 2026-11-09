@@ -37,6 +37,13 @@ export class SessionChannelService {
           409
         );
       }
+      const resolved = this.tryConfirmPendingPolicyRequest(presented, input);
+      if (resolved) return resolved;
+      const authorization = presented.status === "confirmed" && this.store.selectOne(
+        "SELECT json_extract(evidence_json,'$.type') AS policy FROM session_collaboration_channel_authorizations WHERE request_id=? AND json_extract(evidence_json,'$.type') IN ('parent_child_policy','first_message_confirmation_disabled')", [presented.requestId]);
+      if (authorization) {
+        return this.authorizedSendReceipt(presented, input, authorization.policy);
+      }
       return presented;
     }
 
@@ -48,6 +55,7 @@ export class SessionChannelService {
           senderSessionId: source.logicalSessionId,
           body,
           messageKind: input.messageKind,
+          deliveryIntent: input.deliveryIntent,
           inReplyToMessageId: input.inReplyToMessageId,
           idempotencyKey
         });
@@ -67,6 +75,7 @@ export class SessionChannelService {
     const request = {
       body,
       messageKind: normalizeMessageKind(input.messageKind),
+      deliveryIntent: normalizeDeliveryIntent(input.deliveryIntent),
       inReplyToMessageId: optionalText(input.inReplyToMessageId),
       targetWorkId: optionalText(input.targetWorkId),
       sessionAgentId: optionalText(input.sessionAgentId),
@@ -75,6 +84,9 @@ export class SessionChannelService {
       summary: optionalText(input.summary) ?? body,
       sourceContext: this.#resourceContext(source.logicalSessionId)
     };
+    const authorization = recipient ? this.resolveAutomaticAuthorization(source.logicalSessionId, recipient.logicalSessionId) : null;
+    let confirmed;
+    this.store.runInTransaction(() => {
     this.store.db.run(
       `INSERT INTO session_collaboration_channel_requests (
          request_id, channel_id, requesting_session_id, requested_recipient_session_id,
@@ -83,8 +95,86 @@ export class SessionChannelService {
       [requestId, source.logicalSessionId, recipient?.logicalSessionId ?? null,
         JSON.stringify(request), idempotencyKey, timestamp]
     );
+    if (authorization) {
+      confirmed = this.confirmRequest(requestId, {}, authorization);
+    }
+    });
     this.store.scheduleSave();
+    if (confirmed) return this.authorizedSendReceipt(confirmed, input, authorization.type);
     return this.getRequest(requestId);
+  }
+
+  resolveParentChildAuthorization(sourceId, recipientId) {
+    const sourceLogical = this.#requireActiveLogicalSession(sourceId, "sourceSessionId");
+    const recipientLogical = this.#requireActiveLogicalSession(recipientId, "recipientSessionId");
+    const source = this.#resourceContext(sourceLogical.logicalSessionId), recipient = this.#resourceContext(recipientLogical.logicalSessionId);
+    if (!source.taskId || !recipient.taskId || !source.workId || source.workId !== recipient.workId) return null;
+    const sourceTask = this.store.getTask(source.taskId), recipientTask = this.store.getTask(recipient.taskId);
+    if (!sourceTask || !recipientTask) return null;
+    const parent = recipientTask.parent_task_id === sourceTask.id ? sourceTask : recipientTask;
+    const child = recipientTask.parent_task_id === sourceTask.id ? recipientTask : sourceTask;
+    if (!parent || !child || child.parent_task_id !== parent.id
+      || parent.work_id !== child.work_id || parent.work_id !== source.workId
+      || parent.archived || child.archived || parent.deletion_status || child.deletion_status
+      || sourceTask.current_session_id !== sourceLogical.legacySessionId
+      || recipientTask.current_session_id !== recipientLogical.legacySessionId) return null;
+    const [a,b] = canonicalPair(sourceLogical.logicalSessionId,recipientLogical.logicalSessionId);
+    if (this.store.selectOne("SELECT 1 FROM session_collaboration_channels WHERE session_a_id=? AND session_b_id=? AND status='revoked'",[a,b])) return null;
+    return {type:"parent_child_policy",parentTaskId:parent.id,childTaskId:child.id,
+      sourceSessionId:sourceLogical.logicalSessionId,recipientSessionId:recipientLogical.logicalSessionId};
+  }
+
+  resolveTaskFamilyAuthorization(sourceId, recipientId) {
+    const source=this.#requireActiveLogicalSession(sourceId,"sourceSessionId");
+    const recipient=this.#requireActiveLogicalSession(recipientId,"recipientSessionId");
+    const a=this.#resourceContext(source.logicalSessionId),b=this.#resourceContext(recipient.logicalSessionId);
+    if(!a.taskId || !b.taskId || !a.workId || a.workId!==b.workId) return null;
+    const root=id=>{
+      let task=this.store.getTask(id);const seen=new Set();
+      while(task) {
+        if(task.work_id!==a.workId || task.archived || task.deletion_status || seen.has(task.id)) return null;
+        seen.add(task.id);if(!task.parent_task_id) return task.id;
+        task=this.store.getTask(task.parent_task_id);
+      }
+      return null;
+    };
+    const first=this.store.getTask(a.taskId),second=this.store.getTask(b.taskId),rootId=root(a.taskId);
+    if(!rootId || rootId!==root(b.taskId) || first?.current_session_id!==source.legacySessionId
+      || second?.current_session_id!==recipient.legacySessionId) return null;
+    const [x,y]=canonicalPair(source.logicalSessionId,recipient.logicalSessionId);
+    if(this.store.selectOne("SELECT 1 FROM session_collaboration_channels WHERE session_a_id=? AND session_b_id=? AND status='revoked'",[x,y])) return null;
+    // Reuse the existing policy receipt type; no new persistent policy payload.
+    return {type:"parent_child_policy",parentTaskId:rootId,childTaskId:second.id,
+      sourceSessionId:source.logicalSessionId,recipientSessionId:recipient.logicalSessionId};
+  }
+
+  resolveAutomaticAuthorization(sourceId, recipientId) {
+    const parentChild = this.resolveParentChildAuthorization(sourceId, recipientId);
+    if (parentChild) return parentChild;
+    const family=this.resolveTaskFamilyAuthorization(sourceId,recipientId);
+    if(family) return family;
+    if (this.store.collaborationSettings().requireFirstMessageConfirmation) return null;
+    const [a, b] = canonicalPair(sourceId, recipientId);
+    // Disabling first-contact prompts never reverses an explicit revocation.
+    if (this.store.selectOne("SELECT 1 FROM session_collaboration_channels WHERE session_a_id=? AND session_b_id=? AND status='revoked'", [a, b])) return null;
+    return { type: "first_message_confirmation_disabled", sourceSessionId: sourceId, recipientSessionId: recipientId };
+  }
+
+  tryConfirmPendingPolicyRequest(request, input) {
+    // Retry-driven repair only. Never replay historical/rejected requests or
+    // resolve a missing recipient by choosing another Task's current Session.
+    if (request.status !== "pending" || !request.requestedRecipientSessionId) return null;
+    const evidence = this.resolveAutomaticAuthorization(request.requestingSessionId, request.requestedRecipientSessionId);
+    if (!evidence) return null;
+    const confirmed = this.confirmRequest(request.requestId, {}, evidence);
+    return confirmed.status === "confirmed" ? this.authorizedSendReceipt(confirmed, input, evidence.type) : confirmed;
+  }
+
+  authorizedSendReceipt(request, input, policy) {
+    const sent = this.sendMessage({channelId:request.channelId,senderSessionId:request.requestingSessionId,
+      body:input.body,messageKind:input.messageKind,deliveryIntent:input.deliveryIntent,
+      inReplyToMessageId:input.inReplyToMessageId,idempotencyKey:input.idempotencyKey});
+    return {status:"sent",routeAuthorization:policy,requestId:request.requestId,...sent};
   }
 
   getRequest(requestId) {
@@ -107,20 +197,37 @@ export class SessionChannelService {
   }
 
   confirmRequest(requestId, target = {}, evidence = {}) {
-    const request = this.getRequest(requestId);
-    if (!request) throw channelError("CHANNEL_REQUEST_NOT_FOUND", `Channel request ${requestId} was not found.`, 404);
-    if (request.status !== "pending") return request;
-    const source = this.#requireActiveLogicalSession(request.requestingSessionId, "requestingSessionId");
-    const recipientId = target.recipientSessionId ?? request.requestedRecipientSessionId;
-    const recipient = this.#requireActiveLogicalSession(recipientId, "recipientSessionId");
-    if (source.logicalSessionId === recipient.logicalSessionId) {
-      throw channelError("CHANNEL_SELF_TARGET_FORBIDDEN", "A Session cannot open a Channel to itself.");
-    }
-    const [sessionAId, sessionBId] = canonicalPair(source.logicalSessionId, recipient.logicalSessionId);
-    const timestamp = this.clock();
-    let channel = this.findActiveChannel(sessionAId, sessionBId);
-    let message;
+    // Read and decide under the same Store transaction as all existing writes.
+    // Concurrent user/policy confirmation must not create a second first message.
     this.store.runInTransaction(() => {
+      const request = this.getRequest(requestId);
+      if (!request) throw channelError("CHANNEL_REQUEST_NOT_FOUND", `Channel request ${requestId} was not found.`, 404);
+      if (request.status !== "pending") return;
+      const source = this.#requireActiveLogicalSession(request.requestingSessionId, "requestingSessionId");
+      const recipientId = target.recipientSessionId ?? request.requestedRecipientSessionId;
+      const recipient = this.#requireActiveLogicalSession(recipientId, "recipientSessionId");
+      if (evidence?.type === "parent_child_policy") {
+        const current = this.resolveParentChildAuthorization(source.logicalSessionId, recipient.logicalSessionId)
+          ?? this.resolveTaskFamilyAuthorization(source.logicalSessionId, recipient.logicalSessionId);
+        if (!current || ["parentTaskId", "childTaskId", "sourceSessionId", "recipientSessionId"].some(key => current[key] !== evidence[key])) {
+          throw channelError("CHANNEL_PARENT_CHILD_BINDING_CHANGED", "The current direct parent/child binding no longer authorizes this Channel.", 409);
+        }
+        evidence = current;
+      }
+      if (evidence?.type === "first_message_confirmation_disabled") {
+        const current = this.resolveAutomaticAuthorization(source.logicalSessionId, recipient.logicalSessionId);
+        if (current?.type !== evidence.type || evidence.sourceSessionId !== source.logicalSessionId
+          || evidence.recipientSessionId !== recipient.logicalSessionId) {
+          throw channelError("CHANNEL_CONFIRMATION_POLICY_CHANGED", "First-message confirmation is required for this Session pair.", 409);
+        }
+        evidence = current;
+      }
+      if (source.logicalSessionId === recipient.logicalSessionId) {
+        throw channelError("CHANNEL_SELF_TARGET_FORBIDDEN", "A Session cannot open a Channel to itself.");
+      }
+      const [sessionAId, sessionBId] = canonicalPair(source.logicalSessionId, recipient.logicalSessionId);
+      const timestamp = this.clock();
+      let channel = this.findActiveChannel(sessionAId, sessionBId);
       if (!channel) {
         const channelId = `channel:${this.idFactory()}`;
         this.store.db.run(
@@ -139,10 +246,11 @@ export class SessionChannelService {
         [`channel_authorization:${this.idFactory()}`, request.requestId, channel.channelId, source.logicalSessionId,
           JSON.stringify(evidence ?? {}), timestamp]
       );
-      message = this.#insertMessage(channel, {
+      const message = this.#insertMessage(channel, {
         senderSessionId: source.logicalSessionId,
         body: request.request.body,
         messageKind: request.request.messageKind,
+        deliveryIntent: request.request.deliveryIntent,
         inReplyToMessageId: request.request.inReplyToMessageId,
         idempotencyKey: request.idempotencyKey,
         resourceContext: {
@@ -153,23 +261,23 @@ export class SessionChannelService {
       this.store.db.run(
         `UPDATE session_collaboration_channel_requests
          SET channel_id=?, requested_recipient_session_id=?, status='confirmed',
-             first_message_id=?, resolved_at=?, failure_json=NULL WHERE request_id=?`,
+             first_message_id=?, resolved_at=?, failure_json=NULL WHERE request_id=? AND status='pending'`,
         [channel.channelId, recipient.logicalSessionId, message.messageId, timestamp, request.requestId]
       );
     });
     this.store.scheduleSave();
-    return this.getRequest(request.requestId);
+    return this.getRequest(requestId);
   }
 
   rejectRequest(requestId, evidence = {}) {
-    const request = this.getRequest(requestId);
-    if (!request) throw channelError("CHANNEL_REQUEST_NOT_FOUND", `Channel request ${requestId} was not found.`, 404);
-    if (request.status !== "pending") return request;
-    const timestamp = this.clock();
     this.store.runInTransaction(() => {
+      const request = this.getRequest(requestId);
+      if (!request) throw channelError("CHANNEL_REQUEST_NOT_FOUND", `Channel request ${requestId} was not found.`, 404);
+      if (request.status !== "pending") return;
+      const timestamp = this.clock();
       this.store.db.run(
         `UPDATE session_collaboration_channel_requests
-         SET status='rejected', failure_json=?, resolved_at=? WHERE request_id=?`,
+         SET status='rejected', failure_json=?, resolved_at=? WHERE request_id=? AND status='pending'`,
         [JSON.stringify(evidence ?? {}), timestamp, requestId]
       );
       this.store.db.run(
@@ -189,7 +297,7 @@ export class SessionChannelService {
     if (!request || request.status !== "pending") return request;
     this.store.db.run(
       `UPDATE session_collaboration_channel_requests
-       SET status='failed', failure_json=?, resolved_at=? WHERE request_id=?`,
+       SET status='failed', failure_json=?, resolved_at=? WHERE request_id=? AND status='pending'`,
       [JSON.stringify({ code: error?.code ?? "CHANNEL_TARGET_PREPARATION_FAILED", message: error?.message ?? String(error) }),
         this.clock(), requestId]
     );
@@ -257,6 +365,7 @@ export class SessionChannelService {
       if (existing.channel_id !== channel.channelId
         || existing.body !== requiredText(input.body, "body")
         || existing.message_kind !== requestedKind
+        || existing.delivery_intent !== normalizeDeliveryIntent(input.deliveryIntent)
         || (existing.in_reply_to_message_id ?? null) !== optionalText(input.inReplyToMessageId)) {
         throw channelError(
           "CHANNEL_IDEMPOTENCY_CONFLICT",
@@ -278,6 +387,7 @@ export class SessionChannelService {
         senderSessionId: sender.logicalSessionId,
         body: input.body,
         messageKind: input.messageKind,
+        deliveryIntent: input.deliveryIntent,
         inReplyToMessageId: input.inReplyToMessageId,
         idempotencyKey: input.idempotencyKey,
         resourceContext: input.resourceContext ?? {
@@ -296,13 +406,50 @@ export class SessionChannelService {
   }
 
   listMessages(channelId, actorSessionId, options = {}) {
+    return this.listMessagePage(channelId, actorSessionId, options).messages;
+  }
+
+  listMessagePage(channelId, actorSessionId, options = {}) {
     const channel = this.#requireParticipantChannel(channelId, actorSessionId);
+    if (options.beforeCursor && options.afterCursor) throw channelError("INVALID_CHANNEL_CURSOR", "Use one cursor direction.");
+    const cursor = options.beforeCursor ?? options.afterCursor;
+    if (cursor != null && !/^[1-9][0-9]*$/.test(String(cursor))) throw channelError("INVALID_CHANNEL_CURSOR", "Invalid message cursor.");
+    const ascending = Boolean(options.afterCursor);
+    const limit = boundedLimit(options.limit, 100);
     const rows = this.store.selectAll(
-      `SELECT * FROM session_collaboration_messages WHERE channel_id=?
-       ORDER BY created_at ASC, message_id ASC LIMIT ?`,
-      [channel.channelId, boundedLimit(options.limit, 500)]
+      `SELECT m.*, o.sequence FROM session_collaboration_messages m
+       JOIN session_collaboration_message_order o ON o.message_id=m.message_id
+       WHERE m.channel_id=? ${cursor ? `AND o.sequence ${ascending ? ">" : "<"} ?` : ""}
+       ORDER BY o.sequence ${ascending ? "ASC" : "DESC"} LIMIT ?`,
+      [channel.channelId, ...(cursor ? [Number(cursor)] : []), limit + 1]
     );
-    return rows.map((row) => this.#presentMessage(row));
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+    if (!ascending) page.reverse();
+    const deliveries = page.length ? this.store.selectAll(
+      `SELECT d.*, i.batch_id, b.status AS batch_status, op.status AS execution_status,
+        (SELECT COUNT(*) FROM session_collaboration_batch_items bi WHERE bi.batch_id=i.batch_id) AS message_count
+       FROM session_collaboration_deliveries d
+       LEFT JOIN session_collaboration_batch_items i ON i.delivery_id=d.delivery_id
+       LEFT JOIN session_collaboration_batches b ON b.batch_id=i.batch_id
+       LEFT JOIN agent_operations op ON op.task_id=b.operation_id
+       WHERE d.message_id IN (${page.map(() => "?").join(",")})`, page.map(row => row.message_id)
+    ) : [];
+    const receipts = new Map(deliveries.map(row => [row.message_id, presentDelivery(row)]));
+    const pendingCount = Number(this.store.selectOne(
+      `SELECT COUNT(*) AS count FROM session_collaboration_deliveries d
+       JOIN session_collaboration_messages m ON m.message_id=d.message_id
+       WHERE m.channel_id=? AND d.status IN ('pending','queued')
+       AND m.delivery_intent NOT IN ('notification','acknowledgement')`, [channel.channelId]
+    )?.count ?? 0);
+    return {
+      pendingCount,
+      messages: page.map(row => ({ ...this.#presentMessage(row), cursor: String(row.sequence),
+        delivery: receipts.get(row.message_id) ?? null })),
+      hasMore,
+      beforeCursor: page.length ? String(page[0].sequence) : null,
+      afterCursor: page.length ? String(page.at(-1).sequence) : null
+    };
   }
 
   revokeChannel(channelId, actorSessionId, reason, evidence = {}) {
@@ -353,7 +500,12 @@ export class SessionChannelService {
 
   getDelivery(deliveryId) {
     const row = this.store.selectOne(
-      "SELECT * FROM session_collaboration_deliveries WHERE delivery_id=?",
+      `SELECT d.*, i.batch_id, b.status AS batch_status, op.status AS execution_status,
+        (SELECT COUNT(*) FROM session_collaboration_batch_items bi WHERE bi.batch_id=i.batch_id) AS message_count
+       FROM session_collaboration_deliveries d
+       LEFT JOIN session_collaboration_batch_items i ON i.delivery_id=d.delivery_id
+       LEFT JOIN session_collaboration_batches b ON b.batch_id=i.batch_id
+       LEFT JOIN agent_operations op ON op.task_id=b.operation_id WHERE d.delivery_id=?`,
       [deliveryId]
     );
     return row ? presentDelivery(row) : null;
@@ -364,7 +516,7 @@ export class SessionChannelService {
       "SELECT * FROM session_collaboration_deliveries WHERE message_id=?",
       [messageId]
     );
-    return row ? presentDelivery(row) : null;
+    return row ? this.getDelivery(row.delivery_id) : null;
   }
 
   updateDelivery(deliveryId, patch = {}) {
@@ -402,7 +554,7 @@ export class SessionChannelService {
   getDeliveryEnvelope(deliveryId) {
     const row = this.store.selectOne(
       `SELECT d.*, m.channel_id, m.sender_session_id, m.recipient_session_id AS message_recipient_session_id,
-              m.message_kind, m.body, m.in_reply_to_message_id, m.resource_context_json,
+              m.delivery_intent, m.message_kind, m.body, m.in_reply_to_message_id, m.resource_context_json,
               m.idempotency_key, m.created_at AS message_created_at,
               c.session_a_id, c.session_b_id, c.status AS channel_status,
               c.requested_by_session_id, c.authorized_at, c.resource_version
@@ -428,6 +580,7 @@ export class SessionChannelService {
         recipientAgentId: recipientAgent?.agentId ?? null,
         recipientAgentName: recipientAgent?.name ?? null,
         messageKind: row.message_kind,
+        deliveryIntent: row.delivery_intent ?? "action_required",
         body: row.body,
         inReplyToMessageId: row.in_reply_to_message_id ?? null,
         resourceContext: parseJson(row.resource_context_json, {}),
@@ -475,11 +628,11 @@ export class SessionChannelService {
     const deliveryId = `channel_delivery:${this.idFactory()}`;
     this.store.db.run(
       `INSERT INTO session_collaboration_messages (
-         message_id, channel_id, sender_session_id, recipient_session_id, message_kind,
+         message_id, channel_id, sender_session_id, recipient_session_id, message_kind, delivery_intent,
          body, in_reply_to_message_id, resource_context_json, idempotency_key, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [messageId, channel.channelId, senderSessionId, recipientSessionId,
-        normalizeMessageKind(input.messageKind), requiredText(input.body, "body"),
+        normalizeMessageKind(input.messageKind), normalizeDeliveryIntent(input.deliveryIntent), requiredText(input.body, "body"),
         inReplyToMessageId, JSON.stringify(input.resourceContext ?? {}),
         requiredText(input.idempotencyKey, "idempotencyKey"), timestamp]
     );
@@ -490,6 +643,12 @@ export class SessionChannelService {
        ) VALUES (?, ?, ?, 'pending', 0, NULL, NULL, NULL, NULL, ?, ?)`,
       [deliveryId, messageId, recipientSessionId, timestamp, timestamp]
     );
+    if(normalizeDeliveryIntent(input.deliveryIntent)==="acknowledgement") {
+      this.store.db.run("UPDATE session_collaboration_deliveries SET status='delivered',delivered_at=?,updated_at=? WHERE delivery_id=?",[timestamp,timestamp,deliveryId]);
+      this.store.db.run("UPDATE session_mailbox_messages SET disposition='adopted',read_at=?,updated_at=? WHERE channel_delivery_id=?",[timestamp,timestamp,deliveryId]);
+      if(inReplyToMessageId) this.store.db.run("UPDATE session_mailbox_messages SET read_at=?,updated_at=? WHERE source_type='channel' AND source_id=? AND message_id=?",
+        [timestamp,timestamp,channel.channelId,`mailbox:${inReplyToMessageId}`]);
+    }
     this.store.db.run(
       "UPDATE session_collaboration_channels SET updated_at=? WHERE channel_id=?",
       [timestamp, channel.channelId]
@@ -535,7 +694,7 @@ export class SessionChannelService {
   #requireActiveLogicalSession(sessionId, field) {
     const logical = this.#requireLogicalSession(sessionId, field);
     const session = logical.legacySessionId ? this.store.getSession(logical.legacySessionId) : null;
-    if (!session || session.deletedAt || session.archived || logical.activeBinding?.state !== "active") {
+    if (!session || session.deletedAt || session.archived || logical.archived || logical.activeBinding?.state !== "active") {
       throw channelError("SESSION_UNAVAILABLE", `Session ${logical.logicalSessionId} is not an active Channel endpoint.`, 409);
     }
     return logical;
@@ -564,6 +723,7 @@ export class SessionChannelService {
       senderSessionId: row.sender_session_id,
       recipientSessionId: row.recipient_session_id,
       messageKind: row.message_kind,
+      deliveryIntent: row.delivery_intent ?? "action_required",
       body: row.body,
       inReplyToMessageId: row.in_reply_to_message_id ?? null,
       resourceContext: parseJson(row.resource_context_json, {}),
@@ -613,6 +773,7 @@ function sameChannelRequest(existing, input, recipientSessionId) {
   return existing.requestedRecipientSessionId === recipientSessionId
     && stored.body === requiredText(input.body, "body")
     && stored.messageKind === normalizeMessageKind(input.messageKind)
+    && (stored.deliveryIntent ?? "action_required") === normalizeDeliveryIntent(input.deliveryIntent)
     && (stored.inReplyToMessageId ?? null) === optionalText(input.inReplyToMessageId)
     && (stored.targetWorkId ?? null) === optionalText(input.targetWorkId)
     && (stored.sessionAgentId ?? null) === optionalText(input.sessionAgentId)
@@ -633,7 +794,11 @@ function presentDelivery(row) {
     targetTurnId: row.target_turn_id ?? null,
     lastError: row.last_error ?? null,
     createdAt: row.created_at,
-    updatedAt: row.updated_at
+    updatedAt: row.updated_at,
+    batchId: row.batch_id ?? null,
+    batchStatus: row.batch_status ?? null,
+    executionStatus: row.execution_status ?? null,
+    messageCount: Number(row.message_count ?? 0)
   };
 }
 
@@ -663,4 +828,12 @@ function channelError(code, message, statusCode = 400) {
   error.code = code;
   error.statusCode = statusCode;
   return error;
+}
+
+function normalizeDeliveryIntent(value) {
+  const intent = optionalText(value) ?? "action_required";
+  if (!["action_required", "response_required", "notification", "acknowledgement"].includes(intent)) {
+    throw channelError("INVALID_DELIVERY_INTENT", `Unsupported delivery intent: ${intent}.`);
+  }
+  return intent;
 }

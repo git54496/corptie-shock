@@ -3,22 +3,56 @@ import Testing
 @testable import CorptieClientCore
 
 struct ConversationTimelineTests {
-    @Test func materializedImageOutputIsVisibleWithoutExpandingExecution() throws {
+    @Test func correlatedFailuresShareOneDisclosureWithoutLosingDiagnostics() throws {
+        let items = try [message("u", "userMessage", status: "failed"),
+                         message("tool", "commandExecution", status: "failed"),
+                         message("retry", "error", status: "failed"),
+                         message("provider", "error", status: "failed"),
+                         message("summary", "taskComplete", status: "failed"),
+                         message("product", "system", status: "failed")]
+        let entries = ConversationTimeline.makeEntries(from: items)
+        #expect(entries.map(\.id) == ["message:u", "process:turn"])
+        guard case let .process(_, diagnostics) = entries.last?.kind else {
+            Issue.record("Missing failure disclosure"); return
+        }
+        #expect(diagnostics.map(\.id) == Array(items.dropFirst()).map(\.id))
+        #expect(ConversationProcessPresentation.state(for: diagnostics) == .failed)
+        #expect(items.allSatisfy { $0.processStartedAt == nil }, "Source events are immutable")
+    }
+
+    @Test func errorsFromDifferentTurnsAndLegacyUnboundErrorsAreNotMerged() throws {
+        let items = try [message("first", "error", turn: "first", status: "failed"),
+                         message("second", "error", turn: "second", status: "failed"),
+                         message("unbound1", "error", turn: nil, status: "failed"),
+                         message("unbound2", "error", turn: nil, status: "failed")]
+        #expect(ConversationTimeline.makeEntries(from: items).map(\.id) == items.map { "message:\($0.id)" })
+    }
+
+    @Test func recoveredRetryDiagnosticsDoNotOverrideTheSuccessfulTurn() throws {
+        let items = try [message("retry1", "error", status: "completed"),
+                         message("retry2", "error", status: "completed"),
+                         message("answer", "agentMessage", role: "final_answer", status: "completed")]
+        let entries = ConversationTimeline.makeEntries(from: items)
+        #expect(entries.map(\.id) == ["process:turn", "message:answer"])
+        guard case let .process(_, diagnostics) = entries.first?.kind else {
+            Issue.record("Missing retry disclosure"); return
+        }
+        #expect(ConversationProcessPresentation.state(for: diagnostics) == .completed)
+    }
+    @Test func materializedToolImageStaysInExecution() throws {
         let data = Data(#"{"id":"image","turnId":"turn","type":"imageView","text":"/tmp/original.png","images":[{"managedPath":"chat-resources/test/image.png"}]}"#.utf8)
         let item = try JSONDecoder().decode(ClientMessage.self, from: data)
         #expect(item.timelineHasImages)
-        #expect(item.isStandaloneImage)
         #expect(item.presentationKind == .unknown, "Media must not become an authored reply")
         #expect(!ConversationPresentationKind.isFormalMessage(type: item.type, presentationRole: "final_answer"))
         let entries = ConversationTimeline.makeEntries(from: [item])
-        #expect(entries.map(\.id) == ["message:image"])
-        #expect(entries.first?.displayWeight == 1)
+        #expect(entries.map(\.id) == ["process:turn"])
+        #expect(entries.first?.displayWeight == 0)
     }
 
     @Test func imagePresentationPreservesExplicitEventRoles() throws {
         for role in ["system_event", "automation", "collaboration", "collaboration_confirmation"] {
             let item = try imageMessage(role: role)
-            #expect(!item.isStandaloneImage)
             let entries = ConversationTimeline.makeEntries(from: [item])
             #expect(entries.map(\.id) == ["message:image"], "Explicit events must not be folded as tools")
         }
@@ -27,25 +61,92 @@ struct ConversationTimelineTests {
     @Test func imagesDoNotReclassifyInteractionsUnknownEventsOrAuthoredReplies() throws {
         for type in ["approval", "choice", "userInput", "automationEvent", "futureEvent", "userMessage", "agentMessage"] {
             let item = try imageMessage(type: type)
-            #expect(!item.isStandaloneImage)
             #expect(ConversationTimeline.makeEntries(from: [item]).map(\.id) == ["message:image"])
         }
     }
 
-    @Test func missingImageRemainsAnExecutionRecordAndLateAttachmentPromotesSameMessage() throws {
+    @Test func lateImageAttachmentKeepsTheSameExecutionGroup() throws {
         let before = try imageMessage(hasImages: false)
-        #expect(!before.isStandaloneImage)
         #expect(ConversationTimeline.makeEntries(from: [before]).first?.isProcessGroup == true)
         let after = try imageMessage()
         #expect(after.id == before.id)
-        #expect(after.isStandaloneImage)
-        #expect(ConversationTimeline.makeEntries(from: [after]).map(\.id) == ["message:image"])
+        #expect(ConversationTimeline.makeEntries(from: [after]).map(\.id) == ["process:turn"])
     }
 
-    @Test func imageOutputSplitsProcessSegmentsWithoutLosingAdjacentTools() throws {
+    @Test func toolImageDoesNotSplitAdjacentExecutionSteps() throws {
         let items = try [message("before", "commandExecution"), imageMessage(), message("after", "mcpToolCall")]
         let entries = ConversationTimeline.makeEntries(from: items)
-        #expect(entries.map(\.id) == ["process:turn", "message:image", "process:turn:process-segment:1"])
+        #expect(entries.map(\.id) == ["process:turn"])
+        guard case let .process(_, steps) = entries.first?.kind else {
+            Issue.record("Missing execution group"); return
+        }
+        #expect(steps.map(\.id) == items.map(\.id))
+    }
+
+    @Test func processingDisclosureSurvivesSnapshotWithoutDeliveryStatusAndYieldsToRealSteps() throws {
+        func input(_ authority: String?, status: String, turnStatus: String = "inProgress") throws -> ClientMessage {
+            var json: [String: Any] = ["id": "input", "type": "userMessage", "text": "request",
+                "turnId": "turn", "turnStatus": turnStatus, "status": status]
+            json["userMessageStatus"] = authority
+            return try JSONDecoder().decode(ClientMessage.self, from: JSONSerialization.data(withJSONObject: json))
+        }
+        func projected(_ items: [ClientMessage]) -> [ConversationEntry<ClientMessage>] {
+            ConversationReplyProgressProjection.entries(ConversationTimeline.makeEntries(from: items))
+        }
+        let acknowledged = try input("processing", status: "processing")
+        let snapshot = try input(nil, status: "processing")
+        for value in [acknowledged, snapshot] {
+            let rows = projected([value])
+            #expect(rows.map(\.id) == ["message:input", "process:turn"])
+            #expect(rows.last?.processReplyState == .running)
+        }
+        let step = try message("step", "commandExecution")
+        let populated = projected([snapshot, step])
+        #expect(populated.map(\.id) == ["message:input", "process:turn"])
+        if case .process(_, let items) = populated.last?.kind { #expect(items.map(\.id) == ["step"]) }
+        else { Issue.record("Missing populated process") }
+        for authority in ["queued", "preparing", "consumed", "failed", "cancelled", "unknown"] {
+            #expect(projected([try input(authority, status: "processing")]).count == 1)
+        }
+        #expect(projected([try input(nil, status: "queued")]).count == 1)
+        #expect(projected([try input(nil, status: "processing", turnStatus: "completed")]).count == 1)
+    }
+
+    @Test func pendingInputCanShowImmediateProcessingWithoutChangingExecutionAuthority() throws {
+        for state in ["preparing"] {
+            let value: [String: Any] = ["id": "pending", "type": "userMessage", "text": "request",
+                "turnId": "delivery:pending", "turnStatus": state, "userMessageStatus": state]
+            let item = try JSONDecoder().decode(ClientMessage.self, from: JSONSerialization.data(withJSONObject: value))
+            #expect(ConversationTimeline.makeEntries(from: [item]).count == 1)
+            let immediate = ConversationTimeline.makeEntries(from: [item], showsPendingInputAsProcessing: true)
+            #expect(immediate.last?.isProcessGroup == true)
+            #expect(immediate.last?.processReplyState == .running)
+            #expect(item.userMessageStatus == state)
+            #expect(UserMessageStatusPresentation(authoritativeStatus: state, legacyStatus: nil,
+                showsPendingAsProcessing: true)?.kind == .processing)
+        }
+        for authoritative in [true, false] {
+            var value: [String: Any] = ["id": "queued", "type": "userMessage", "text": "queued request",
+                "turnId": "delivery:queued", "turnStatus": "running", "status": "queued"]
+            if authoritative { value["userMessageStatus"] = "queued" }
+            let item = try JSONDecoder().decode(ClientMessage.self, from: JSONSerialization.data(withJSONObject: value))
+            #expect(!ConversationTimeline.makeEntries(from: [item], showsPendingInputAsProcessing: true).contains { $0.isProcessGroup })
+            let status = UserMessageStatusPresentation(authoritativeStatus: authoritative ? "queued" : nil,
+                legacyStatus: "queued", queuePosition: 3, showsPendingAsProcessing: true)
+            #expect(status?.kind == .queued)
+            #expect(status?.queuePosition == 3)
+        }
+        for state in ["failed", "cancelled", "consumed"] {
+            #expect(UserMessageStatusPresentation(authoritativeStatus: state, legacyStatus: nil,
+                showsPendingAsProcessing: true)?.kind != .processing)
+        }
+        for role in ["automation", "system_event", "collaboration"] {
+            let value: [String: Any] = ["id": "event", "type": "userMessage", "text": "event",
+                "turnId": "event:pending", "turnStatus": "queued", "userMessageStatus": "queued",
+                "presentationRole": role, "collaborationDirection": "inbound"]
+            let item = try JSONDecoder().decode(ClientMessage.self, from: JSONSerialization.data(withJSONObject: value))
+            #expect(!ConversationTimeline.makeEntries(from: [item], showsPendingInputAsProcessing: true).contains { $0.isProcessGroup })
+        }
     }
 
     private func imageMessage(type: String = "imageView", role: String? = nil,

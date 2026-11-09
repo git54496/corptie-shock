@@ -31,12 +31,12 @@
 "Work Session Archive" = "Work Session Archive";
 "Delete this archived session permanently?" = "Delete this archived session permanently?";
 "This action cannot be undone." = "This action cannot be undone.";
-"Agent 协作" = "Agent Collaboration";
+"会话协作" = "Session Collaboration";
 "取消" = "Cancel";
 "确认发送" = "Confirm Send";
 "确认发送协作任务" = "Confirm Collaboration Task";
 "任务详情" = "Task Details";
-"验收标准" = "Acceptance Criteria";
+"验收标准" = "Acceptance criteria";
 "理想状态" = "Ideal State";
 "也可以直接回复“确认”或“取消”" = "You can also reply “confirm” or “cancel”.";
 "已处理" = "Resolved";
@@ -99,7 +99,7 @@
 "Detached or non-branch workspace" = "Detached or non-branch workspace";
 "Open Read Only" = "Open Read Only";
 "Active" = "Active";
-"A new Git worktree was detected. Ask the Agent to list workspaces or switch to it." = "A new Git worktree was detected. Ask the Agent to list workspaces or switch to it.";
+"A new Git worktree was detected. Ask the Role to list workspaces or switch to it." = "A new Git worktree was detected. Ask the Role to list workspaces or switch to it.";
 "Could not inspect the session worktree." = "Could not inspect the session worktree.";
 "Could not delete the session." = "Could not delete the session.";
 "detached HEAD" = "detached HEAD";
@@ -150,15 +150,15 @@
 "%d Worktrees require conflict resolution" = "%d Worktrees require conflict resolution";
 "Resolve Conflicts…" = "Resolve Conflicts…";
 "Open Conflict CorptieTask" = "Open Conflict CorptieTask";
-"Add an IC Agent to this Work before creating the resolution CorptieTask" = "Add an IC Agent to this Work before creating the resolution CorptieTask";
+"Add an IC Role to this Work before creating the resolution CorptieTask" = "Add an IC Role to this Work before creating the resolution CorptieTask";
 "Create and immediately start a CorptieTask to resolve these merge conflicts" = "Create and immediately start a CorptieTask to resolve these merge conflicts";
 "Create Conflict-Resolution CorptieTask" = "Create Conflict-Resolution CorptieTask";
 "This CorptieTask will be created under Work %@ and start immediately." = "This CorptieTask will be created under Work %@ and start immediately.";
 "This operation creates one dedicated CorptieTask to resolve the merge conflicts in the following %d branches and merge the result into main:" = "This operation creates one dedicated CorptieTask to resolve the merge conflicts in the following %d branches and merge the result into main:";
 "CorptieTask title" = "CorptieTask title";
 "Resolve completed Worktree merge conflicts" = "Resolve completed Worktree merge conflicts";
-"After confirmation, Corptie will bind this CorptieTask to Agent %@ and start its Work Session in a dedicated Integration Worktree." = "After confirmation, Corptie will bind this CorptieTask to Agent %@ and start its Work Session in a dedicated Integration Worktree.";
-"This Work has no available IC Agent." = "This Work has no available IC Agent.";
+"After confirmation, Corptie will bind this CorptieTask to Role %@ and start its Work Session in a dedicated Integration Worktree." = "After confirmation, Corptie will bind this CorptieTask to Role %@ and start its Work Session in a dedicated Integration Worktree.";
+"This Work has no available IC Role." = "This Work has no available IC Role.";
 "Create and Start CorptieTask" = "Create and Start CorptieTask";
 "Connecting to the server…" = "Connecting to the server…";
 "Click to copy Session title" = "Click to copy Session title";
@@ -253,19 +253,17 @@
 "Commit These Files" = "Commit These Files";
 "Could not inspect commit contents." = "Could not inspect commit contents.";
 "%d unmerged commits will be permanently deleted" = "%d unmerged commits will be permanently deleted";
-"Continue to branch-name confirmation" = "Continue to branch-name confirmation";
+"Continue to permanent deletion confirmation" = "Continue to permanent deletion confirmation";
 "Deleting this Worktree will permanently delete all changes on branch %@. This action cannot be undone." = "Deleting this Worktree will permanently delete all changes on branch %@. This action cannot be undone.";
 "Confirm permanent Worktree deletion" = "Confirm permanent Worktree deletion";
 "%d commits have not been merged into main." = "%d commits have not been merged into main.";
 "This will permanently delete the Worktree directory, its branch, and all changes unique to that branch. This action cannot be undone." = "This will permanently delete the Worktree directory, its branch, and all changes unique to that branch. This action cannot be undone.";
-"Type the full branch name exactly as shown to confirm:" = "Type the full branch name exactly as shown to confirm:";
-"Full branch name" = "Full branch name";
 "Permanently Delete Worktree" = "Permanently Delete Worktree";
 "This session's workspace is missing" = "This session's workspace is missing";
 "The workspace at %@ is unavailable. Corptie can delete only the session and its local conversation record; no Worktree files or Git branches will be changed." = "The workspace at %@ is unavailable. Corptie can delete only the session and its local conversation record; no Worktree files or Git branches will be changed.";
 "Delete Session Only" = "Delete Session Only";
 "Workspace missing" = "Workspace missing";
-"This session is preserved, but Agent work is blocked until the workspace is restored or switched." = "This session is preserved, but Agent work is blocked until the workspace is restored or switched.";
+"This session is preserved, but Session work is blocked until the workspace is restored or switched." = "This session is preserved, but Session work is blocked until the workspace is restored or switched.";
 "Rebuild Original Worktree" = "Rebuild Original Worktree";
 "Switch Workspace" = "Switch Workspace";
 "Main — %@" = "Main — %@";
@@ -348,10 +346,10 @@
 "The Artifact's local path is not a regular file." = "The Artifact's local path is not a regular file.";
 "The system could not open this Artifact: %@" = "The system could not open this Artifact: %@";
 "Commit message" = "Commit message";
-"Generate with Agent" = "Generate with Agent";
+"Generate with Role" = "Generate with Role";
 "Generating…" = "Generating…";
 "Enter a commit message" = "Enter a commit message";
-"Enter your own message or generate one with Agent, then edit it before pushing." = "Enter your own message or generate one with Agent, then edit it before pushing.";
+"Enter your own message or generate one with Role, then edit it before pushing." = "Enter your own message or generate one with Role, then edit it before pushing.";
 "Could not generate commit message." = "Could not generate commit message.";
 "Service profile does not match the selected profile" = "Service profile does not match the selected profile";
 "Running build cannot be verified" = "Running build cannot be verified";
@@ -369,7 +367,7 @@
 "profile" = "profile";
 "Could not update the service profile." = "Could not update the service profile.";
 "Review Commit" = "Review Commit";
-"Enter your own message or generate one with Agent, then edit it before continuing." = "Enter your own message or generate one with Agent, then edit it before continuing.";
+"Enter your own message or generate one with Role, then edit it before continuing." = "Enter your own message or generate one with Role, then edit it before continuing.";
 "The changes will be committed to this Worktree only. No remote push is performed." = "The changes will be committed to this Worktree only. No remote push is performed.";
 "The changes will be committed and then merged into main. No remote push is performed." = "The changes will be committed and then merged into main. No remote push is performed.";
 "The changes will be committed before completing the Worktree operation. No remote push is performed." = "The changes will be committed before completing the Worktree operation. No remote push is performed.";
@@ -390,29 +388,29 @@
 "Banked reset expiry unavailable" = "Banked reset expiry unavailable";
 
 /* Console, Sessions, Work, CorptieTask, and Agent surfaces */
-"\u63A7\u5236\u53F0" = "Console";
-"\u8BBE\u7F6E" = "Settings";
-"\u6682\u65E0\u4F1A\u8BDD" = "No Sessions";
-"\u65B0\u5EFA\u4F1A\u8BDD" = "New Session";
-"\u65B0\u5EFA\u4F1A\u8BDD\uFF08\u9009\u62E9\u4E00\u4E2A Assistant\uFF09" = "New session (choose an Assistant)";
-"\u4ECE\u5DE6\u4FA7\u9009\u62E9\u4E00\u4E2A\u4F1A\u8BDD\u67E5\u770B\u5BF9\u8BDD" = "Select a session from the sidebar to view the conversation";
-"\u4F1A\u8BDD\u8BE6\u60C5" = "Session Details";
-"CorptieTask \u8BE6\u60C5" = "CorptieTask Details";
-"\u7ED1\u5B9A\u8BB0\u5F55\u53EF\u80FD\u5DF2\u4E0D\u5B58\u5728" = "The linked record may no longer exist";
-"\u521B\u5EFA Agent" = "Create Agent";
-"Agent \u540D\u79F0" = "Agent Name";
-"\u5982\uFF1A\u540E\u7AEF\u63A5\u53E3\u4E0E\u6570\u636E\u5E93\u4E13\u5BB6" = "e.g. Backend API and database specialist";
-"\u72EC\u7ACB\u8D21\u732E\u8005\uFF08IC\uFF09" = "Independent Contributor (IC)";
-"\u52A9\u624B\uFF08Assistant\uFF09" = "Assistant";
-"\u9AD8\u7EA7\u9009\u9879" = "Advanced Options";
-"\u5982\uFF1Abackend, api, database" = "e.g. backend, api, database";
-"\u7559\u7A7A\u5219\u81EA\u52A8\u751F\u6210\uFF08\u6BCF\u4E2A\u52A9\u624B\u72EC\u7ACB\uFF0C\u8D21\u732E\u8005\u4E3A\u6301\u4E45\u5316\u76EE\u5F55\uFF09" = "Leave blank to generate automatically (isolated per Assistant, persistent directory for contributors)";
-"\u53D6\u6D88" = "Cancel";
-"\u521B\u5EFA" = "Create";
-"\u4ECE\u5DF2\u6709 Agent \u7EE7\u627F\uFF08\u53EF\u9009\uFF09" = "Inherit from an existing Agent (optional)";
-"\u6682\u65E0\u5DF2\u6709 Agent\uFF0C\u53EF\u76F4\u63A5\u586B\u5199\u4E0B\u65B9\u4FE1\u606F\u3002" = "No existing Agents. Fill in the fields below directly.";
-"\u9884\u88C5 Skill" = "Preinstalled Skills";
-"\u767B\u8BB0" = "Register";
+"控制台" = "Console";
+"设置" = "Settings";
+"暂无会话" = "No Sessions";
+"新建会话" = "New Session";
+"新建会话（选择一个 Assistant）" = "New session (choose an Assistant)";
+"从左侧选择一个会话查看对话" = "Select a session from the sidebar to view the conversation";
+"会话详情" = "Session Details";
+"CorptieTask 详情" = "CorptieTask Details";
+"绑定记录可能已不存在" = "The linked record may no longer exist";
+"创建角色" = "Create Role";
+"角色名称" = "Role Name";
+"如：后端接口与数据库专家" = "e.g. Backend API and database specialist";
+"独立贡献者（IC）" = "Independent Contributor (IC)";
+"助手（Assistant）" = "Assistant";
+"高级选项" = "Advanced Options";
+"如：backend, api, database" = "e.g. backend, api, database";
+"留空则自动生成（每个助手独立，贡献者为持久化目录）" = "Leave blank to generate automatically (isolated per Assistant, persistent directory for contributors)";
+"取消" = "Cancel";
+"创建" = "Create";
+"从已有角色继承（可选）" = "Inherit from an existing Role (optional)";
+"暂无已有角色，可直接填写下方信息。" = "No existing Roles. Fill in the fields below directly.";
+"预装 Skill" = "Preinstalled Skills";
+"登记" = "Register";
 "Skills" = "Skills";
 "Show Skills" = "Show Skills";
 "No Skills" = "No Skills";
@@ -420,83 +418,83 @@
 "No description" = "No description";
 "Git" = "Git";
 "Local" = "Local";
-"\u5C1A\u672A\u767B\u8BB0\u4EFB\u4F55 Skill\uFF0C\u70B9\u300C\u767B\u8BB0\u300D\u4ECE\u672C\u5730\u76EE\u5F55\u6216 Git \u4ED3\u5E93\u6DFB\u52A0\u3002" = "No Skills registered. Click Register to add one from a local directory or Git repository.";
-"\u8BF7\u5148\u5728 Agent \u7BA1\u7406\u9875\u521B\u5EFA\u4E00\u4E2A Assistant \u7C7B Agent\u3002" = "Create an Assistant Agent in Agent Management first.";
-"\u9009\u62E9\u4E00\u4E2A Assistant \u5F00\u59CB\u5BF9\u8BDD" = "Choose an Assistant to start a conversation";
-"\u641C\u7D22 Agent \u540D\u79F0" = "Search Agent names";
-"\u65B0\u5EFA Agent" = "New Agent";
-"\u5B8C\u6210" = "Done";
-"\u521B\u5EFA Work" = "Create Work";
-"\u76EE\u6807\u540D\u79F0" = "Work name";
-"\u4F18\u5148\u7EA7" = "Priority";
-"\u672A\u8BBE\u7F6E" = "Not Set";
-"\u4F4E" = "Low";
-"\u4E2D" = "Medium";
-"\u9AD8" = "High";
-"\u7D27\u6025" = "Urgent";
-"\u5982\uFF1A\u540E\u7AEF, \u91CD\u6784, \u6027\u80FD" = "e.g. backend, refactoring, performance";
-"\u5E2E\u6211\u5199" = "Help Me Write";
-"\u6B63\u5728\u751F\u6210\u2026" = "Generating\u2026";
-"\u751F\u6210\u7ED3\u679C\uFF08\u53EF\u7F16\u8F91\u540E\u91C7\u7EB3\uFF09" = "Generated result (edit before applying)";
-"\u91CD\u65B0\u751F\u6210" = "Regenerate";
-"\u91C7\u7EB3" = "Apply";
-"\u7B80\u5355\u63CF\u8FF0\u4F60\u60F3\u8BA9 Agent \u586B\u5199\u7684\u5185\u5BB9\uFF0C\u4F8B\u5982\uFF1A" = "Briefly describe what you want the Agent to write, for example:";
-"\u300C\u628A Corptie \u7684\u63A7\u5236\u53F0\u62C6\u6210\u4E09\u4E2A\u6A21\u5757\uFF0C\u8BF4\u660E\u91CD\u6784\u76EE\u6807\u548C\u9A8C\u6536\u6807\u51C6\u300D" = "Split the Corptie console into three modules and explain the refactoring goals and acceptance criteria.";
-"\u6E05\u9664\uFF0C\u4F7F\u7528\u9ED8\u8BA4 Agent" = "Clear and use the default Agent";
-"\u751F\u6210" = "Generate";
-"\u65B0\u5EFA\u5DE5\u4F5C\u9879" = "New CorptieTask";
-"\u6807\u9898 *" = "Title *";
-"\u5DE5\u4F5C\u9879\u6807\u9898" = "CorptieTask title";
-"\u63CF\u8FF0 *" = "Description *";
-"\u63CF\u8FF0" = "Description";
-"\u9A8C\u6536\u6807\u51C6" = "Acceptance Criteria";
-"\u4F7F\u7528\u9ED8\u8BA4 Agent" = "Use Default Agent";
-"\u767B\u8BB0 Skill" = "Register Skill";
-"\u672C\u5730\u76EE\u5F55" = "Local Directory";
-"Git \u4ED3\u5E93" = "Git Repository";
-"\u672C\u5730\u76EE\u5F55\uFF08\u9700\u542B SKILL.md\uFF09" = "Local directory (must contain SKILL.md)";
-"\u9009\u62E9\u5305\u542B SKILL.md \u7684\u76EE\u5F55" = "Choose a directory containing SKILL.md";
-"\u6D4F\u89C8\u2026" = "Browse\u2026";
-"Git \u4ED3\u5E93 URL\uFF08\u9700\u542B SKILL.md\uFF09" = "Git repository URL (must contain SKILL.md)";
-"\u7559\u7A7A\u5219\u81EA\u52A8\u63A8\u65AD" = "Leave blank to infer automatically";
-"\u8FD9\u4E2A Skill \u505A\u4EC0\u4E48" = "What this Skill does";
-"\u70B9\u51FB\u53F3\u4E0A\u89D2\u300C\u65B0\u5EFA Agent\u300D\u521B\u5EFA\u7B2C\u4E00\u4E2A" = "Click New Agent in the top-right to create the first one";
-"\u5F00\u59CB\u65B0\u4F1A\u8BDD" = "Start New Session";
-"\u6253\u5F00\u8BE6\u60C5" = "Open Details";
-"Workspace\uFF08Git \u4ED3\u5E93\uFF09" = "Workspace (Git Repository)";
-"\u6240\u5C5E Work \u5C1A\u672A\u6302\u9760\u4ED3\u5E93\uFF0C\u8BF7\u5148\u5728 Work \u4E2D\u6DFB\u52A0" = "This Work has no linked repository. Add one to the Work first.";
-"\u672A\u9009\u62E9" = "Not Selected";
-"\u7ED1\u5B9A Workspace" = "Bind Workspace";
-"\u4FDD\u5B58" = "Save";
-"\u65E0\u6CD5\u6DFB\u52A0 Workspace" = "Unable to Add Workspace";
-"\u786E\u5B9A" = "OK";
-"\u6DFB\u52A0 Git \u4ED3\u5E93" = "Add Git Repository";
-"\u5C1A\u672A\u9009\u62E9\u4ED3\u5E93" = "No Repository Selected";
-"\u5206\u914D Agent" = "Assign Agent";
-"\u5C1A\u672A\u5206\u914D Agent" = "No Agent Assigned";
-"\u5220\u9664 Agent" = "Delete Agent";
-"\u5220\u9664" = "Delete";
-"\u5220\u9664\u540E\u8BE5 Agent \u7684\u5386\u53F2\u4F1A\u8BDD\u4F1A\u89E3\u7ED1\u4FDD\u7559\uFF0C\u4F46\u6B64\u64CD\u4F5C\u4E0D\u53EF\u64A4\u9500\u3002" = "Historical sessions will be retained but unbound after deleting this Agent. This action cannot be undone.";
-"\u8BBE\u7F6E\u5934\u50CF" = "Set Avatar";
-"\u540D\u79F0" = "Name";
-"\u65E0" = "None";
-"\u6E05\u9664\u5934\u50CF" = "Clear Avatar";
-"\u7F16\u8F91 Work" = "Edit Work";
-"\u5DF2\u4FDD\u5B58" = "Saved";
-"\u5220\u9664 Work" = "Delete Work";
-"\u7F16\u8F91" = "Edit";
-"\u901A\u8FC7\u52A9\u624B\u5BF9\u8BDD\u6216\u5FEB\u6377\u8F93\u5165\u521B\u5EFA\u7B2C\u4E00\u4E2A\u76EE\u6807" = "Create your first Work through an Assistant conversation or quick input";
-"\u9009\u62E9\u76EE\u6807" = "Select an Work";
-"\u9009\u62E9\u5DE5\u4F5C\u9879" = "Select a CorptieTask";
-"\u6267\u884C\u5931\u8D25" = "Execution Failed";
-"\u597D" = "OK";
-"\u786E\u8BA4\u5B8C\u6210" = "Confirm Completion";
-"Agent \u7684\u5224\u5B9A\u5DF2\u6EE1\u8DB3\u9A8C\u6536\u6807\u51C6\uFF0C\u786E\u8BA4\u5C06\u8BE5\u5DE5\u4F5C\u9879\u6807\u8BB0\u4E3A\u300C\u5DF2\u5B8C\u6210\u300D\uFF1F" = "The Agent determined that the acceptance criteria are met. Mark this CorptieTask as completed?";
-"负责 Agent *" = "Responsible Agent *";
-"负责 Agent" = "Responsible Agent";
-"请选择 Agent" = "Select an Agent";
-"请选择负责该 CorptieTask 的 Agent。" = "Select the Agent responsible for this CorptieTask.";
-"当前 Work 没有可用的 Independent Contributor Agent。" = "This Work has no available Independent Contributor Agent.";
+"尚未登记任何 Skill，点「登记」从本地目录或 Git 仓库添加。" = "No Skills registered. Click Register to add one from a local directory or Git repository.";
+"请先在角色管理页创建一个 Assistant 类角色。" = "Create an Assistant Role in Role Management first.";
+"选择一个 Assistant 开始对话" = "Choose an Assistant to start a conversation";
+"搜索角色名称" = "Search Role names";
+"新建角色" = "New Role";
+"完成" = "Done";
+"创建 Work" = "Create Work";
+"目标名称" = "Work name";
+"优先级" = "Priority";
+"未设置" = "Not Set";
+"低" = "Low";
+"中" = "Medium";
+"高" = "High";
+"紧急" = "Urgent";
+"如：后端, 重构, 性能" = "e.g. backend, refactoring, performance";
+"帮我写" = "Help Me Write";
+"正在生成…" = "Generating…";
+"生成结果（可编辑后采纳）" = "Generated result (edit before applying)";
+"重新生成" = "Regenerate";
+"采纳" = "Apply";
+"简单描述你想让角色填写的内容，例如：" = "Briefly describe what you want the Role to write, for example:";
+"「把 Corptie 的控制台拆成三个模块，说明重构目标和验收标准」" = "Split the Corptie console into three modules and explain the refactoring goals and acceptance criteria.";
+"清除，使用默认角色" = "Clear and use the default Role";
+"生成" = "Generate";
+"新建工作项" = "New CorptieTask";
+"标题 *" = "Title *";
+"工作项标题" = "CorptieTask title";
+"描述 *" = "Description *";
+"描述" = "Description";
+"验收标准" = "Acceptance criteria";
+"使用默认角色" = "Use Default Role";
+"登记 Skill" = "Register Skill";
+"本地目录" = "Local Directory";
+"Git 仓库" = "Git Repository";
+"本地目录（需含 SKILL.md）" = "Local directory (must contain SKILL.md)";
+"选择包含 SKILL.md 的目录" = "Choose a directory containing SKILL.md";
+"浏览…" = "Browse…";
+"Git 仓库 URL（需含 SKILL.md）" = "Git repository URL (must contain SKILL.md)";
+"留空则自动推断" = "Leave blank to infer automatically";
+"这个 Skill 做什么" = "What this Skill does";
+"点击右上角「新建角色」创建第一个" = "Click New Role in the top-right to create the first one";
+"开始新会话" = "Start New Session";
+"打开详情" = "Open Details";
+"Workspace（Git 仓库）" = "Workspace (Git Repository)";
+"所属 Work 尚未挂靠仓库，请先在 Work 中添加" = "This Work has no linked repository. Add one to the Work first.";
+"未选择" = "Not Selected";
+"绑定 Workspace" = "Bind Workspace";
+"保存" = "Save";
+"无法添加 Workspace" = "Unable to Add Workspace";
+"确定" = "OK";
+"添加 Git 仓库" = "Add Git Repository";
+"尚未选择仓库" = "No Repository Selected";
+"分配角色" = "Assign Role";
+"尚未分配角色" = "No Role Assigned";
+"删除角色" = "Delete Role";
+"删除" = "Delete";
+"删除后该角色的历史会话会解绑保留，但此操作不可撤销。" = "Historical sessions will be retained but unbound after deleting this Role. This action cannot be undone.";
+"设置头像" = "Set Avatar";
+"名称" = "Name";
+"无" = "None";
+"清除头像" = "Clear Avatar";
+"编辑 Work" = "Edit Work";
+"已保存" = "Saved";
+"删除 Work" = "Delete Work";
+"编辑" = "Edit";
+"通过助手对话或快捷输入创建第一个目标" = "Create your first Work through an Assistant conversation or quick input";
+"选择目标" = "Select an Work";
+"选择工作项" = "Select a CorptieTask";
+"执行失败" = "Execution Failed";
+"好" = "OK";
+"确认完成" = "Confirm Completion";
+"会话的判定已满足验收标准，确认将该工作项标记为「已完成」？" = "The Session determined that the acceptance criteria are met. Mark this CorptieTask as completed?";
+"负责角色 *" = "Responsible Role *";
+"负责角色" = "Responsible Role";
+"请选择角色" = "Select a Role";
+"请选择负责该 CorptieTask 的角色。" = "Select the Role responsible for this CorptieTask.";
+"当前 Work 没有可用的 Independent Contributor 角色。" = "This Work has no available Independent Contributor Role.";
 "仅创建不执行" = "Create Without Running";
 "创建后立即执行" = "Create and Run";
 "重试执行" = "Retry Execution";
@@ -510,19 +508,19 @@
 "CorptieTask 已创建，但执行失败：%@" = "The CorptieTask was created, but execution failed: %@";
 "CorptieTask 已创建（%@）；重试只会再次尝试执行，不会重复创建。" = "The CorptieTask was created (%@). Retrying will only retry execution and will not create another CorptieTask.";
 "未知错误" = "Unknown error";
-"\u7F16\u8F91\u5DE5\u4F5C\u9879" = "Edit CorptieTask";
-"\u6267\u884C" = "Execution";
-"\u65E0\u4F1A\u8BDD" = "No Session";
-"\u5DE5\u4F5C\u9879\u8BB0\u5FC6" = "CorptieTask Memory";
-"\u6682\u65E0\u8BB0\u5FC6" = "No Memory";
-"\u5DF2\u5B8C\u6210" = "Completed";
-"\u7EC8\u6B62\u6267\u884C" = "Stop Execution";
-"\u6807\u9898" = "Title";
-"\u72B6\u6001" = "Status";
-"\u624B\u52A8\u4FEE\u6539\u72B6\u6001\u5C06\u8986\u76D6\u7531\u6267\u884C\u6D41\u7A0B\u81EA\u52A8\u7EF4\u62A4\u7684\u72B6\u6001\uFF0C\u8BF7\u8C28\u614E\u64CD\u4F5C\u3002" = "Changing the status manually overrides the execution-managed status. Proceed carefully.";
-"\u8FDB\u884C\u4E2D" = "In Progress";
-"\u786E\u8BA4\u4FEE\u6539\u72B6\u6001" = "Confirm Status Change";
-"\u786E\u8BA4\u4FEE\u6539" = "Confirm Change";
+"编辑工作项" = "Edit CorptieTask";
+"执行" = "Execution";
+"无会话" = "No Session";
+"工作项记忆" = "CorptieTask Memory";
+"暂无记忆" = "No Memory";
+"已完成" = "Completed";
+"终止执行" = "Stop Execution";
+"标题" = "Title";
+"状态" = "Status";
+"手动修改状态将覆盖由执行流程自动维护的状态，请谨慎操作。" = "Changing the status manually overrides the execution-managed status. Proceed carefully.";
+"进行中" = "In Progress";
+"确认修改状态" = "Confirm Status Change";
+"确认修改" = "Confirm Change";
 
 /* Shared navigation and entity vocabulary */
 "Console" = "Console";
@@ -537,7 +535,12 @@
 "归档失败" = "Could not archive Task.";
 "Mention a Work or Session" = "Mention a Work or Session";
 "Mention suggestions" = "Mention suggestions";
-"Agents" = "Agents";
+"Roles" = "Roles";
+"Execution Engine" = "Execution Engine";
+"New Session" = "New Session";
+"Controls when the Session asks before running privileged actions" = "Controls when the Session asks before running privileged actions";
+"Full Access lets the Session operate outside the workspace. Use it only for trusted tasks." = "Full Access lets the Session operate outside the workspace. Use it only for trusted tasks.";
+"Roles define reusable instructions and skills. Sessions run through execution engines." = "Roles define reusable instructions and skills. Sessions run through execution engines.";
 "Work" = "Work";
 "Work *" = "Work *";
 "请选择 Work" = "Select a Work";
@@ -563,7 +566,7 @@
 "New %@" = "New %@";
 "No Workspace Bound" = "No Workspace Bound";
 "No Content" = "No Content";
-"Select an Agent" = "Select an Agent";
+"Select a Role" = "Select a Role";
 "Open Session" = "Open Session";
 "Could not load session messages: %@" = "Could not load session messages: %@";
 "The history server returned an invalid response." = "The history server returned an invalid response.";
@@ -592,17 +595,17 @@
 "来源" = "Source";
 "标签（逗号分隔）" = "Tags (comma-separated)";
 "设置目标日期" = "Set Target Date";
-"Contributor Agent" = "Contributor Agent";
+"Contributor Role" = "Contributor Role";
 "WORKSPACE" = "WORKSPACE";
 "Select a Session" = "Select a Session";
 "Unable to Load CorptieTask" = "Unable to Load CorptieTask";
-"No Agents" = "No Agents";
-"No Matching Agents" = "No Matching Agents";
-"%lld Agents Selected" = "%lld Agents Selected";
-"1 Agent Selected" = "1 Agent Selected";
+"No Roles" = "No Roles";
+"No Matching Roles" = "No Matching Roles";
+"%lld Roles Selected" = "%lld Roles Selected";
+"1 Role Selected" = "1 Role Selected";
 "No %@" = "No %@";
 "Delete “%@”? All of its CorptieTasks will be deleted. This action cannot be undone." = "Delete “%@”? All of its CorptieTasks will be deleted. This action cannot be undone.";
-"Ask an Agent to write “%@”" = "Ask an Agent to write “%@”";
+"Ask a Role to write “%@”" = "Ask a Role to write “%@”";
 "You are manually overriding the CorptieTask status (%@), bypassing execution-managed status. Continue?" = "You are manually overriding the CorptieTask status (%@), bypassing execution-managed status. Continue?";
 "会话名称（可选）" = "Session name (optional)";
 "会话头像（可选）" = "Session avatar (optional)";
@@ -610,14 +613,14 @@
 "选择图片" = "Choose Image";
 "清除" = "Clear";
 "可用 Skill" = "Available Skills";
-"选中的 Skill 会加入该 Agent 的查询范围，并在需要时按需加载。" = "Selected Skills are searchable by this Agent and load their full instructions only when needed.";
+"选中的 Skill 会加入该角色的查询范围，并在需要时按需加载。" = "Selected Skills are searchable by this Role and load their full instructions only when needed.";
 "当前 Provider 不支持会话内 Skill 查询和懒加载。" = "The current Provider does not support in-session Skill search and lazy loading.";
 "选择具体 Skill" = "Choose a Specific Skill";
 "本地" = "Local";
 "保存失败。" = "Save failed.";
 "用一段话填写整个表单" = "Fill the whole form from one description";
 "AI 只会回填草稿，你仍可逐项检查和编辑。" = "AI only fills a draft; you can review and edit every field.";
-"使用默认 Agent" = "Use Default Agent";
+"使用默认角色" = "Use Default Role";
 "生成并填入" = "Generate and Fill";
 "重新生成并填入" = "Regenerate and Fill";
 "草稿已填入下方表单，请逐项检查后再创建。" = "The draft is in the form below. Review each field before creating.";
@@ -706,8 +709,8 @@
 "Active Session: %@" = "Active Session: %@";
 "An active Session is still modifying this Worktree. Stop it before integrating." = "An active Session is still modifying this Worktree. Stop it before integrating.";
 "Local Agent configuration links cannot be committed. Replace them with real project files first." = "Local Agent configuration links cannot be committed. Replace them with real project files first.";
-"Agent %@ is resolving conflicts in %@. Return here and retry after it finishes." = "Agent %@ is resolving conflicts in %@. Return here and retry after it finishes.";
-"The conflict Agent stopped before completing. Open its Session to inspect or resume it." = "The conflict Agent stopped before completing. Open its Session to inspect or resume it.";
+"Session %@ is resolving conflicts in %@. Return here and retry after it finishes." = "Session %@ is resolving conflicts in %@. Return here and retry after it finishes.";
+"The conflict Session stopped before completing. Open its Session to inspect or resume it." = "The conflict Session stopped before completing. Open its Session to inspect or resume it.";
 "修改请求" = "Change Request";
 "澄清请求" = "Information Request";
 "结果" = "Result";
@@ -735,14 +738,14 @@
 "进程退出任务" = "Process-exit task";
 "等待确认" = "Awaiting Confirmation";
 "等待处理" = "Awaiting Processing";
-"未知 Agent" = "Unknown Agent";
-"当前 Agent" = "Current Agent";
+"未知角色" = "Unknown Role";
+"当前角色" = "Current Role";
 "当前 Session" = "Current Session";
 "未知 Session" = "Unknown Session";
 "未命名协作任务" = "Untitled Collaboration Task";
 "协作消息正文不可用" = "Collaboration message unavailable";
-"来自 Agent" = "From Agent";
-"发送至 Agent" = "To Agent";
+"来自会话" = "From Session";
+"发送至角色" = "To Role";
 "目标 Session" = "Target Session";
 "消息" = "Message";
 "目标 CorptieTask" = "Target CorptieTask";
@@ -762,8 +765,8 @@
 "Unable to delete Skill" = "Unable to delete Skill";
 "Unable to delete Skill." = "Unable to delete Skill.";
 "Unable to inspect Skill deletion impact." = "Unable to inspect Skill deletion impact.";
-"No Agent currently uses this Skill." = "No Agent currently uses this Skill.";
-"This permanently removes the Skill from %d Agent(s): %@." = "This permanently removes the Skill from %d Agent(s): %@.";
+"No Role currently uses this Skill." = "No Role currently uses this Skill.";
+"This permanently removes the Skill from %d Role(s): %@." = "This permanently removes the Skill from %d Role(s): %@.";
 "All Provider runtime copies and the Git cache will be removed. This cannot be undone." = "All Provider runtime copies and the Git cache will be removed. This cannot be undone.";
 "Deletion is blocked because %d active Session(s) can still use this Skill: %@. End or interrupt them first." = "Deletion is blocked because %d active Session(s) can still use this Skill: %@. End or interrupt them first.";
 "No Git Worktrees" = "No Git Worktrees";
@@ -879,26 +882,26 @@
 "Impact: only the listed task Worktrees require manual repair, but no plan step can start until their Git conflicts are resolved." = "Impact: only the listed task Worktrees require manual repair, but no plan step can start until their Git conflicts are resolved.";
 "Show in Finder" = "Show in Finder";
 "Next: finish or abort the existing Git operation in each task Worktree, resolve all conflict files, then re-run preflight." = "Next: finish or abort the existing Git operation in each task Worktree, resolve all conflict files, then re-run preflight.";
-"The conflict Agent stopped before completing. Corptie did not promote anything to main; open its Session to inspect or resume it." = "The conflict Agent stopped before completing. Corptie did not promote anything to main; open its Session to inspect or resume it.";
-"Let Agent Resolve Conflicts" = "Let Agent Resolve Conflicts";
-"View Agent Session" = "View Agent Session";
+"The conflict Session stopped before completing. Corptie did not promote anything to main; open its Session to inspect or resume it." = "The conflict Session stopped before completing. Corptie did not promote anything to main; open its Session to inspect or resume it.";
+"Resolve Conflicts in Session" = "Resolve Conflicts in Session";
+"View Resolution Session" = "View Resolution Session";
 "Revalidate and Continue" = "Revalidate and Continue";
-"Agent is resolving conflicts…" = "Agent is resolving conflicts…";
-"Agent finished; automatic validation needs attention" = "Agent finished; automatic validation needs attention";
-"Agent resolved the conflicts; validating and continuing automatically…" = "Agent resolved the conflicts; validating and continuing automatically…";
-"Retry Agent for Remaining Worktrees" = "Retry Agent for Remaining Worktrees";
+"Role is resolving conflicts…" = "Role is resolving conflicts…";
+"Role finished; automatic validation needs attention" = "Role finished; automatic validation needs attention";
+"Session resolved the conflicts; validating and continuing automatically…" = "Session resolved the conflicts; validating and continuing automatically…";
+"Retry Role for Remaining Worktrees" = "Retry Role for Remaining Worktrees";
 "Integration plan completed. All planned Worktrees reached a final state." = "Integration plan completed. All planned Worktrees reached a final state.";
 "Automatic conflict resolution is blocked at %@." = "Automatic conflict resolution is blocked at %@.";
 "Conflicting files: %@" = "Conflicting files: %@";
 "The conflict could not be resolved automatically." = "The conflict could not be resolved automatically.";
-"Agent stopped before resolving the conflicts" = "Agent stopped before resolving the conflicts";
-"Preparing the Agent conflict workspace" = "Preparing the Agent conflict workspace";
-"Agent is resolving conflicts" = "Agent is resolving conflicts";
+"Role stopped before resolving the conflicts" = "Role stopped before resolving the conflicts";
+"Preparing the Role conflict workspace" = "Preparing the Role conflict workspace";
+"Role is resolving conflicts" = "Role is resolving conflicts";
 "Conflict resolved; continuing automatically" = "Conflict resolved; continuing automatically";
-"Validating the Agent result" = "Validating the Agent result";
-"The conflict Agent finished in its dedicated Integration Worktree. Corptie is validating the committed result and will continue automatically; main remains untouched until validation passes." = "The conflict Agent finished in its dedicated Integration Worktree. Corptie is validating the committed result and will continue automatically; main remains untouched until validation passes.";
-"Agent %@ is resolving conflicts only in %@. main remains unchanged; Corptie will validate the result and continue automatically when it finishes." = "Agent %@ is resolving conflicts only in %@. main remains unchanged; Corptie will validate the result and continue automatically when it finishes.";
-"The Agent result was not promoted: %@ Nothing changed in main. Fix the dedicated Integration Worktree, then revalidate and continue, or stop and re-preflight." = "The Agent result was not promoted: %@ Nothing changed in main. Fix the dedicated Integration Worktree, then revalidate and continue, or stop and re-preflight.";
+"Validating the Session result" = "Validating the Session result";
+"The conflict Session finished in its dedicated Integration Worktree. Corptie is validating the committed result and will continue automatically; main remains untouched until validation passes." = "The conflict Session finished in its dedicated Integration Worktree. Corptie is validating the committed result and will continue automatically; main remains untouched until validation passes.";
+"Session %@ is resolving conflicts only in %@. main remains unchanged; Corptie will validate the result and continue automatically when it finishes." = "Session %@ is resolving conflicts only in %@. main remains unchanged; Corptie will validate the result and continue automatically when it finishes.";
+"The Session result was not promoted: %@ Nothing changed in main. Fix the dedicated Integration Worktree, then revalidate and continue, or stop and re-preflight." = "The Session result was not promoted: %@ Nothing changed in main. Fix the dedicated Integration Worktree, then revalidate and continue, or stop and re-preflight.";
 "Pushed to GitHub" = "Pushed to GitHub";
 "GitHub did not confirm that the branch was pushed." = "GitHub did not confirm that the branch was pushed.";
 "Pushed %@ to %@ and configured its upstream branch." = "Pushed %@ to %@ and configured its upstream branch.";
@@ -908,12 +911,12 @@
 "This branch is already up to date with GitHub and has the correct upstream branch." = "This branch is already up to date with GitHub and has the correct upstream branch.";
 "Push committed branch changes to GitHub. Uncommitted files are not included." = "Push committed branch changes to GitHub. Uncommitted files are not included.";
 "Push this local branch to the configured GitHub repository and set its upstream branch if needed." = "Push this local branch to the configured GitHub repository and set its upstream branch if needed.";
-"CorptieTask Memory" = "CorptieTask Memory";
+"CorptieTask Memory" = "Task Memory";
 "Work Memory" = "Work Memory";
-"Agent Long-term Memory" = "Agent Long-term Memory";
+"Role Long-term Memory" = "Role Memory";
 "Kept by me" = "Kept by me";
-"Suggested by Agent" = "Suggested by Agent";
-"Confirmed Agent Memory" = "Confirmed Agent Memory";
+"Suggested by Role" = "Suggested memories";
+"Confirmed Role Memory" = "Confirmed Role Memory";
 "System checkpoints and consolidation" = "System checkpoints and consolidation";
 "Disabled, replaced or expired" = "Disabled, replaced or expired";
 "Memories explicitly kept or manually added by you." = "Memories explicitly kept or manually added by you.";
@@ -921,17 +924,17 @@
 "Trusted durable knowledge available within this scope." = "Trusted durable knowledge available within this scope.";
 "Recoverable pre-compaction checkpoints and audited consolidation results." = "Recoverable pre-compaction checkpoints and audited consolidation results.";
 "Preserved for audit but excluded from normal recall." = "Preserved for audit but excluded from normal recall.";
-"Layered Memory Inspector" = "Layered Memory Inspector";
+"Layered Memory Inspector" = "Memory";
 "Structured Memory" = "Structured Memory";
-"CorptieTask → Work → Agent is the recall priority. Memories are grouped by both scope and origin." = "CorptieTask → Work → Agent is the recall priority. Memories are grouped by both scope and origin.";
-"Only this Agent's long-term layer is managed here. Work and CorptieTask memories remain in their own context pages." = "Only this Agent's long-term layer is managed here. Work and CorptieTask memories remain in their own context pages.";
-"Only this Agent's structured long-term layer is managed here. Work, CorptieTask, and runtime file memories remain separate." = "Only this Agent's structured long-term layer is managed here. Work, CorptieTask, and runtime file memories remain separate.";
-"Shared Work context. CorptieTask-local and Agent long-term memories are managed separately." = "Shared Work context. CorptieTask-local and Agent long-term memories are managed separately.";
+"CorptieTask → Work → Role is the recall priority. Memories are grouped by both scope and origin." = "CorptieTask → Work → Role is the recall priority. Memories are grouped by both scope and origin.";
+"Only this Role's long-term layer is managed here. Work and CorptieTask memories remain in their own context pages." = "Only this Role's long-term layer is managed here. Work and CorptieTask memories remain in their own context pages.";
+"Only this Role's structured long-term layer is managed here. Work, CorptieTask, and runtime file memories remain separate." = "Only this Role's structured long-term layer is managed here. Work, CorptieTask, and runtime file memories remain separate.";
+"Shared Work context. CorptieTask-local and Role long-term memories are managed separately." = "Shared Work context. CorptieTask-local and Role long-term memories are managed separately.";
 "The most specific task-local layer and the first layer considered during recall." = "The most specific task-local layer and the first layer considered during recall.";
 "Structured Memory for the selected owner." = "Structured Memory for the selected owner.";
 "Add Memory" = "Add Memory";
 "Add structured Memory" = "Add structured Memory";
-"Choose the narrowest scope that should be affected. CorptieTask is local, Work is shared by the work, and Agent is long-term." = "Choose the narrowest scope that should be affected. CorptieTask is local, Work is shared by the work, and Agent is long-term.";
+"Choose the narrowest scope that should be affected. CorptieTask is local, Work is shared by the work, and Role is long-term." = "Choose the narrowest scope that should be affected. CorptieTask is local, Work is shared by the work, and Role is long-term.";
 "Memory layer" = "Memory layer";
 "All scopes" = "All scopes";
 "Extraction queue" = "Extraction queue";
@@ -949,7 +952,7 @@
 "Edit Memory" = "Edit Memory";
 "Active extracted Memory" = "Active extracted Memory";
 "Candidates awaiting review; they do not participate in recall." = "Candidates awaiting review; they do not participate in recall.";
-"Task → Work → Global memories apply across their scopes. Agent memories remain a separate legacy layer." = "Task → Work → Global memories apply across their scopes. Agent memories remain a separate legacy layer.";
+"Task → Work → Global memories apply across their scopes. Role memories remain a separate legacy layer." = "Manage memories by task, Work, global or role scope. Pending suggestions are excluded from recall.";
 "Choose the scope where this memory should apply. Global memories follow you across Works and Tasks." = "Choose the scope where this memory should apply. Global memories follow you across Works and Tasks.";
 "Owner" = "Owner";
 "Keep Memory" = "Keep Memory";
@@ -984,7 +987,7 @@
 "The migration failed before activation." = "The migration failed before activation.";
 "The Data Root setting was restored to the original directory. No new root was activated." = "The Data Root setting was restored to the original directory. No new root was activated.";
 "Active Session turns" = "Active Session turns";
-"Agent work queue" = "Agent work queue";
+"Role work queue" = "Role work queue";
 "Scheduled tasks" = "Scheduled tasks";
 "Worktree integrations" = "Worktree integrations";
 "Artifact writes" = "Artifact writes";
@@ -1019,13 +1022,13 @@
 "引用内容" = "References";
 "已安装 Skill" = "Installed Skills";
 "添加 Skill" = "Add Skill";
-"这些 Skill 已加入该 Agent 的查询范围，并会在需要时按需加载。" = "These Skills are available to this Agent and load on demand when needed.";
-"尚未给此 Agent 安装 Skill。" = "No Skills are installed for this Agent.";
-"从 Agent 移除 %@" = "Remove %@ from Agent";
+"这些 Skill 已加入该角色的查询范围，并会在需要时按需加载。" = "These Skills are available to this Role and load on demand when needed.";
+"尚未给此角色安装 Skill。" = "No Skills are installed for this Role.";
+"从角色移除 %@" = "Remove %@ from Role";
 "选择 Skill" = "Choose Skills";
-"选择系统中已有的 Skill；确认后会更新 Agent Profile 中的已安装列表。" = "Choose from the Skills already registered in the system. Confirm to update the installed list in the Agent Profile.";
+"选择系统中已有的 Skill；确认后会更新角色 Profile 中的已安装列表。" = "Choose from the Skills already registered in the system. Confirm to update the installed list in the Role Profile.";
 "搜索 Skill" = "Search Skills";
-"请先在 Agent 页面登记 Skill。" = "Register a Skill on the Agents page first.";
+"请先在角色页面登记 Skill。" = "Register a Skill on the Roles page first.";
 "已选择 %d 个 Skill" = "%d Skills selected";
 "Skill 选择尚未更改" = "The Skill selection has not changed";
 "确认 Skill 选择" = "Confirm Skill selection";
@@ -1199,7 +1202,7 @@
 "The integration state changed. Generate a new merge plan." = "The integration state changed. Generate a new merge plan.";
 "Choose an action for every blocked Markdown file, then continue." = "Choose an action for every blocked Markdown file, then continue.";
 "Repository state changed. Generate and review a fresh integration plan." = "Repository state changed. Generate and review a fresh integration plan.";
-"Resolve the preserved conflict with an Agent or manually, then retry." = "Resolve the preserved conflict with an Agent or manually, then retry.";
+"Resolve the preserved conflict with a Role or manually, then retry." = "Resolve the preserved conflict with a Role or manually, then retry.";
 "The operation is paused and can be retried from its preserved state." = "The operation is paused and can be retried from its preserved state.";
 
 "Basic Operation Notifications" = "Basic Operation Notifications";
@@ -1317,13 +1320,13 @@
 "正在提交…" = "Submitting…";
 "首次与此会话建立通道，或原通道已撤销。授权仅适用于这两个 Session。" = "This is the first Channel to this Session, or the previous Channel was revoked. Authorization applies only to these two Sessions.";
 
-"本机 Agent" = "Local Agents";
+"本机执行引擎" = "Local Execution Engines";
 "欢迎开始" = "Welcome";
-"让你的 Agent 准备就绪" = "Get your Agent ready";
-"连接本机的 Agent，开始在 Corptie 中工作。完成一个配置即可开始，其他配置可以稍后添加。" = "Connect a local Agent to start working in Corptie. Set up one to begin; you can add others later.";
+"让你的执行引擎准备就绪" = "Get your Execution Engine ready";
+"连接本机的执行引擎，开始在 Corptie 中工作。完成一个配置即可开始，其他配置可以稍后添加。" = "Connect a local Execution Engine to start working in Corptie. Set up one to begin; you can add others later.";
 "完成配置后，Corptie 助理会陪你开始使用。" = "Once setup is complete, your Corptie assistant will help you get started.";
-"Agent 已准备就绪" = "Your Agent is ready";
-"至少完成一个 Agent 配置才能继续" = "Set up at least one Agent to continue";
+"执行引擎已准备就绪" = "Your Execution Engine is ready";
+"至少完成一个执行引擎配置才能继续" = "Set up at least one Execution Engine to continue";
 "正在准备助理…" = "Preparing your assistant…";
 "进入 Corptie" = "Open Corptie";
 "正在保存…" = "Saving…";
@@ -1335,7 +1338,7 @@
 "已通过实际回复检测" = "Verified with an actual reply";
 "更改配置…" = "Configure…";
 "程序路径" = "Program path";
-"未找到程序，请选择已安装的 Agent 可执行文件。" = "Program not found. Select the executable for an installed Agent.";
+"未找到程序，请选择已安装的执行引擎可执行文件。" = "Program not found. Select the executable for an installed Execution Engine.";
 "启用 %@" = "Enable %@";
 
 "正在准备本地数据…" = "Preparing local data…";
@@ -1386,7 +1389,7 @@
 "登录未完成，请重试。" = "Sign-in did not complete. Please try again.";
 "登录超时，请重试。" = "Sign-in timed out. Please try again.";
 "无法启动 Codex 登录，请在 Codex 中登录后重新检测。" = "Could not start Codex sign-in. Sign in with Codex and check again.";
-"Agent 运行环境" = "Agent runtime environments";
+"执行引擎运行环境" = "Execution Engine runtime environments";
 "正在加载运行环境…" = "Loading runtime environments…";
 "检测" = "Check";
 "重新检测" = "Check again";
@@ -1624,3 +1627,490 @@
 /* 创建入口术语 */
 "New Agent Conversation" = "New Agent Conversation";
 "Create Session in %@" = "Create Session in %@";
+/* Management and composer presentation. */
+"All Automations" = "All Automations";
+"Automations" = "Automations";
+"History" = "History";
+"No Automations" = "No Automations";
+"No matching Automations" = "No matching Automations";
+"Tasks in this category will appear here." = "Tasks in this category will appear here.";
+"Create an Automation from a Session’s message composer." = "Create an Automation from a Session’s message composer.";
+"View scheduled and event-driven tasks and their run history." = "View scheduled and event-driven tasks and their run history.";
+"After %lld seconds" = "After %lld seconds";
+"Every %lld seconds" = "Every %lld seconds";
+"After a delay" = "After a delay";
+"One time" = "One time";
+"Interval" = "Interval";
+"Process exit" = "Process exit";
+"Condition" = "Condition";
+"Claimed" = "Claimed";
+"Queued" = "Queued";
+"Running" = "Running";
+"Failed" = "Failed";
+"Cancelled" = "Cancelled";
+"Skipped" = "Skipped";
+"Edit" = "Edit";
+"Last Result" = "Last Result";
+"Not run" = "Not run";
+"Risk" = "Risk";
+"Run History (%lld)" = "Run History (%lld)";
+"Run Now" = "Run Now";
+"The target Logical Session is unavailable." = "The target Logical Session is unavailable.";
+"Local-only actions; remote writes and destructive operations are disabled." = "Local-only actions; remote writes and destructive operations are disabled.";
+"Used when reviewing files changed during a session." = "Used when reviewing files changed during a session.";
+"Send an instruction" = "Send an instruction";
+"Missed" = "Missed";
+"Waiting to retry" = "Waiting to retry";
+
+"性能" = "Performance";
+
+"加速会话切换" = "Accelerate session switching";
+
+"保留最近访问的会话页面，减少重复排版和输入区重建。最多保留 8 个页面，会增加内存占用。更改后重新启动 App 生效。" = "Keep recently visited session pages to reduce repeated layout and editor rebuilding. Retains up to 8 pages and uses more memory. Restart the app to apply changes.";
+
+"需要重新启动 App 才能应用此更改。" = "Restart the app to apply this change.";
+"无代码改动" = "No code changes";
+"仅提交历史变化" = "Commit history changes only";
+"存在代码改动" = "Code changes available";
+"工作区状态需要检查" = "Check workspace state";
+"子任务无代码交付，无需额外集成验收" = "No child code delivery; no extra integration approval needed";
+"已人工验收" = "Approved by you";
+"版本已变化，需要重新验收" = "Version changed; approval required again";
+"请先处理工作区状态" = "Resolve the workspace state first";
+"无需集成验收" = "Integration approval not required";
+"等待父任务验收" = "Waiting for parent task approval";
+"人工确认不代表自动化测试已通过。" = "Manual approval does not mean automated tests passed.";
+"子分支尚未全部合入，请先合并子任务改动。" = "Merge the remaining child changes first.";
+"可在此人工确认，或前往父会话执行验证。" = "Approve here, or open the parent conversation to verify.";
+"代码或验收范围已更新，原验收不再适用。" = "The code or review scope changed; the previous approval is stale.";
+"当前有其他操作正在进行，请稍后刷新。" = "Another operation is running. Refresh shortly.";
+"工作区存在未提交改动、绑定异常或状态变化，请检查后刷新。" = "Check uncommitted changes, workspace bindings and current state, then refresh.";
+"前往父会话验证" = "Open parent conversation";
+"人工验收通过" = "Approve manually";
+"合并到主分支" = "Merge into main";
+"继续合并到主分支" = "Continue merge into main";
+"人工验收当前版本" = "Approve the current version";
+"当前版本" = "Current version";
+"本次操作记录你的人工确认，不代表自动化测试已通过，也不会自动合并主分支。" = "This records your manual approval. It does not mark automated tests as passed or merge into main.";
+"我已知晓当前存在未通过的自动验证结果，仍确认人工验收通过。" = "I acknowledge the failed automated verification and still approve this version manually.";
+"确认通过" = "Confirm approval";
+"无法读取验收状态，请刷新重试。" = "Could not read approval status. Refresh to retry.";
+"先合并到父分支" = "Merge into parent first";
+"子任务未删除。可在 Worktree 管理中将分支 %@ 合并到父分支，或重新选择强制删除。" = "Child task was not deleted. Merge branch %@ into its parent in Worktree management, or choose force delete.";
+"可先将子分支合并到父分支，或重新选择强制删除。" = "Merge the child branch into its parent first, or choose force delete.";
+"仅删除此子任务及所选资源；不影响父任务、兄弟任务或已合入父分支的代码。" = "Deletes only this child task and selected resources. Parent and sibling tasks, and code already merged into the parent, are unaffected.";
+"无法准备当前验收版本，请刷新后重试。" = "Could not prepare this version for approval. Refresh to retry.";
+"无法确认验收，版本可能已变化或确认已过期。请关闭窗口并刷新后重试。" = "Could not confirm approval. The version may have changed or the confirmation expired. Close and refresh to retry.";
+
+"收到" = "Received";
+
+"发出" = "Sent";
+
+"未关联 Work" = "No associated Work";
+
+"来源会话信息不可用" = "Source session information unavailable";
+
+"目标会话信息不可用" = "Target session information unavailable";
+
+"部分协作来源或目标信息不可用。" = "Some collaboration source or destination information is unavailable.";
+"协调模式" = "Coordination mode";
+"自动派发给子任务，当前会话继续讨论；关闭后已派发任务仍会执行并回报。" = "Delegate execution to child tasks while this conversation stays available. Disabling this mode does not cancel accepted tasks or their reports.";
+
+"Scenes" = "Scenes";
+
+"No Scenes" = "No scenes yet";
+
+"Create Scene" = "Create Scene";
+
+"Select a Scene" = "Select a Scene";
+
+"Scene Error" = "Scene Error";
+
+"使用场景整理每日清单或记录数据。选择一个模板即可开始。" = "Organize daily checklists or track measurements. Choose a template to get started.";
+
+"Close details" = "Close details";
+
+"Context used" = "Context used";
+
+"Quota remaining" = "Quota remaining";
+
+"Provider" = "Provider";
+
+"Platform managed" = "Platform assistant";
+
+"Available for chat and tasks" = "Available for chat and tasks";
+
+"Search memories" = "Search memories";
+
+"All kinds" = "All kinds";
+
+"All statuses" = "All statuses";
+
+"显示已停用" = "Include disabled";
+
+"来源与技术详情" = "Sources and technical details";
+
+"当前任务" = "Current Automations";
+
+"搜索自动化名称、消息或会话" = "Search automations, messages or sessions";
+
+"视图" = "View";
+
+"列表" = "List";
+
+"卡片" = "Cards";
+
+"创建自动化" = "Create Automation";
+
+"查看执行历史" = "View History";
+
+"选择承载自动化的会话" = "Choose a Session";
+
+"在会话输入区的更多菜单中创建定时或条件触发任务。结果会保留在对应会话中。" = "Create scheduled or conditional tasks from the Session composer menu. Results stay in that Session.";
+
+"前往工作台选择会话" = "Choose a Session in Workbench";
+
+"下次执行" = "Next run";
+
+"最近执行" = "Last run";
+
+"显示导航文字" = "Show navigation labels";
+
+"展开左侧导航名称，也可右键导航栏切换。" = "Show navigation names. You can also change this from the rail context menu.";
+
+"创建并启动" = "Create and Start";
+
+"正在创建…" = "Creating…";
+
+"执行配置与更多选项" = "Execution and advanced options";
+
+"执行配置" = "Execution";
+
+"默认模型" = "Default model";
+
+"加载中…" = "Loading…";
+
+"当前 Work 没有可用角色，请先在 Work 详情中添加角色。" = "No roles are available in this Work. Add a role in Work details.";
+
+"执行配置尚未就绪，请检查后重试。" = "Execution settings are not ready. Check the settings and try again.";
+
+"展开查看失败原因与诊断" = "Expand for failure details";
+
+"刷新状态" = "Refresh Status";
+
+"技术详情" = "Technical details";
+
+"读取或操作未完成。刷新只检查当前状态，不会重复执行合并、推送或删除。" = "The request did not complete. Refresh checks the current state without repeating a merge, push or delete.";
+
+"本地服务暂时无法完成请求（HTTP %lld）。请刷新状态后再检查。" = "The local service could not complete the request (HTTP %lld). Refresh the current state before continuing.";
+
+"最近保存" = "Last saved";
+
+"Database, configuration, logs, Artifacts, Provider runtimes, Skills, cache, state, and backups are migrated and verified before a controlled Backend restart. The old Data Root is retained and is never deleted automatically." = "Data, settings and backups are verified before the local service restarts. The original directory is retained.";
+
+"技能" = "Skill";
+
+"操作方法" = "Procedure";
+
+"开发经验" = "Development experience";
+
+"事实" = "Fact";
+
+"经验教训" = "Lesson";
+
+"偏好" = "Preference";
+
+"反馈" = "Feedback";
+
+"经历" = "Experience";
+
+"已生效" = "Active";
+
+"待审核" = "Pending review";
+
+"已替换" = "Replaced";
+
+"已转为技能" = "Promoted to skill";
+
+"已归档" = "Archived";
+
+"已回退" = "Rolled back";
+
+"未生效" = "Inactive";
+
+"待审核 · 尚未生效" = "Pending review · inactive";
+
+"source" = "Source";
+
+"trust" = "Trust";
+
+"confidence" = "Confidence";
+
+"usage" = "Usage";
+
+"updated" = "Updated";
+
+"promoted" = "Skill";
+
+"impact" = "Scope";
+
+"New Task" = "New Task";
+
+"New Assistant Session" = "New Chat";
+
+"无可用执行引擎，请检查设置" = "No execution engine available. Check Settings.";
+
+"展开全文" = "Show full text";
+
+"收起全文" = "Collapse text";
+
+"场景暂时无法加载" = "Scenes could not be loaded";
+
+"New Chat" = "New chat";
+
+"Projects" = "Projects";
+
+"更多选项" = "More options";
+
+"会话状态与用量" = "Session status and usage";
+
+"显示快捷指令" = "Show quick messages";
+
+"Create Task, Work, or chat" = "Create Task, Work, or chat";
+
+"Create" = "Create";
+
+"Overview" = "Overview";
+"Changes" = "Changes";
+"Execution Record" = "Execution Record";
+"Needs Attention" = "Needs Attention";
+"Has Changes" = "Has Changes";
+"Use the parent-child integration actions for this Worktree." = "Use the parent-child integration actions for this Worktree.";
+"This Worktree is unavailable." = "This Worktree is unavailable.";
+"This Worktree has no named branch." = "This Worktree has no named branch.";
+"A Git operation is in progress." = "A Git operation is in progress.";
+"Resolve conflicts before selecting this Worktree." = "Resolve conflicts before selecting this Worktree.";
+"Unable to confirm local changes. Refresh or inspect the local directory." = "Unable to confirm local changes. Refresh or inspect the local directory.";
+"%d uncommitted files" = "%d uncommitted files";
+"Changes detected; the file list was not provided." = "Changes detected; the file list was not provided.";
+"Conflicts" = "Conflicts";
+"Conflicting Files" = "Conflicting Files";
+"The latest integration job for this repository, not a complete operation history." = "The latest integration job for this repository, not a complete operation history.";
+"Created: %@" = "Created: %@";
+"Updated: %@" = "Updated: %@";
+"Confirmed: %@" = "Confirmed: %@";
+"Completed: %@" = "Completed: %@";
+"This Worktree did not participate in this job." = "This Worktree did not participate in this job.";
+"Current Worktree and job-level events only" = "Current Worktree and job-level events only";
+"This job did not provide event records." = "This job did not provide event records.";
+"The Worktree directory and its local branch will be permanently removed. This action cannot be undone here." = "The Worktree directory and its local branch will be permanently removed. This action cannot be undone here.";
+"Backend offline. Previously loaded data may be out of date." = "Backend offline. Previously loaded data may be out of date.";
+"Repositories" = "Repositories";
+"Back to Worktrees" = "Back to Worktrees";
+"Search repositories" = "Search repositories";
+"Loading repositories…" = "Loading repositories…";
+"Could Not Load Repositories" = "Could Not Load Repositories";
+"No Matching Repositories" = "No Matching Repositories";
+"Clear Search" = "Clear Search";
+"Search Worktrees" = "Search Worktrees";
+"No Matching Worktrees" = "No Matching Worktrees";
+"Clear Filters" = "Clear Filters";
+"Selection" = "Selection";
+"Select Available Results" = "Select Available Results";
+"Clear Selection" = "Clear Selection";
+"%d selected Worktrees are outside these results." = "%d selected Worktrees are outside these results.";
+"%d unavailable selections were removed. Review the selection before continuing." = "%d unavailable selections were removed. Review the selection before continuing.";
+"Current Worktree is outside the results. Clear filters" = "Current Worktree is outside the results. Clear filters";
+"Worktree details" = "Worktree details";
+"No Recent Integration Record" = "No Recent Integration Record";
+"Repository Development Service" = "Repository Development Service";
+"Hide Worktrees" = "Hide Worktrees";
+"Hide Repositories" = "Hide Repositories";
+// Role registry management
+"Search roles" = "Search roles";
+"Search role names, descriptions or specialties" = "Search role names, descriptions or specialties";
+"Loading roles" = "Loading roles";
+"%d of %d roles" = "%d of %d roles";
+"No roles yet" = "No roles yet";
+"Create a reusable role for conversations and tasks." = "Create a reusable role for conversations and tasks.";
+"No matching roles" = "No matching roles";
+"Manage" = "Manage";
+"Manage MCP" = "Manage MCP";
+"New role" = "New role";
+"Manage independent MCP Servers and role assignments" = "Manage independent MCP Servers and role assignments";
+"Expanded" = "Expanded";
+"Collapsed" = "Collapsed";
+"Register Skill" = "Register Skill";
+"Close Skills" = "Close Skills";
+"Shared registry. Assign registered skills in role details." = "Shared registry. Assign registered skills in role details.";
+"Search Skills" = "Search Skills";
+"Loading Skills" = "Loading Skills";
+"Register a Skill from a local directory or Git repository." = "Register a Skill from a local directory or Git repository.";
+"No matching Skills" = "No matching Skills";
+"Registry unavailable. Displayed data may be out of date." = "Registry unavailable. Displayed data may be out of date.";
+"Retry" = "Retry";
+"Unable to load registry" = "Unable to load registry";
+"Try another search or clear the current query." = "Try another search or clear the current query.";
+"Clear search" = "Clear search";
+"Checking deletion impact" = "Checking deletion impact";
+"Copy source" = "Copy source";
+"Actions for %@" = "Actions for %@";
+"Open details for %@" = "Open details for %@";
+"Independent MCP Servers" = "Independent MCP Servers";
+"Add MCP" = "Add MCP";
+"Close" = "Close";
+"Check Session tools" = "Check Session tools";
+"Error: %@" = "Error: %@";
+"Loading MCP Servers" = "Loading MCP Servers";
+"No MCP Servers" = "No MCP Servers";
+"Register a Server, then assign it to a role." = "Register a Server, then assign it to a role.";
+"Assign to role" = "Assign to role";
+"Choose a role" = "Choose a role";
+"Session name or logical ID" = "Session name or logical ID";
+"Role no longer exists" = "Role no longer exists";
+"The registry was updated. Return to choose another role." = "The registry was updated. Return to choose another role.";
+"View processing activity" = "View processing activity";
+"Preferences" = "Preferences";
+"Connections" = "Connections";
+"Management" = "Management";
+"Category" = "Category";
+"Changes on this page take effect immediately." = "Changes on this page take effect immediately.";
+"Actions on this page are applied immediately." = "Actions on this page are applied immediately.";
+"Save applies pending general, session defaults, proxy and trusted workspace settings. Other actions are saved separately." = "Save applies pending general, session defaults, proxy and trusted workspace settings. Other actions are saved separately.";
+"Discard unsaved settings?" = "Discard unsaved settings?";
+"Discard Changes" = "Discard Changes";
+"Only pending shared settings will be discarded. Immediate changes and separately saved regions are kept." = "Only pending shared settings will be discarded. Immediate changes and separately saved regions are kept.";
+"Unable to load settings." = "Unable to load settings.";
+"Loading settings…" = "Loading settings…";
+"%lld categories have unsaved changes" = "%lld categories have unsaved changes";
+"Settings saved" = "Settings saved";
+"No unsaved changes" = "No unsaved changes";
+"Background model has changes to save separately" = "Background model has changes to save separately";
+"Bot credentials have not been added" = "Bot credentials have not been added";
+"Saving…" = "Saving…";
+"Save Settings" = "Save Settings";
+"Read-only preview. Shared settings cannot be saved." = "Read-only preview. Shared settings cannot be saved.";
+"Settings changed elsewhere. Your edits are kept. Discard shared changes to load the latest values before saving." = "Settings changed elsewhere. Your edits are kept. Discard shared changes to load the latest values before saving.";
+"Settings were not fully saved." = "Settings were not fully saved.";
+"Conflict" = "Conflict";
+"Unsaved changes" = "Unsaved changes";
+"Saved locally; restart the app to apply." = "Saved locally; restart the app to apply.";
+"Requires Save Settings" = "Requires Save Settings";
+"Takes effect immediately" = "Takes effect immediately";
+"Navigation and appearance" = "Navigation and appearance";
+"Session defaults use Save Settings below. Background models are saved separately." = "Session defaults use Save Settings below. Background models are saved separately.";
+"Other pending shared settings are submitted with this migration. Separately saved regions are not included." = "Other pending shared settings are submitted with this migration. Separately saved regions are not included.";
+"Choose a Provider." = "Choose a Provider.";
+"API model is required." = "API model is required.";
+"Use HTTPS without credentials or query parameters. HTTP is allowed only for localhost." = "Use HTTPS without credentials or query parameters. HTTP is allowed only for localhost.";
+"Save Background Model" = "Save Background Model";
+"Discard Model Changes" = "Discard Model Changes";
+"Saved separately; not included in Save Settings." = "Saved separately; not included in Save Settings.";
+"Changing the API address clears the saved key unless you enter a replacement." = "Changing the API address clears the saved key unless you enter a replacement.";
+
+"Language and tools" = "Language and tools";
+"Language changes immediately; code diff requires Save Settings." = "Language changes immediately; code diff requires Save Settings.";
+"复制完整诊断" = "Copy Full Diagnostics";
+
+"完整错误详情" = "Full Error Details";
+
+"目标代码已合并到主分支。" = "The target code has been merged into the main branch.";
+
+"任务状态已变化，请刷新并使用当前可用操作。" = "The task state changed. Refresh and use the currently available action.";
+
+"已展开" = "Expanded";
+
+"已折叠" = "Collapsed";
+
+"关闭窗口" = "Close Window";
+"最小化窗口" = "Minimize Window";
+"全屏与窗口布局" = "Full Screen and Window Layout";
+"移动与调整大小" = "Move and Resize";
+"左半屏" = "Left Half";
+"右半屏" = "Right Half";
+"上半屏" = "Top Half";
+"下半屏" = "Bottom Half";
+"左上角" = "Top Left";
+"右上角" = "Top Right";
+"左下角" = "Bottom Left";
+"右下角" = "Bottom Right";
+"填满窗口" = "Fill";
+"还原大小" = "Restore Size";
+"全屏幕" = "Full Screen";
+"移到其他屏幕" = "Move to Another Display";
+
+"正在处理另一个 Worktree 操作，请稍后重试。" = "Another Worktree operation is in progress. Try again shortly.";
+
+"合并已完成，无需取消。" = "The merge has already completed; no cancellation is needed.";
+
+"合并已取消。" = "The merge has already been canceled.";
+
+/* Execution engine runtime and credential sources */
+"独立运行目录" = "Isolated runtime directory";
+"由 Corptie 自动创建，用于保存此引擎的独立配置、运行数据和集成资源。" = "Created by Corptie for this engine’s isolated configuration, runtime data, and integrations.";
+"在 Finder 中显示" = "Show in Finder";
+"官方登录凭证来源" = "Official credential source";
+"来源类型" = "Source type";
+"凭证来源的绝对路径" = "Absolute path to the credential source";
+"凭证来源路径" = "Credential source path";
+"选择来源…" = "Choose source…";
+"发现的候选来源" = "Discovered sources";
+"本地可读取" = "Readable locally";
+"未找到或不可读取" = "Missing or unreadable";
+"应用凭证来源" = "Apply credential source";
+"重新检查本地状态" = "Recheck local status";
+"请在官方 CLI 或 App 中登录、退出或切换账号。Corptie 不提供登录流程；应用来源仅做本地检查，不会发送模型请求。" = "Sign in, sign out, or switch accounts in the official CLI or app. Corptie does not provide a sign-in flow. Applying a source only checks local data and sends no model requests.";
+"应用来源将确认使用其中的当前账号，并影响此引擎后续的新请求；不会中断正在执行的请求。" = "Applying confirms the account in this source for future requests with this engine. Running requests are not interrupted.";
+"后续请求前会将所选来源的凭证同步到以下本地文件，不会写回来源。来源丢失时会停止使用，不会自动切换账号。" = "Before future requests, credentials from the selected source are synchronized to the local file below. The source is never modified. A missing source blocks requests without switching accounts.";
+"此适配器当前支持凭证目录和文件，不支持直接读取系统钥匙串。" = "This adapter supports credential directories and files, but cannot read the system keychain directly.";
+"请选择官方登录环境目录。读取其系统钥匙串凭证时，macOS 可能请求授权。" = "Choose the official login environment directory. macOS may ask for permission to read its keychain credentials.";
+"凭证文件" = "Credential file";
+"官方环境的钥匙串凭证" = "Official environment’s keychain";
+"官方配置目录" = "Official configuration directory";
+"采用程序" = "Adopt executable";
+"配置已更改 · 待检测" = "Configuration changed · Not tested";
+"已启用 · 待检测" = "Enabled · Not tested";
+"未启用 · 待检测" = "Disabled · Not tested";
+"请在官方工具中登录" = "Sign in with the official tool";
+"连接检测失败" = "Connection test failed";
+"已关闭" = "Disabled";
+"当前默认执行引擎已关闭；请启用或手动更改默认设置，不会自动改用其他引擎。" = "The default engine is disabled. Enable it or change the default manually; Corptie will not switch engines automatically.";
+"所选执行引擎已关闭，请先在设置中启用或手动选择其他引擎。" = "The selected engine is disabled. Enable it in Settings or choose another engine manually.";
+"检测会发送最小测试请求，可能消耗额度；不会读取项目或聊天记录，也不会加入聊天历史。" = "Testing sends a minimal model request and may consume quota. It does not read project files or conversations and is not added to chat history.";
+"最近检测：%@" = "Last tested: %@";
+"请选择官方工具已有的登录凭证来源。" = "Choose an existing credential source from the official tool.";
+"未找到登录凭证，请先在官方 CLI 或 App 中登录。" = "No credentials found. Sign in with the official CLI or app first.";
+"已找到凭证；有效性需通过连接检测确认。" = "Credentials found. A connection test is needed to verify validity.";
+"无法读取所选凭证，请检查路径、权限及文件格式。不会改用其他来源。" = "Cannot read the selected credentials. Check the path, permissions, and format. No other source will be used.";
+"沿用旧运行环境中的凭证，尚未指定官方来源；请选择后续同步的来源。" = "Existing runtime credentials are retained. Choose an official source for future synchronization.";
+"来源中的账号已变更，请重新应用凭证来源以确认。" = "The source account or credential contents have changed. Apply the source again to confirm.";
+"此适配器使用独立运行目录中的 Provider 配置，目前不支持单独选择登录凭证来源。请使用官方工具配置该环境。" = "This adapter uses the provider configuration in its isolated runtime. Selecting a separate credential source is not supported yet. Configure this environment using the official tool.";
+"支持 Codex 官方 auth.json 凭证，以及官方登录环境对应的系统钥匙串条目。" = "Supports official Codex auth.json credentials and the keychain entry associated with an official login environment.";
+"支持 Claude Code 官方 OAuth .credentials.json 文件。此处不支持以 API 密钥环境变量作为凭证来源。" = "Supports official Claude Code OAuth .credentials.json files. API key environment variables are not supported as selectable credential sources here.";
+"来源中的账号或凭证内容已变更，请重新应用来源以确认。" = "The account or credential contents in the source have changed. Apply the source again to confirm.";
+"执行程序、凭证来源和启用状态将在点击页面底部“保存设置”后一起生效；检测连接使用已保存的配置。" = "Executable, credential source, and enable state take effect together when you click Save Settings below. Connection tests use saved settings.";
+"执行程序、凭证来源和启用状态统一通过页面底部“保存设置”提交。" = "Save executable, credential source, and enable state together with Save Settings below.";
+"有未保存的修改" = "Unsaved changes";
+"执行引擎设置已在其他位置更改，请重新加载或放弃本地修改。" = "Engine settings changed elsewhere. Reload or discard local changes.";
+"来源中的账号或凭证内容已变更，请点击“保存设置”确认。" = "The account or credential contents have changed. Click Save Settings to confirm.";
+"请在官方 CLI 或 App 中登录、退出或切换账号。Corptie 不提供登录流程；保存来源仅做本地检查，不会发送模型请求。" = "Sign in, sign out, or switch accounts in the official CLI or app. Corptie does not provide a sign-in flow. Saving the source only checks local data and sends no model requests.";
+"保存来源将确认使用其中的当前账号，并影响此引擎后续的新请求；不会中断正在执行的请求。" = "Saving confirms this source’s current account for future requests with this engine. Running requests are not interrupted.";
+"Save applies pending general, execution engine, session defaults, proxy and trusted workspace settings. Other actions are saved separately." = "Save applies pending general, execution engine, session defaults, proxy and trusted workspace settings. Other actions are saved separately.";
+
+"Manage MCP assignments, tool permissions, and credentials for this role." = "Manage MCP assignments, tool permissions, and credentials for this role.";
+
+"Remove %@?" = "Remove %@?";
+
+"Unassign this MCP from the roles below before removing it. Their existing sessions will also lose access." = "Unassign this MCP from the roles below before removing it. Their existing sessions will also lose access.";
+
+"Unassign" = "Unassign";
+
+"Unassign %@ from %@" = "Unassign %@ from %@";
+
+"Remove the registration, %d managed package copies, and %d credential references. Original sources and external services are preserved." = "Remove the registration, %d managed package copies, and %d credential references. Original sources and external services are preserved.";
+
+"Updating MCP removal status" = "Updating MCP removal status";
+
+"Remove MCP" = "Remove MCP";
+
+"Create Agent Conversation or Work" = "Create Agent Conversation or Work";

@@ -6,6 +6,18 @@ import CorptieConversation
 /// The composer's geometry, key semantics and mention catalog are shared with the
 /// iPad; these pin the desktop values the shared layer must keep producing.
 final class ComposerShellPolicyTests: XCTestCase {
+    func testContinuousResizePublishesOnlyChangedModelWidthBudgets() {
+        let widths = (0..<180).map { ComposerModelWidthPolicy.maximumWidth(for: CGFloat(500 + $0)) }
+        let changes = zip(widths, widths.dropFirst()).filter { $0 != $1 }.count
+        XCTAssertLessThanOrEqual(changes, 8)
+        XCTAssertEqual(ComposerModelWidthPolicy.maximumWidth(for: 390), 176)
+        for width in 390...480 { XCTAssertEqual(ComposerModelWidthPolicy.maximumWidth(for: CGFloat(width)), 176) }
+        for width in 700...1_200 { XCTAssertEqual(ComposerModelWidthPolicy.maximumWidth(for: CGFloat(width)), 240) }
+        for width in 240...700 {
+            XCTAssertLessThanOrEqual(ComposerModelWidthPolicy.maximumWidth(for: CGFloat(width)), CGFloat(width) - 124)
+        }
+    }
+
     func testEmptyDraftRejectsStaleExpandedHeight() {
         XCTAssertEqual(ComposerInputLayout.resolvedHeight(text: "", measuredHeight: 96), 30)
         XCTAssertEqual(ComposerInputLayout.resolvedHeight(text: "", measuredHeight: 400), 30)
@@ -95,14 +107,14 @@ final class ComposerShellPolicyTests: XCTestCase {
         XCTAssertEqual(original.text, "A edited"); XCTAssertEqual(other.text, "B")
     }
 
-    func testStopAndSendShareVisualSizeButRetainTouchTarget() throws {
+    func testStopAndSendRetainTheirCurrentTouchTargets() throws {
         let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/CopetsMac")
         let stop = try String(contentsOf: sources.appendingPathComponent("SessionComposerStopButton.swift"), encoding: .utf8)
         let send = try String(contentsOf: sources.appendingPathComponent("Conversation/Composer/MessageComposer.swift"), encoding: .utf8)
-        XCTAssertTrue(stop.contains("ComposerShellMetrics.actionVisualEdge"))
-        XCTAssertTrue(send.contains("sendControlEdge = ComposerShellMetrics.actionVisualEdge"))
-        XCTAssertTrue(stop.contains("compact ? ComposerShellMetrics.actionHitEdge : 44"))
+        XCTAssertTrue(stop.contains("ComposerShellMetrics.actionHitEdge"))
+        XCTAssertTrue(send.contains(".frame(width: ComposerShellMetrics.actionHitEdge, height: ComposerShellMetrics.actionHitEdge)"))
+        XCTAssertFalse(stop.contains("compact ? ComposerShellMetrics.actionHitEdge : 44"))
         XCTAssertEqual(ComposerShellMetrics.actionVisualEdge, 22)
     }
 

@@ -179,7 +179,9 @@ private final class DetachedChatWindowController: NSObject, NSWindowDelegate {
             normalSize: Self.initialSize,
             minimumSize: panel.minSize
         )
-        panel.setFrame(frame, display: true, animate: true)
+        // A window frame is a layout input. Implicit frame animation rewrites
+        // it on every frame and re-lays out the hosted SwiftUI tree each time.
+        panel.setFrame(frame, display: true, animate: false)
         panel.saveFrame(usingName: DetachedChatWindowFrameStore.name(for: sessionID))
     }
 
@@ -481,10 +483,13 @@ private struct DetachedChatWindowTitle: View {
 
     var body: some View {
         VStack(spacing: 1) {
-            Text(session?.title ?? L10n("Chat"))
-                .font(.system(size: 11, weight: .semibold))
-                .lineLimit(1)
-                .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 4) {
+                Text(session?.title ?? L10n("Chat"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .accessibilityAddTraits(.isHeader)
+                if let session { SessionTitleBadges(session: session, size: 12) }
+            }
             if let work {
                 HStack(spacing: 4) {
                     ObjectiveAvatarView(objectiveID: work.id, name: work.name,

@@ -53,11 +53,20 @@ export function projectNativeBusinessDocument(scope, results, generation, { edit
   if (scope.session.sessionKind === "worker" && scope.task) {
     const task = scope.task, data = { taskId: task.id, title: task.title ?? "", status: task.lifecycle_state ?? "", description: task.description ?? "", acceptanceCriteria: task.acceptance_criteria ?? "", verificationCriteria: task.verification_criteria ?? "", resourceRevision: String(task.revision), summary: summary(task) };
     data.parentTaskId = task.parent_task_id ?? null;
+    data.coordinationEnabled = task.coordination_enabled === 1;
+    data.coordinationExecution = task.coordinationExecution ?? null;
+    data.coordinationDispatches = task.coordinationDispatches ?? [];
     data.parentSessionId = scope.parentSessionId ?? null;
     if (scope.taskHierarchy) data.hierarchy = scope.taskHierarchy;
     const actions = editors ? [nav("editor.open", "task", task.id, "编辑 Task", { expectedResourceRevision: data.resourceRevision })] : [];
+    // Keep legacy uncertain commands recoverable without blocking a new explicit
+    // user action after the desktop updateTask wiring was repaired.
+    if (editors) actions.push({ id: "task-coordination-setting", kind: "command", operation: "task.coordination.update",
+      label: { fallback: "协调模式" }, available: true, target: { resourceType: "task", id: task.id }, expectedResourceRevision: String(task.resource_version) });
     if (scope.parentSessionId) actions.push(nav("resource.open", "session", scope.parentSessionId, "打开父任务"));
     cards.push(card("task-information", "taskInfo", data, actions));
+    if(task.coordinationProgress) cards.push({id:"coordination-progress",kind:"coordinationProgress",version:1,
+      revision:String(task.coordinationProgress.revision),loadState:"ready",data:task.coordinationProgress,actions:[],nextCursor:null});
   }
   for (const name of eligibleNativeBusinessModules(scope)) {
     if (name === "worktree" && results[name]?.state !== "error" && results[name]?.data?.attached === false) continue;

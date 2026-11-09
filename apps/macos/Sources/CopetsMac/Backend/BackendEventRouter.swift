@@ -1,4 +1,5 @@
 import Foundation
+import CorptieClientCore
 import UserNotifications
 
 private struct AutomationClientActionEnvelope: Decodable {
@@ -43,45 +44,87 @@ final class BackendEventRouter {
         let sessionCleared: (SessionReplacement) -> Void
     }
 
+    private var recoveryGeneration = UUID()
+    private var recoveryTask: Task<Void, Never>?
+    private var pendingRecovery: Set<String> = []
     private let ports: Ports
     init(ports: Ports) { self.ports = ports }
 
+    func stop() {
+        recoveryGeneration = UUID()
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        pendingRecovery.removeAll()
+    }
+
+    private func scheduleRecovery(_ event: String) {
+        pendingRecovery.insert(event)
+        guard recoveryTask == nil else { return }
+        let generation = recoveryGeneration
+        recoveryTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.recoveryGeneration == generation { self.recoveryTask = nil } }
+            while !Task.isCancelled, self.recoveryGeneration == generation, !self.pendingRecovery.isEmpty {
+                let events = self.pendingRecovery
+                self.pendingRecovery.removeAll()
+                await AppStateSyncController.shared.refreshSnapshot()
+                guard !Task.isCancelled else { return }
+                await self.ports.reconcileTimelineRevisions()
+                if events.contains("BackendStoreReady") {
+                    await self.ports.loadSettings()
+                    await self.ports.syncNewSessionDefaults()
+                    await self.ports.loadProviders()
+                }
+                guard !Task.isCancelled else { return }
+                await self.ports.loadAutomations()
+                if let selected = self.ports.selectedSession() {
+                    await self.ports.loadScheduledTasks(selected)
+                    self.ports.scheduleTimelineSync(selected, selected.timelineRevision ?? 0)
+                }
+            }
+        }
+    }
+
     func handle(_ eventName: String, data: String) async {
+        if eventName == "SessionAbilitiesChanged", let bytes = data.data(using: .utf8),
+           let envelope = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+           let payload = envelope["payload"] as? [String: Any], let id = payload["sessionId"] as? String {
+            NotificationCenter.default.post(name: .sessionAbilitiesChanged, object: id)
+            return
+        }
+        if eventName == "TaskChanged", let bytes = data.data(using: .utf8),
+           let event = try? JSONDecoder().decode(ChecklistTaskChangedEnvelope.self, from: bytes) {
+            let taskID = event.payload.taskId ?? event.payload.entity?.id
+            if let taskID { NotificationCenter.default.post(name: .executionChecklistAssignmentChanged, object: taskID) }
+            if let parentID = event.payload.entity?.parentTaskId ?? event.payload.entity?.parent_task_id, parentID != taskID {
+                NotificationCenter.default.post(name: .executionChecklistAssignmentChanged, object: parentID)
+            }
+        }
+        if eventName == "ExecutionChecklistChanged" {
+            if let bytes = data.data(using: .utf8),
+               let event = try? JSONDecoder().decode(ExecutionChecklistChangedEnvelope.self, from: bytes) {
+                var info: [AnyHashable: Any] = [:]
+                if let plan = event.payload.checklist { info["checklist"] = plan }
+                NotificationCenter.default.post(name: .executionChecklistChanged, object: event.payload.taskId, userInfo: info)
+            }
+            return
+        }
         if eventName == "WorktreeIntegrationJobChanged" {
-            OperationNotificationManager.shared.observe(data: data)
+            if !(await WorktreeManagementClient.shared.receiveJobEvent(data)) {
+                OperationNotificationManager.shared.observe(data: data)
+            }
             return
         }
         if eventName == "EventReplayRequired" || eventName == "BackendStoreReady" {
             OperationNotificationManager.shared.recoverJobs()
+            Task { await WorktreeManagementClient.shared.recoverAfterEventGap() }
         }
         if eventName == "SessionChannelMessageSent", let bytes = data.data(using: .utf8),
            let envelope = try? JSONDecoder().decode(TaskCollaborationFlowEvent.Envelope.self, from: bytes) {
             ports.channelMessage(envelope)
         }
-        if eventName == "BackendStoreReady" {
-            // Startup requests are allowed to receive a retryable 503 while the
-            // migration Worker is running. Reissue their authoritative reads as
-            // soon as the Store crosses its independent readiness boundary.
-            await AppStateSyncController.shared.refreshSnapshot()
-            await ports.loadSettings()
-            await ports.syncNewSessionDefaults()
-            await ports.loadProviders()
-            await ports.reconcileTimelineRevisions()
-            await ports.loadAutomations()
-            if let selectedSession = ports.selectedSession() { await ports.loadScheduledTasks(selectedSession) }
-            return
-        }
-        if eventName == "EventReplayRequired" {
-            // The bounded wake-event buffer cannot cover this cursor. State and
-            // timelines have their own durable authorities, so repair those
-            // directly instead of replaying ambiguous side effects.
-            await AppStateSyncController.shared.refreshSnapshot()
-            await ports.reconcileTimelineRevisions()
-            await ports.loadAutomations()
-            if let selectedSession = ports.selectedSession() {
-                await ports.loadScheduledTasks(selectedSession)
-                ports.scheduleTimelineSync(selectedSession, selectedSession.timelineRevision ?? 0)
-            }
+        if eventName == "BackendStoreReady" || eventName == "EventReplayRequired" {
+            scheduleRecovery(eventName)
             return
         }
         if eventName == "SessionTimelineChanged" {
@@ -173,5 +216,23 @@ final class BackendEventRouter {
             }
             return
         }
+    }
+}
+
+private struct ExecutionChecklistChangedEnvelope: Decodable {
+    let payload: Payload
+    struct Payload: Decodable { let taskId: String; let checklist: ConversationExecutionPlan? }
+}
+
+private struct ChecklistTaskChangedEnvelope: Decodable {
+    let payload: Payload
+    struct Payload: Decodable {
+        let taskId: String?
+        let entity: Entity?
+    }
+    struct Entity: Decodable {
+        let id: String?
+        let parentTaskId: String?
+        let parent_task_id: String?
     }
 }

@@ -6,6 +6,7 @@ import { presentMemoryRecallAudit } from "./memoryRecallService.mjs";
 import { validateMemoryInput } from "./entityHttpApi.mjs";
 
 const ACTION_FIELDS = {
+  "abilities.update": ["expectedResourceVersion", "kind", "id", "disabled", "reset"],
   "reference.create": ["targetType", "targetId", "locator", "displayName"],
   "reference.update": ["id", "enabled", "locator"], "reference.delete": ["id"], "reference.refresh": ["id"],
   "reference.import": ["fileName", "dataBase64"], "artifact.import": ["fileName", "dataBase64", "title"],
@@ -24,7 +25,7 @@ const ACTION_FIELDS = {
   "memory.rollback": ["id", "auditId", "confirmed", "expectedVersion"],
   "memory.confirm": ["id", "content", "confirmed", "expectedVersion"],
   "memory.reject": ["id", "reason", "confirmed", "expectedVersion"],
-  "task.update": ["title", "description", "acceptanceCriteria", "verificationCriteria", "priority", "mainAgentId", "autoTitleEnabled"],
+  "task.update": ["title", "description", "acceptanceCriteria", "verificationCriteria", "priority", "mainAgentId", "autoTitleEnabled", "coordinationEnabled"],
   "task.reclaimWorktree": ["confirmed"],
   "worktree.autoFollow": ["enabled", "expectedWorktreeId", "expectedTargetWorktreeId", "expectedHierarchyRevision", "expectedBindingRevision"],
 };
@@ -65,7 +66,8 @@ export class ClientInspectorAPI {
         .map((audit) => presentMemoryRecallAudit(this.store, audit))),
       read("schedules", () => this.schedules.list({ logicalSessionId: scope.logicalSessionId, status: "active" }, pairedDeviceActor(identity))),
       read("turn", () => this.observability.latestSummary(scope.logicalSessionId ?? sessionId, { kind: "local_user" })),
-      read("providers", () => this.providers(sessionId))
+      read("providers", () => this.providers(sessionId)),
+      ...(this.abilities ? [read("abilities", () => this.abilities.inspect(scope.logicalSessionId ?? sessionId))] : [])
     ]);
     if (workId && !task) {
       const focus = this.store.listTasksByWork(workId).filter(row => !row.archived && !row.deletion_status && row.lifecycle_state !== "done")
@@ -83,6 +85,8 @@ export class ClientInspectorAPI {
         verificationCriteria: task.verification_criteria ?? "", summary: parseSummary(task.user_summary_json),
         title: task.title, revision: task.revision, priority: task.priority, mainAgentId: task.main_agent_id, lifecycleState: task.lifecycle_state,
         autoTitleEnabled: task.auto_title_enabled !== 0,
+        coordinationEnabled: task.coordination_enabled === 1,
+        coordinationDispatches: this.store.listTaskCoordinationDispatches?.(task.id) ?? [],
         parentTaskId: task.parent_task_id ?? null,
         hierarchy: this.store.hierarchySummaries?.([task.id]).get(task.id) ?? null,
         agents: (this.store.getWork(workId)?.contributorAgentIds ?? []).map(id => {
@@ -117,6 +121,7 @@ export class ClientInspectorAPI {
   }
   async read(identity, sessionId, resource, input = {}) {
     const scope = this.scope(sessionId, identity);
+    if (resource === "abilities" && this.abilities) return this.abilities.inspect(scope.logicalSessionId ?? scope.sessionId);
     if (resource === "session-worktree") {
       if (!this.readSessionWorktree) throw deviceError("ROUTE_NOT_AVAILABLE", 404);
       // Parameters cannot select an unrelated repository or Worktree.
@@ -187,6 +192,12 @@ export class ClientInspectorAPI {
   async perform(scope, action, fields, fingerprint) {
     const { sessionId, context, task } = scope;
     switch (action) {
+      case "abilities.update": {
+        if (!this.abilities) throw deviceError("CAPABILITY_UNSUPPORTED", 409);
+        const receipt = this.abilities.update(scope.logicalSessionId ?? sessionId, { ...fields, requestId: fingerprint });
+        this.onAbilitiesChanged?.(scope, receipt);
+        return receipt;
+      }
       case "worktree.autoFollow": return this.setWorktreeAutoFollow(sessionId, fields);
       case "reference.import": case "artifact.import": return this.importFile(scope, action, fields);
       case "reference.create": return this.references.create(sessionId, fields.targetType === "session"

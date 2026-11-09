@@ -3,6 +3,26 @@ import Testing
 @testable import CorptieClientCore
 
 struct SessionAPITests {
+    @Test func userMessageDirectoryUsesSharedCursorContractAndRejectsUnknownSchema() async throws {
+        for version in [1, 2] {
+            let endpoint = try BackendEndpoint(URL(string: "http://127.0.0.1:1234")!)
+            let transport = BackendTransport(endpoint: endpoint, data: { request in
+                #expect(request.url?.path == "/client/v1/sessions/session:test/user-message-navigation")
+                let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems
+                #expect(query?.first(where: { $0.name == "cursor" })?.value == "cursor+中文")
+                #expect(query?.first(where: { $0.name == "direction" })?.value == "newer")
+                let body = "{\"schemaVersion\":\(version),\"items\":[],\"olderCursor\":\"older\",\"newerCursor\":null,\"scannedCount\":1024}"
+                return (Data(body.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }, bytes: { _ in throw ClientConnectionError.invalidResponse })
+            do {
+                let page = try await ClientSessionAPI(transport: transport).userMessageNavigation(
+                    sessionId: "session:test", cursor: "cursor+中文", direction: "newer")
+                #expect(version == 1)
+                #expect(page.items.isEmpty && page.olderCursor == "older")
+            } catch { #expect(version == 2) }
+        }
+    }
+
     @Test func messageAPIReadsSupportedWindowVersionsAndRejectsUnknownVersions() async throws {
         for version in [1, 2, 3] {
             let endpoint = try BackendEndpoint(URL(string: "http://127.0.0.1:1234")!)
@@ -67,9 +87,9 @@ struct SessionAPITests {
         let transport = try BackendTransport(endpoint: BackendEndpoint(URL(string: "https://unit-test.invalid")!),
             bearerToken: "test-only", configuration: config)
         let api = ClientSessionAPI(transport: transport)
-        #expect(try await api.workCreationOptions().agents.map(\.id) == ["agent:test"])
+        #expect(try await api.workCreationOptions().roles.map(\.id) == ["agent:test"])
         let receipt = try await api.createWork(ClientWorkCreation(requestId: "work_create1", name: "NewWork",
-            description: "Scope", contributorAgentIds: ["agent:test"]))
+            description: "Scope", contributorRoleIds: ["agent:test"]))
         #expect(receipt.kind == "work_create")
         #expect(receipt.entityResult?.workId == "work:new")
     }
@@ -80,7 +100,7 @@ struct SessionAPITests {
             bearerToken: "test-only", configuration: config)
         let api = ClientSessionAPI(transport: transport)
         let input = ClientTaskCreation(requestId: "create_123", workId: "work:test", title: "Task",
-            mainAgentId: "agent:test", providerId: "provider:test")
+            mainRoleId: "agent:test", providerId: "provider:test")
         let receipt = try await api.createTask(sourceSessionId: "session:test", input: input)
         #expect(receipt.kind == "create_task")
         #expect(receipt.taskResult?.taskId == "task:new")
@@ -104,7 +124,7 @@ struct SessionAPITests {
         #expect(management.task.archived == false)
         #expect(management.actions.restart == ClientEntityAction(available: false, reason: "PROVIDER_INITIALIZING"))
         #expect(management.actions.delete.available)
-        #expect(management.agents.map(\.id) == ["agent:test"])
+        #expect(management.roles.map(\.id) == ["agent:test"])
         let plan = try await api.taskDeletionPlan(taskId: "task:one")
         #expect(plan.status == "risky")
         #expect(plan.worktree?.branchName == "task/abc")
@@ -121,7 +141,7 @@ struct SessionAPITests {
         #expect(renamed.entityResult?.title == "Renamed")
         #expect(renamed.taskResult == nil && renamed.commandResult == nil)
         var deletion = ClientTaskDeletion(requestId: "delete_12345")
-        deletion.mode = "force"; deletion.acknowledgeDataLoss = true; deletion.confirmedBranchName = "task/abc"
+        deletion.mode = "force"; deletion.acknowledgeDataLoss = true
         let deleted = try await api.taskCommand(taskId: "task:one", command: .delete, body: deletion)
         #expect(deleted.entityResult?.operationId == "op:1")
         let removed = try await api.workCommand(workId: "work:one", command: .delete, body: ClientEntityRequest(requestId: "delete_work12"))
@@ -286,6 +306,26 @@ struct SessionAPITests {
         #expect(try await api.capabilities(sessionId: "session:test").send.available)
     }
 
+    @Test func collaborationPresentationAllowsMissingWorkAndHistoricEndpoints() throws {
+        for direction in ["inbound", "outbound"] {
+            let data = Data("""
+            {"id":"collaboration","type":"userMessage","text":"Authored text",
+             "presentationRole":"collaboration","collaborationDirection":"\(direction)",
+             "collaborationSourceWorkId":null,"collaborationTargetWorkId":null}
+            """.utf8)
+            let message = try JSONDecoder().decode(ClientMessage.self, from: data)
+            let presentation = try #require(message.collaborationPresentation)
+            #expect(message.presentationKind == .collaborationMessage)
+            #expect(presentation.direction == direction)
+            #expect(presentation.body == "Authored text")
+            #expect(presentation.sourceWork == nil)
+            #expect(presentation.targetWork == nil)
+            #expect(presentation.sourceSession == nil)
+            #expect(presentation.targetSession == nil)
+            #expect(!presentation.isPendingConfirmation)
+        }
+    }
+
     @Test func collaborationPresentationOverridesUserMessageVisualMeaning() throws {
         let message = try JSONDecoder().decode(ClientMessage.self, from: Data(#"""
         {
@@ -350,7 +390,7 @@ private final class SessionProtocol: URLProtocol, @unchecked Sendable {
             case ("/client/v1/tasks/task:one/delete", _, "POST"):
                 #expect(body?["mode"] as? String == "force")
                 #expect(body?["acknowledgeDataLoss"] as? Bool == true)
-                #expect(body?["confirmedBranchName"] as? String == "task/abc")
+                #expect(Set(body?.keys.map { $0 } ?? []) == Set(["requestId", "mode", "deleteWorktree", "artifactDisposition", "acknowledgeDataLoss"]))
                 #expect(body?["deleteWorktree"] as? Bool == true)
                 json = #"{"schemaVersion":1,"requestId":"delete_12345","sessionId":"","kind":"task_delete","status":"completed","errorCode":null,"updatedAt":"now","entityResult":{"taskId":"task:one","operationId":"op:1","state":"queued"}}"#
             case ("/client/v1/works/work:one/delete", _, "POST"):

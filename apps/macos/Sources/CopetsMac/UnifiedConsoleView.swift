@@ -37,13 +37,13 @@ struct UnifiedConsoleView: View {
     @ObservedObject var viewportController = SessionViewportController.shared
     let selectionController = BackendClient.shared.sessionSelectionController
     @StateObject var sessionGroupProjectionStore = SessionGroupProjectionStore()
-    @StateObject var outlineProjectionStore = ConsoleOutlineProjectionStore()
+    @StateObject var outlineProjectionStore = ConsoleOutlineProjectionStore(defaults: .standard)
     @State var composerDraftRepository = ComposerDraftRepository()
     @State var detailRenderTask: Task<Void, Never>?
     @State var pendingSelectionTask: Task<Void, Never>?
     @State private var navigationSelection = ConsoleNavigationSelectionState()
     @State private var pagePresentation = SessionPagePresentationState()
-    @State private var showsDetailColumn = true
+    @AppStorage("ui.conversation.showDetails", store: CorptieAppEnvironment.userDefaults) private var showsDetailColumn = false
     var selectedCategory: SessionCategory {
         get { navigationSelection.category }
         nonmutating set { if navigationSelection.category != newValue { navigationSelection.category = newValue } }
@@ -76,16 +76,17 @@ struct UnifiedConsoleView: View {
         "sessions.workerGroupingMode",
         store: CorptieAppEnvironment.userDefaults
     ) var workerGroupingModeRawValue = WorkerSessionGroupingMode.work.rawValue
+    @Environment(\.accessibilityReduceMotion) var reduceOutlineMotion
     @EnvironmentObject var router: AppTabRouter
     private static let usesResidentDetailHosts = CorptieAppEnvironment.isDevelopment
         && ProcessInfo.processInfo.environment["CORPTIE_DETAIL_RESIDENT_HOSTS"] == "1"
-    static let usesResidentPages = CorptieAppEnvironment.isDevelopment
-        && ProcessInfo.processInfo.environment["CORPTIE_SESSION_RESIDENT_PAGES"] == "1"
+    static let usesResidentPages = true
     static let usesPageGateProof = CorptieAppEnvironment.isDevelopment
         && ProcessInfo.processInfo.environment["CORPTIE_SESSION_FRAME_GATE"] == "1"
     @EnvironmentObject var sidebarState: TabSidebarState
     /// Chat「+」只创建 Assistant Chat；Work Chat 与 Task Session 由系统伴生创建。
     @State var showNewSessionCreation = false
+    @State private var showsCreationMenu = false
     @State var isCreatingWork = false
     struct TaskCreationTarget: Identifiable {
         let id = UUID()
@@ -125,11 +126,11 @@ struct UnifiedConsoleView: View {
             CorptieAppEnvironment.userDefaults.set(newValue, forKey: "console.workOutline.sort")
         }
     }
-    @StateObject var outlineExpansionPreferences = ConsoleOutlineExpansionPreferences()
+    @State var outlineExpansionPreferences = ConsoleOutlineExpansionPreferences()
     @State var outlineFullyExpandedWorkIDs = Set<String>()
     @State var cardAttentionCount = 0
     @State var cardSelectionExplicitlyCleared = false
-    @State private var didResolveDevelopmentPreviewStart = false
+    @State private var didResolveInitialSession = false
     /// 每个 Tab（SessionCategory）独立记录其上一次选中的 Session，跨窗口/重启恢复，
     /// 避免不同 Tab 的选择相互覆盖。key 形如 `sessions.lastSelectedSessionId.<category>`。
     static let recentSessionIdsKey = "sessions.recentSessionIds"
@@ -141,6 +142,8 @@ struct UnifiedConsoleView: View {
     var body: some View {
         ConsoleWindowSplitView(mode: navigationMode, isActive: sidebarState.isSelected) {
             consoleNavigationContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(WorkbenchStyle.workColumnColor)
                 .ignoresSafeArea(.container, edges: .top)
                 .environmentObject(router)
                 .environmentObject(sidebarState)
@@ -159,9 +162,11 @@ struct UnifiedConsoleView: View {
         .environmentObject(layoutState)
         .environment(\.isLiquidGlass, false)
         .modifier(ConversationSkinHost())
+        .task(id: outlinePreparationKey) { await prepareOutline() }
         .onAppear {
+            sessionIndexStore.updateWorkTasks(entityClient.tasks)
             PerfStopwatch.event("UnifiedConsoleView·onAppear", value: 1)
-            selectDevelopmentPreviewAtStartupIfAvailable(backendClient.sessions)
+            restoreInitialSessionIfAvailable(backendClient.sessions)
             restoreConsoleSpaceIfNeeded()
             activateSessions()
         }
@@ -188,7 +193,7 @@ struct UnifiedConsoleView: View {
         .onReceive(backendClient.sessionsDidChange) { sessions in
             guard sidebarState.isSelected else { return }
             attemptPendingSelection(sessions)
-            selectDevelopmentPreviewAtStartupIfAvailable(sessions)
+            restoreInitialSessionIfAvailable(sessions)
             restoreConsoleContentIfNeeded()
             if let selectedSessionID = backendClient.selectedSession?.id {
                 markOpenedSessionRead(sessions.first(where: { $0.id == selectedSessionID }))
@@ -226,6 +231,7 @@ struct UnifiedConsoleView: View {
             }
         }
         .onReceive(entityClient.sessionGroupingDidChange) { _ in
+            sessionIndexStore.updateWorkTasks(entityClient.tasks)
             entityGroupingRevision &+= 1
             guard sidebarState.isSelected, router.pendingSessionId == nil else { return }
             restoreConsoleSpaceIfNeeded()
@@ -288,17 +294,18 @@ struct UnifiedConsoleView: View {
                 onMergeFirst: {
                     taskDeletionPresentation = nil
                     taskDeletionError = L10nFormat(
-                        "CorptieTask 未删除。请先在项目 Worktree 管理中将分支 %@ 合并到目标主分支，确认无待提交文件后再重试删除。",
+                        presentation.plan.parentTaskId == nil
+                            ? "CorptieTask 未删除。请先在项目 Worktree 管理中将分支 %@ 合并到目标主分支，确认无待提交文件后再重试删除。"
+                            : "子任务未删除。可在 Worktree 管理中将分支 %@ 合并到父分支，或重新选择强制删除。",
                         presentation.plan.worktree?.branchName ?? ""
                     )
                 },
-                onDelete: { force, branch, deleteWorktree, artifactDisposition in
+                onDelete: { force, deleteWorktree, artifactDisposition, options in
                     deleteTask(
                         presentation.task,
                         force: force,
-                        confirmedBranchName: branch,
                         deleteWorktree: deleteWorktree,
-                        artifactDisposition: artifactDisposition
+                        artifactDisposition: artifactDisposition, options: options
                     )
                 }
             )
@@ -350,16 +357,27 @@ struct UnifiedConsoleView: View {
     }
 
 
-    @ViewBuilder
     var consoleNavigationContent: some View {
-        if isSearching, !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            VStack(spacing: 8) {
-                sessionSearchBar.padding(.horizontal, 8)
+        VStack(spacing: 0) {
+            // Create belongs to the Work column itself, not to the thin top
+            // row shared with the conversation header across the divider.
+            consoleSidebarCreationRow
+            // Keep one search field mounted as the query gains/loses results.
+            // Replacing the field here would lose focus and marked input.
+            if isSearching {
+                sessionSearchBar.padding(.horizontal, 16).padding(.bottom, 8)
+            }
+            if isSearching, !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 UnifiedSearchResultsView(query: searchText, currentWorkID: selectedWorkId,
                                          submitRevision: searchSubmitRevision, open: openSearchHit)
-            }.frame(maxHeight: .infinity)
-        } else {
-            normalConsoleNavigationContent
+                    .frame(maxHeight: .infinity)
+            } else {
+                normalConsoleNavigationContent
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) { consoleSidebarHeader }
+        .sheet(isPresented: $showNewSessionCreation) {
+            NewSessionCreationSheet(fixedKind: .assistantChat)
         }
     }
 
@@ -378,16 +396,34 @@ struct UnifiedConsoleView: View {
         }
         .frame(maxHeight: .infinity)
         .modifier(ConsoleTopEdgeEffectModifier())
-        .safeAreaInset(edge: .top, spacing: 0) {
-            PlatformWorkOutlineToolbar(density: .compact) {
+    }
+
+    /// Search and More own this one row. Its height matches the conversation
+    /// header accessory on the other pane, so the two top rows line up as a
+    /// single thin band without measuring anything during a live resize.
+    private var consoleSidebarHeader: some View {
+        HStack(spacing: 4) {
+            Spacer(minLength: 8)
+            searchToggleButton
+                .consoleHoverFeedback()
+            Menu {
                 outlineSortMenu
-                navigationModeToggle.labelsHidden()
-                searchToggleButton
+                navigationModeToggle
                 taskArchiveToggle
-            } trailing: {
-                outlineCreationMenu
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 28, height: 28)
             }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden)
+            .consoleHoverFeedback()
+            .fixedSize().help(L10n("更多选项"))
+            WorkColumnCollapseButton()
+                .frame(width: 28, height: 28)
+                .consoleHoverFeedback()
         }
+        .platformWorkOutlineToolbarDensity(.titlebar)
+        .padding(.horizontal, 16)
+        .padding(.top, 2)
+        .frame(height: MainWindowPageLayoutMetrics.headerRowHeight, alignment: .top)
     }
 
     var navigationMode: ConsoleNavigationMode {
@@ -406,7 +442,7 @@ struct UnifiedConsoleView: View {
                 }
             }
         } label: {
-            PlatformWorkOutlineToolbarGlyph(symbol: "arrow.up.arrow.down")
+            PlatformWorkOutlineToolbarGlyph(symbol: "line.3.horizontal.decrease")
         }
         .platformWorkOutlineToolbarControl()
         .menuIndicator(.hidden)
@@ -421,7 +457,7 @@ struct UnifiedConsoleView: View {
             navigationModeOption(.taskCards, title: "卡片 · 实验")
         } label: {
             PlatformWorkOutlineToolbarGlyph(
-                symbol: navigationMode == .taskCards ? "rectangle.grid.2x2" : "rectangle.3.group"
+                symbol: navigationMode == .taskCards ? "square.grid.2x2" : "list.bullet"
             )
         }
         .platformWorkOutlineToolbarControl()
@@ -459,9 +495,11 @@ struct UnifiedConsoleView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10).padding(.top, 10)
             }
-            if isSearching { sessionSearchBar.padding(.horizontal, 10) }
             ConsoleCardWorkspace(isActive: navigationMode == .taskCards, works: entityClient.works, tasks: entityClient.tasks,
-                sessions: sessionIndexStore.rows.map(\.session), selectedTaskID: selectedTaskId,
+                // The clipped, hit-test-disabled card column must not rebuild
+                // the full session projection on every window geometry frame.
+                sessions: navigationMode == .taskCards ? sessionIndexStore.rows.map(\.session) : [],
+                selectedTaskID: selectedTaskId,
                 selectedSessionID: selectionController.presentationSessionID, query: searchText,
                 sortMode: outlineSort, showsArchive: isShowingWorkerArchive,
                 attentionCount: $cardAttentionCount,
@@ -510,16 +548,26 @@ struct UnifiedConsoleView: View {
             return
         }
         guard selectionController.selectedSessionID == nil else { return }
+        restoreInitialSessionIfAvailable(backendClient.sessions)
+        guard selectionController.selectedSessionID == nil else { return }
         selectedWorkId = entityClient.works.first?.id
         selectedCategory = selectedWorkId == nil ? .assistant : .worker
         selectDefaultContentForCurrentSpace()
     }
 
-    private func selectDevelopmentPreviewAtStartupIfAvailable(_ sessions: [TaskSession]) {
-        guard !didResolveDevelopmentPreviewStart, !sessions.isEmpty else { return }
-        didResolveDevelopmentPreviewStart = true
-        guard router.pendingSessionId == nil,
-              let previewID = ProcessInfo.processInfo.environment["CORPTIE_DEVELOPMENT_PREVIEW_SESSION_ID"],
+    private func restoreInitialSessionIfAvailable(_ sessions: [TaskSession]) {
+        guard !didResolveInitialSession, !sessions.isEmpty else { return }
+        didResolveInitialSession = true
+        guard router.pendingSessionId == nil, selectionController.selectedSessionID == nil else { return }
+        // Restore the existing recent-selection history before any default or
+        // development preview. Explicit navigation/current selection still wins.
+        if let restoredID = SessionSelectionRecoveryPolicy.restoring(
+            recentSessionIDs: Self.restoredRecentSessionIds(), sessions: sessions),
+           let session = sessions.first(where: { $0.id == restoredID }) {
+            selectSessionAfterHighlight(session)
+            return
+        }
+        guard let previewID = ProcessInfo.processInfo.environment["CORPTIE_DEVELOPMENT_PREVIEW_SESSION_ID"],
               let session = sessions.first(where: { $0.id == previewID }) else { return }
         selectSessionAfterHighlight(session)
     }
@@ -540,18 +588,7 @@ struct UnifiedConsoleView: View {
     }
 
     func workChatSession(for workId: String) -> TaskSession? {
-        let indexedSession = sessionIndexStore.rows.lazy
-            .map(\.session)
-            .first {
-                $0.resolvedSessionKind == .workChat
-                    && $0.workId == workId
-                    && $0.archived != true
-            }
-        return indexedSession ?? backendClient.sessions.first {
-            $0.resolvedSessionKind == .workChat
-                && $0.workId == workId
-                && $0.archived != true
-        }
+        sessionIndexStore.taskSessionLookup.workChat(for: workId)
     }
 
     func openWorkChat(for work: Work, session: TaskSession) {
@@ -594,6 +631,8 @@ struct UnifiedConsoleView: View {
             return
         }
         // Keep an unresolved selected identity while its data is hydrating.
+        guard selectionController.selectedSessionID == nil else { return }
+        restoreInitialSessionIfAvailable(backendClient.sessions)
         guard selectionController.selectedSessionID == nil else { return }
         // A Task without a Session is still an explicit, valid user selection.
         // Keep it authoritative across session-index refreshes instead of
@@ -643,7 +682,7 @@ struct UnifiedConsoleView: View {
         if router.pendingSessionId == nil {
             restoreConsoleContentIfNeeded()
         }
-        Task { await entityClient.refreshAgents() }
+        Task { await entityClient.refreshRoles() }
     }
 
     func deactivateSessions() {
@@ -781,13 +820,9 @@ struct UnifiedConsoleView: View {
             return
         }
         if Self.usesPageGateProof || Self.usesResidentPages, pagePresentation.request(sessionID: session.id, title: session.title, activate: {
-            guard let current = backendClient.appState.session(session.id)
-                    ?? backendClient.archivedSessions.first(where: { $0.id == session.id }),
-                  current.hasValidProductClassification, current.taskId == session.taskId,
-                  current.workId == session.workId else { pagePresentation.cancel(); return }
-            commitNavigationSelection(current)
-            viewportController.hydrate(current.id)
-            backendClient.select(session: current, focusComposer: focusComposer)
+            commitNavigationSelection(session)
+            viewportController.hydrate(session.id)
+            backendClient.select(session: session, focusComposer: focusComposer)
         }) { return }
         // Commit the lightweight local selection synchronously. The native
         // row highlight and a warm timeline host can therefore paint in the
@@ -815,7 +850,7 @@ struct UnifiedConsoleView: View {
     var sessionSearchBar: some View {
         HStack(spacing: 7) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 12, weight: .medium))
+                .font(WorkbenchTypography.font(for: .navigationHeading))
                 .foregroundStyle(.secondary)
             TextField(L10n("Search Work, Task and chat history"), text: $searchText)
                 .textFieldStyle(.plain)
@@ -830,7 +865,7 @@ struct UnifiedConsoleView: View {
                 isSearchFieldFocused = false
             } label: {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(WorkbenchTypography.font(for: .navigationHeading))
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
@@ -910,26 +945,63 @@ struct UnifiedConsoleView: View {
         backendClient.select(session: session)
     }
 
+    /// Create is a Work-column control with its own layout: it sits below the
+    /// shared top band rather than thickening the row that has to line up
+    /// with the conversation title on the other side of the divider.
+    private var consoleSidebarCreationRow: some View {
+        outlineCreationMenu
+            .padding(.horizontal, 16)
+            .padding(.top, 4)
+            .padding(.bottom, 6)
+    }
+
     var outlineCreationMenu: some View {
-        Menu {
-            if selectedWork == nil {
-                Button(L10n("New Agent Conversation"), systemImage: "bubble.left.and.bubble.right") {
+        Button { showsCreationMenu.toggle() } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "plus").font(.system(size: 13))
+                Text(L10n("Create")).font(WorkbenchTypography.font(for: .navigation))
+                Spacer(minLength: 8)
+            }
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .consoleHoverFeedback()
+        .help(L10n("Create Agent Conversation or Work"))
+        .accessibilityLabel(L10n("Create Agent Conversation or Work"))
+        .accessibilityIdentifier("work-outline-create")
+        .popover(isPresented: $showsCreationMenu, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                creationMenuItem("New Work", symbol: "folder.badge.plus") {
+                    isCreatingWork = true
+                }
+                Divider().padding(.vertical, 3)
+                creationMenuItem("New Agent Conversation", symbol: "square.and.pencil") {
                     showNewSessionCreation = true
                 }
                 Divider()
             }
-
-            Button(L10n("New Work"), systemImage: "scope") {
-                isCreatingWork = true
-            }
-        } label: {
-            PlatformWorkOutlineToolbarGlyph(symbol: "plus")
+            .padding(6)
+            .frame(width: 220)
         }
-        .platformWorkOutlineToolbarControl()
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help(L10n("Create"))
-        .accessibilityLabel("新增 Agent 对话或 Work").accessibilityIdentifier("work-outline-create")
+    }
+
+    private func creationMenuItem(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+        Button {
+            showsCreationMenu = false
+            DispatchQueue.main.async { action() }
+        } label: {
+            Label(L10n(title), systemImage: symbol)
+                .font(WorkbenchTypography.font(for: .navigation))
+                .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                .padding(.horizontal, 10)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .consoleHoverFeedback()
     }
 
     func presentTaskCreation(for workID: String) {
@@ -1010,9 +1082,11 @@ struct UnifiedConsoleView: View {
         .modifier(SessionSidebarFunctionBarGlassModifier())
     }
 
-    func sessionRow(_ row: SessionRowModel) -> some View {
+    func sessionRow(_ row: SessionRowModel, showsHoverFeedback: Bool = true) -> some View {
         let isSelected = selectionController.presentationSessionID == row.session.id
         return ConsoleSessionRow(
+            showsHoverFeedback: showsHoverFeedback,
+            isActive: sidebarState.isSelected,
             row: row,
             selectionRequested: { selectSessionAfterHighlight($0, focusComposer: true) }
         )
@@ -1085,7 +1159,7 @@ struct UnifiedConsoleView: View {
         return sessionGroupProjectionStore.groups(for: key) {
             makeSessionGroups(
                 rows: searchFilteredRows,
-                agents: entityClient.agents,
+                roles: entityClient.roles,
                 tasks: entityClient.tasks,
                 works: entityClient.works,
                 category: selectedCategory,
@@ -1182,7 +1256,7 @@ struct UnifiedConsoleView: View {
            SessionCategory(session: session) == selectedCategory,
            navigationMode == .taskCards || selectedCategory != .worker
                 || isArchivedWorkerSession(session) == isShowingWorkerArchive {
-            HStack(spacing: 0) {
+            AdaptiveConversationColumns(isVisible: $showsDetailColumn) {
                 // All navigation modes share the full conversation surface.
                 // Keep details present without replacing the editor or timeline.
                 VStack(spacing: 6) {
@@ -1194,12 +1268,13 @@ struct UnifiedConsoleView: View {
                     initialTimelinePosition: viewportController.position(for: session.id),
                     onTimelinePositionChange: { position in
                         viewportController.store(position, for: session.id)
-                    }
+                    },
+                    showsHeader: false
                 )
                 .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .top)
                 }
                 .modifier(ConversationColumnSurface(.transcript))
-
+            } detail: {
                 Group {
                 if Self.usesResidentDetailHosts {
                     SessionDetailHostSwitcher(session: session,
@@ -1215,10 +1290,12 @@ struct UnifiedConsoleView: View {
                         .frame(maxHeight: .infinity)
                 }
                 }
-                .modifier(ConsoleDetailColumnVisibility(isVisible: showsDetailColumn))
+            } header: {
+                DetailHeaderView(session: session,
+                    historicalWorkspacePath: backendClient.selectedDetail?.cwd)
+                    .padding(.bottom, 8)
             }
             .padding(MainWindowPageLayoutMetrics.outerPadding)
-            .modifier(ConsoleDetailColumnBackground(isVisible: showsDetailColumn))
             .environment(\.detailColumnVisibility, $showsDetailColumn)
         } else if let task = selectedTask {
             HStack(spacing: MainWindowPageLayoutMetrics.columnSpacing) {

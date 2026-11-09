@@ -1,3 +1,5 @@
+import { logError } from "../utils/errorDiagnostics.mjs";
+import { coordinationProgressFor } from './coordinationProgressService.mjs';
 import https from "node:https";
 import { clientSafeJSONStringify } from "../utils/unicodeText.mjs";
 import { readFile } from "node:fs/promises";
@@ -14,6 +16,7 @@ import { ClientResourceAPI } from "./clientResourceAPI.mjs";
 import { readTaskHierarchyPage } from "./taskHierarchyService.mjs";
 import { TaskIntegrationAcceptanceService } from "./taskIntegrationAcceptanceService.mjs";
 import { worktreeErrorBody } from "./projectWorkspaceHttpApi.mjs";
+import { handleChildTaskDeliveryHttp } from "./childTaskDeliveryHttp.mjs";
 
 export const reply = (response, status, body) => {
   response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store",
@@ -60,11 +63,12 @@ function streamFile(response, { path, contentType, size, etag }) {
 /** Separate TLS listener with a closed route list; never forwards to the legacy router. */
 export class ClientDeviceGateway {
   constructor(authority, { readAPI = null, sessionAPI = null, controlAPI = null, worktreeAPI = null,
-    detailActionService = null, detailWritesAllowed = false, resourceWritesAllowed = true } = {}) {
+    detailActionService = null, detailWritesAllowed = false, resourceWritesAllowed = true, automationNotifications = null } = {}) {
     if (typeof detailWritesAllowed !== "boolean") throw deviceError("DETAIL_GATE_INVALID", 500);
     this.authority = authority;
     this.readAPI = readAPI;
     this.sessionAPI = sessionAPI;
+    this.resourceWritesAllowed=resourceWritesAllowed;
     this.detailWritesAllowed = detailWritesAllowed;
     this.detailActions = detailActionService ?? (sessionAPI?.inspector?.store ? createDetailBusinessActionService({ commandAPI: sessionAPI,
       inspector: sessionAPI.inspector, documentService: detailServiceFor(sessionAPI.inspector.store) }) : null);
@@ -74,6 +78,7 @@ export class ClientDeviceGateway {
       artifacts: sessionAPI.inspector.artifacts, writesAllowed: resourceWritesAllowed }) : null;
     this.inspectorEvents = new ClientInspectorStream({ snapshot: (identity, id) => this.sessionAPI.inspector.snapshot(identity, id) });
     this.events = new ClientEventStream({
+      automationNotifications,
       stateSnapshot: async () => this.readAPI?.realtimeSnapshot?.() ?? null,
       controlSnapshot: async () => this.controlAPI?.realtimeSnapshot?.() ?? null,
       timeline: async (identity, sessionId, after, options) =>
@@ -119,6 +124,7 @@ export class ClientDeviceGateway {
   }
 
   async handle(request, response) {
+    let worktreeDiagnosticAllowed = false;
     try {
       this.limit(request);
       if (request.headers.origin || request.headers["x-corptie-agent-id"]) {
@@ -150,9 +156,12 @@ export class ClientDeviceGateway {
       const worktreeRepositoryJobs = /^\/client\/v1\/worktrees\/repositories\/([^/]+)\/integration-jobs$/.exec(path);
       const worktreeJob = /^\/client\/v1\/worktrees\/jobs\/([^/]+)$/.exec(path);
       const worktreeJobAction = /^\/client\/v1\/worktrees\/jobs\/([^/]+)\/actions\/([^/]+)$/.exec(path);
-      const conversation = /^\/client\/v1\/sessions\/([^/]+)\/(messages|message-deliveries|quick-messages|stop|capabilities|composer|conversation-commands|tasks|task-startup|read-receipt|images|resources|usage|approval|user-input|collaboration-confirmation)$/.exec(path);
+      const conversation = /^\/client\/v1\/sessions\/([^/]+)\/(messages|message-deliveries|quick-messages|user-message-navigation|stop|capabilities|composer|conversation-commands|tasks|task-startup|read-receipt|images|resources|usage|approval|user-input|collaboration-confirmation)$/.exec(path);
       const commandReceipt = /^\/client\/v1\/commands\/([A-Za-z0-9_-]{8,128})$/.exec(path);
-      if (url.search && !resource && !search && !inventory && !taskHierarchy && !control && !eventV2 && !worktreeRepository
+      const progressRead = /^\/client\/v1\/sessions\/[^/]+\/coordination-progress\/[^/]+$/.test(path) && request.method === "GET";
+      if(progressRead && [...url.searchParams.keys()].some(key=>!["offset","assignment"].includes(key))) throw deviceError("REQUEST_NOT_ALLOWED",403);
+      if (url.search && !progressRead && !resource && !search && !inventory && !taskHierarchy && !control && !eventV2 && !worktreeRepository
+          && !/^\/client\/v1\/tasks\/[^/]+\/child-deliveries$/.test(path)
           && !(path === "/client/v1/provider-settings/task-creation" && request.method === "GET")
           && !(["messages", "tasks", "task-startup", "images", "resources", "usage"].includes(conversation?.[2]) && request.method === "GET")) {
         throw deviceError("REQUEST_NOT_ALLOWED", 403);
@@ -167,6 +176,24 @@ export class ClientDeviceGateway {
         return reply(response, 200, await this.authority.refresh(await body(request)));
       }
       const identity = this.authenticateRequest(request);
+      const deliveryAPI=this.sessionAPI?.entityCommands?.childDelivery;
+      if(await handleChildTaskDeliveryHttp({request,response,url,prefix:"/client/v1",
+        service:deliveryAPI?.service(),completion:deliveryAPI?.completion(),actor:{type:"user",id:`user:paired-device:${identity.deviceId}`},
+        writesAllowed:this.resourceWritesAllowed,
+        revalidate:()=>{if(this.authenticateRequest(request).deviceId!==identity.deviceId) throw deviceError("DEVICE_AUTH_CHANGED",403);},
+        readJson:body,sendJson:reply})) return;
+      const userApproval = path.match(/^\/client\/v1\/tasks\/([^/]+)\/integration-acceptance-(intents|confirmations)$/);
+      if(userApproval && this.readAPI?.store) {
+        if(request.method!=="POST") throw deviceError("REQUEST_NOT_ALLOWED",405);
+        if(!this.worktreeAPI) throw deviceError("CAPABILITY_UNAVAILABLE",403);
+        const taskId=decode(userApproval[1],"INVALID_TASK_ID"), input=await body(request);
+        const service=new TaskIntegrationAcceptanceService({store:this.readAPI.store});
+        const user={type:"user",id:`user:device:${identity.deviceId}`};
+        const options={revalidate:()=>{if(this.authenticateRequest(request).deviceId!==identity.deviceId) throw deviceError("DEVICE_AUTH_CHANGED",403);}};
+        return reply(response,200,userApproval[2]==="intents"
+          ? await service.prepareUserApproval(taskId,input,user,options)
+          : await service.confirmUserApproval(taskId,input,user,options));
+      }
       const integration = path.match(/^\/client\/v1\/tasks\/([^/]+)\/integration-(snapshots|acceptance)$/);
       if(integration && this.readAPI?.store) {
         const service=new TaskIntegrationAcceptanceService({store:this.readAPI.store}),taskId=decode(integration[1],"INVALID_TASK_ID");
@@ -211,6 +238,12 @@ export class ClientDeviceGateway {
         handleDetailActionHttp({ request, response, url, service: this.detailActions, authenticate, sendJson: reply,
           route: "pairedDevice", writesAllowed: this.detailWritesAllowed });
         return;
+      }
+      const progress=/^\/client\/v1\/sessions\/([^/]+)\/coordination-progress\/([^/]+)$/.exec(path);
+      if(progress&&request.method==='GET'&&this.sessionAPI?.inspector){
+        const id=decode(progress[1],'INVALID_SESSION_ID');this.sessionAPI.inspector.scope(id,identity);
+        const service=coordinationProgressFor(this.sessionAPI.inspector.store),batch=decode(progress[2],'INVALID_BATCH_ID'),offset=Number(url.searchParams.get('offset')??0);
+        return reply(response,200,url.searchParams.has('assignment')?service.report(id,batch,url.searchParams.get('assignment'),offset):service.page(id,batch,offset));
       }
       const detailSync = /^\/client\/v1\/sessions\/([^/]+)\/detail\/sync$/.exec(path);
       if (detailSync && this.sessionAPI?.inspector) {
@@ -424,6 +457,7 @@ export class ClientDeviceGateway {
       if (this.worktreeAPI && (worktreeLocalState || worktreeRepository || worktreePushStatus || worktreeDelete
           || worktreeWorkspaceAction || worktreeService || worktreeServiceAction || worktreePlan
           || worktreeCandidate || worktreeRepositoryJobs || worktreeJob || worktreeJobAction)) {
+        worktreeDiagnosticAllowed = true;
         let result;
         if (worktreeLocalState && ["GET", "POST"].includes(request.method)) {
           const input = request.method === "POST" ? await body(request, 1024) : null;
@@ -453,7 +487,7 @@ export class ClientDeviceGateway {
           const input = await body(request, 64 * 1024);
           this.authenticateRequest(request);
           if (worktreeDelete) result = await this.worktreeAPI.deleteWorktree(
-            decode(worktreeDelete[1], "INVALID_REPOSITORY_ID"), decode(worktreeDelete[2], "INVALID_WORKTREE_ID")
+            decode(worktreeDelete[1], "INVALID_REPOSITORY_ID"), decode(worktreeDelete[2], "INVALID_WORKTREE_ID"), input
           );
           else if (worktreeWorkspaceAction) result = await this.worktreeAPI.workspaceAction(
             decode(worktreeWorkspaceAction[1], "INVALID_REPOSITORY_ID"),
@@ -567,6 +601,11 @@ export class ClientDeviceGateway {
           this.authenticateRequest(request);
           return reply(response, 200, result);
         }
+        if (request.method === "GET" && conversation[2] === "user-message-navigation") {
+          const result = await this.sessionAPI.userMessageNavigation(identity, sessionId, url.searchParams);
+          this.authenticateRequest(request);
+          return reply(response, 200, result);
+        }
         if (request.method === "GET" && conversation[2] === "quick-messages") {
           const result = await this.sessionAPI.quickMessages(identity, sessionId);
           this.authenticateRequest(request);
@@ -660,10 +699,18 @@ export class ClientDeviceGateway {
       }
       throw deviceError("ROUTE_NOT_AVAILABLE", 404);
     } catch (error) {
+      logError("device-gateway.request", error, { stage: "request" });
       const status = error.status ?? error.statusCode ?? 500;
+      let worktreeMessage;
+      if (worktreeDiagnosticAllowed) {
+        try {
+          this.authenticateRequest(request);
+          worktreeMessage = worktreeErrorBody(error).error;
+        } catch { /* Revoked devices cannot receive operation diagnostics. */ }
+      }
       reply(response, status, {
         code: error.code ?? "DEVICE_SERVICE_ERROR",
-        ...(status < 500 ? { error: error.message } : {}),
+        ...(status < 500 || worktreeMessage ? { error: worktreeMessage ?? error.message } : {}),
         ...(status < 500 && error.busyContext ? {busyContext:worktreeErrorBody(error).busyContext} : {}),
         ...(typeof error.retryable === "boolean" ? { retryable: error.retryable } : {}),
         ...(status < 500 && error.commitPolicyBlocker ? {commitPolicyBlocker:error.commitPolicyBlocker,commitReviewId:error.commitReviewId} : {}),
@@ -727,12 +774,12 @@ export class ClientDeviceGateway {
         return reply(response, 200, { deleted: true });
       }
       throw deviceError("ROUTE_NOT_AVAILABLE", 404);
-    } catch (error) { reply(response, error.status ?? 500, { code: error.code ?? "DEVICE_SERVICE_ERROR" }); }
+    } catch (error) { logError("device-gateway.admin", error, { stage: "admin" }); reply(response, error.status ?? 500, { code: error.code ?? "DEVICE_SERVICE_ERROR" }); }
   }
 }
 
 export async function startConfiguredDeviceGateway({ directory, preview, readAPI = null, controlAPI = null,
-  worktreeAPI = null, sessionAPIFactory = null, environment = process.env, detailActionService = null, detailWritesAllowed = false }) {
+  worktreeAPI = null, sessionAPIFactory = null, environment = process.env, detailActionService = null, detailWritesAllowed = false, automationNotifications = null }) {
   if (preview || environment.CORPTIE_REMOTE_ACCESS !== "1") return null;
   const host = environment.CORPTIE_REMOTE_HOST;
   const port = Number(environment.CORPTIE_REMOTE_PORT);
@@ -746,7 +793,7 @@ export async function startConfiguredDeviceGateway({ directory, preview, readAPI
   const authority = new ClientDeviceAuthority(directory);
   await authority.initialize();
   const gateway = new ClientDeviceGateway(authority, {
-    detailActionService, detailWritesAllowed,
+    detailActionService, detailWritesAllowed, automationNotifications,
     readAPI, controlAPI, worktreeAPI, sessionAPI: sessionAPIFactory?.() ?? null
   });
   try { await gateway.start({ host, port, key, cert }); }

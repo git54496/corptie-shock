@@ -70,6 +70,7 @@ function projectTask(task) {
     acceptanceCriteria: task.acceptance_criteria ?? "", verificationCriteria: task.verification_criteria ?? "",
     priority: task.priority, lifecycleState: task.lifecycle_state, archived: Boolean(task.archived),
     autoTitleEnabled: task.auto_title_enabled !== 0,
+    coordinationEnabled: task.coordination_enabled === 1,
     mainAgentId: task.main_agent_id ?? null,
     deletionStatus: ["deleting", "delete_failed"].includes(task.deletion_status) ? task.deletion_status : null };
 }
@@ -117,10 +118,12 @@ export async function clientTaskDeletionPlan(api, identity, taskId) {
   }
   const risk = row => ({ code: String(row.code), message: typeof row.message === "string" ? row.message.slice(0, 512) : "",
     ...(Array.isArray(row.files) ? { files: row.files.filter(file => typeof file === "string").slice(0, 8).map(file => file.slice(0, 256)) } : {}),
-    ...(Number.isFinite(row.commitCount) ? { commitCount: row.commitCount } : {}) });
-  return { schemaVersion: 1, taskId: task.id,
+    ...(Number.isFinite(row.commitCount) ? { commitCount: row.commitCount } : {}),
+    ...(row.jobId ? { jobId: row.jobId, status: row.status, phase: row.phase, canResolve: row.canResolve === true, action: row.action } : {}) });
+  return { schemaVersion: 1, taskId: task.id, parentTaskId: plan?.parentTaskId ?? null,
     status: ["blocked", "risky", "safe"].includes(plan?.status) ? plan.status : "blocked",
     associatedSessionCount: Number(plan?.associatedSessionCount) || 0,
+    associatedTaskIds: plan?.associatedTaskIds ?? [], childTaskIds: plan?.childTaskIds ?? [],
     artifacts: (plan?.artifacts ?? []).map(row => ({ id: String(row.artifactId), title: typeof row.title === "string" ? row.title : "" })).slice(0, 50),
     worktree: plan?.worktree ? { branchName: typeof plan.worktree.branchName === "string" ? plan.worktree.branchName : null,
       dirty: plan.worktree.dirty === true, mergedIntoMain: plan.worktree.mergedIntoMain === true,
@@ -235,12 +238,16 @@ function validateTaskCommand(api, task, command, input) {
   const code = "INVALID_TASK_COMMAND";
   switch (command) {
     case "update": {
-      knownFields(input, ["requestId", "title", ...TASK_TEXT_FIELDS, "priority", "mainAgentId", "autoTitleEnabled"], code);
+      knownFields(input, ["requestId", "title", ...TASK_TEXT_FIELDS, "priority", "mainAgentId", "autoTitleEnabled", "coordinationEnabled"], code);
       const fields = {};
       if ("title" in input) fields.title = name(input.title, "title", "Task", code);
       if ("autoTitleEnabled" in input) {
         if (typeof input.autoTitleEnabled !== "boolean") throw deviceError(code, 400);
         fields.autoTitleEnabled = input.autoTitleEnabled;
+      }
+      if ("coordinationEnabled" in input) {
+        if (typeof input.coordinationEnabled !== "boolean") throw deviceError(code, 400);
+        fields.coordinationEnabled = input.coordinationEnabled;
       }
       for (const key of TASK_TEXT_FIELDS) if (key in input) fields[key] = text(input[key], code);
       if ("priority" in input) {
@@ -265,16 +272,21 @@ function validateTaskCommand(api, task, command, input) {
       knownFields(input, ["requestId"], code);
       return {};
     case "delete": {
-      knownFields(input, ["requestId", "mode", "deleteWorktree", "artifactDisposition", "acknowledgeDataLoss", "confirmedBranchName"], code);
+      knownFields(input, ["requestId", "mode", "deleteWorktree", "artifactDisposition", "acknowledgeDataLoss", "stopRunning", "cancelStartup", "deleteAssociatedTasks", "cancelIntegration"], code);
       const fields = { mode: input.mode ?? "safe", deleteWorktree: input.deleteWorktree ?? true,
         artifactDisposition: input.artifactDisposition ?? "delete" };
       if (!["safe", "force"].includes(fields.mode) || typeof fields.deleteWorktree !== "boolean"
           || !["delete", "work", "retain"].includes(fields.artifactDisposition)) throw deviceError(code, 400);
+      for (const key of ["stopRunning", "cancelStartup", "deleteAssociatedTasks", "cancelIntegration"]) {
+        if (key in input) {
+          if (typeof input[key] !== "boolean") throw deviceError(code, 400);
+          fields[key] = input[key];
+        }
+      }
       if ("acknowledgeDataLoss" in input) {
         if (typeof input.acknowledgeDataLoss !== "boolean") throw deviceError(code, 400);
         fields.acknowledgeDataLoss = input.acknowledgeDataLoss;
       }
-      if ("confirmedBranchName" in input) fields.confirmedBranchName = text(input.confirmedBranchName, code, { limit: 512 });
       return fields;
     }
     default: throw deviceError("ROUTE_NOT_AVAILABLE", 404);

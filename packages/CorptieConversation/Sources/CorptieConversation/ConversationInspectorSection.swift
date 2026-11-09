@@ -3,12 +3,14 @@ import SwiftUI
 /// One scroll owner for both platform Detail rails.
 public struct ConversationDetailDashboard<Content: View>: View {
     private let content: Content
+    private let fixedContentWidth: CGFloat?
     #if os(macOS)
     @State private var scrollRouter = DetailScrollRouter()
     #endif
 
-    public init(@ViewBuilder content: () -> Content) {
+    public init(fixedContentWidth: CGFloat? = nil, @ViewBuilder content: () -> Content) {
         self.content = content()
+        self.fixedContentWidth = fixedContentWidth
     }
 
     public var body: some View {
@@ -32,6 +34,7 @@ public struct ConversationDetailDashboard<Content: View>: View {
                 .environment(\.detailScrollRouter, scrollRouter)
                 #endif
         }
+        .environment(\.detailFixedContentWidth, fixedContentWidth)
         .coordinateSpace(name: "conversation.detail.rail")
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(WorkbenchCanvasSurface.color)
@@ -68,26 +71,27 @@ public struct ConversationDetailContentSurface: ViewModifier {
     }
 
     public func body(content: Content) -> some View {
-        content.modifier(ConversationContentSurface(cornerRadius: cornerRadius, isPanel: true))
+        content.modifier(ConversationContentSurface(cornerRadius: cornerRadius, isPanel: true, allowsMaterial: false))
     }
 }
 
 /// One static material and color surface per Detail module; no nested glass.
 public struct ConversationDetailModuleSurface: ViewModifier {
     @Environment(\.detailWidgetSize) private var widgetSize
+    @Environment(\.detailPrefersNaturalContent) private var prefersNaturalContent
     public init() {}
 
     public func body(content: Content) -> some View {
         Group {
             if let widgetSize {
-                ScrollView(.vertical) {
-                    // Preserve the viewport proposal for lazy collection rows.
-                    // An ideal-height override makes nested lazy layout keep
-                    // invalidating as paged content and scrollbars change.
-                    content.frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(widgetSize.columns == 1 || widgetSize == .strip ? 12 : 16)
+                DetailWidgetViewport(size: widgetSize) {
+                    if prefersNaturalContent {
+                        ViewThatFits(in: .vertical) {
+                            padded(content, size: widgetSize).fixedSize(horizontal: false, vertical: true)
+                            scrollable(content, size: widgetSize)
+                        }
+                    } else { scrollable(content, size: widgetSize) }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             } else {
                 content
@@ -100,6 +104,19 @@ public struct ConversationDetailModuleSurface: ViewModifier {
             .modifier(DetailCardScrollActivation())
             #endif
     }
+    private func padded(_ content: Content, size: DetailWidgetSize) -> some View {
+        content.frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(size.columns == 1 || size == .strip ? 12 : 16)
+    }
+    private func scrollable(_ content: Content, size: DetailWidgetSize) -> some View {
+        ScrollView(.vertical) {
+            padded(content, size: size)
+                #if os(macOS)
+                .modifier(DetailScrollOwnerRegistration())
+                #endif
+        }
+    }
+
 }
 
 public struct ConversationDetailModuleCard<Content: View, HeaderActions: View>: View {
@@ -201,7 +218,7 @@ public struct ConversationInspectorSection<Content: View, HeaderActions: View>: 
         self.content = content()
     }
     public var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 6) {
                 if let cardDrag {
                     #if os(macOS)
@@ -223,7 +240,7 @@ public struct ConversationInspectorSection<Content: View, HeaderActions: View>: 
 
     private var titleLabel: some View {
         Label(title, systemImage: systemImage)
-            .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            .font(WorkbenchTypography.font(for: .cardTitle)).foregroundStyle(.secondary)
             .lineLimit(1).truncationMode(.tail)
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityAddTraits(.isHeader)
@@ -304,5 +321,36 @@ public struct ConversationTaskDefinition: View {
                 }
             }
         }
+    }
+}
+
+/// Stable property columns in regular widgets, stacked values in compact ones.
+public struct ConversationDetailPropertyRow<Value: View>: View {
+    @Environment(\.detailWidgetSize) private var widgetSize
+    private let title: String
+    private let value: Value
+
+    public init(_ title: String, @ViewBuilder value: () -> Value) {
+        self.title = title
+        self.value = value()
+    }
+
+    public var body: some View {
+        Group {
+            if widgetSize?.columns == 1 {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).foregroundStyle(.secondary)
+                    value
+                }
+            } else {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(title).foregroundStyle(.secondary)
+                        .frame(width: 64, alignment: .leading)
+                    value.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .font(WorkbenchTypography.font(for: .body))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

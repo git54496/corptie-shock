@@ -15,7 +15,7 @@ final class ChatImageModelTests: XCTestCase {
         }
         let portrait = row(MessageImageGeometry(pixelWidth: 900, pixelHeight: 1600))
         XCTAssertTrue(MacSharedMessageTextCard.supports(portrait))
-        let layout = NativeTimelineLayoutCache.shared.layout(for: portrait, columnWidth: 500)
+        let layout = LegacyTimelineLayoutReference.shared.layout(for: portrait, columnWidth: 500)
         XCTAssertEqual(layout.imageLayout.size, CGSize(width:146.25,height:260))
         let cell = AppKitSharedMessageTextCell(identifier: .init("rich-image"))
         cell.setContent(portrait, availableWidth: 500, onToggleExpansion: { _ in })
@@ -23,7 +23,7 @@ final class ChatImageModelTests: XCTestCase {
         XCTAssertFalse(cell.updateLayoutIfContentUnchanged(row(nil), availableWidth: 500))
     }
     @MainActor func testUserAndModelImageGeometryDrivesBubbleCanvasAndRowHeightTogether() throws {
-        for type in ["userMessage", "imageView"] {
+        for type in ["userMessage", "agentMessage"] {
             let item = try JSONDecoder().decode(CodexThreadItem.self, from: Data("""
                 {"id":"\(type)","turnId":"turn","turnStatus":"complete","type":"\(type)","title":"image","text":"[localImage]",
                  "images":[{"managedPath":"chat-resources/\(type).png","pixelWidth":900,"pixelHeight":1600}]}
@@ -31,7 +31,7 @@ final class ChatImageModelTests: XCTestCase {
             let builder = ConversationNativeRowBuilder(sessionTitle: nil, workingDirectory: nil,
                 allowsFork: false, forkUnavailableReason: nil, imageURL: { _ in nil })
             let row = builder.nativeAppKitRow(.init(kind: .message(item)), expandedTurnIds: [])
-            let layout = NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: 500)
+            let layout = LegacyTimelineLayoutReference.shared.layout(for: row, columnWidth: 500)
             XCTAssertEqual(layout.cardWidth, 166.25, accuracy: 0.01)
             XCTAssertEqual(layout.imageLayout.size, CGSize(width:146.25,height:260))
             XCTAssertEqual(layout.textHeight, 0)
@@ -40,6 +40,8 @@ final class ChatImageModelTests: XCTestCase {
             let cell = AppKitChatNativeTextCell(identifier: .init(type))
             cell.frame = .init(x: 0, y: 0, width: 500, height: layout.rowHeight)
             cell.setContent(row, availableWidth: 500, onToggleExpansion: { _ in })
+            cell.layoutSubtreeIfNeeded()
+            cell.frame.size.height = cell.fittingSize.height
             cell.layoutSubtreeIfNeeded()
             func images(_ view: NSView) -> [NSButton] {
                 view.subviews.flatMap { child -> [NSButton] in
@@ -56,18 +58,22 @@ final class ChatImageModelTests: XCTestCase {
             XCTAssertLessThanOrEqual(button.frame.width, 96)
         }
     }
-    @MainActor func testImageViewUsesSharedMediaRuleWithoutHeaderOrHostPath() throws {
+    @MainActor func testToolImageStaysInProcessWithoutStandaloneGallery() throws {
         let data = Data(#"{"id":"qr","turnId":"turn","turnStatus":"complete","type":"imageView","title":"imageView","text":"/tmp/qr.png","images":[{"managedPath":"chat-resources/qr.png"}]}"#.utf8)
         let item = try JSONDecoder().decode(CodexThreadItem.self, from: data)
-        XCTAssertTrue(item.isStandaloneImage)
         let entries = makeChatDisplayEntries(from: [item])
         XCTAssertEqual(entries.count, 1)
         let builder = ConversationNativeRowBuilder(sessionTitle: nil, workingDirectory: nil,
             allowsFork: false, forkUnavailableReason: nil, imageURL: { _ in URL(fileURLWithPath: "/tmp/qr.png") })
         let row = builder.nativeAppKitRow(try XCTUnwrap(entries.first), expandedTurnIds: [])
-        XCTAssertEqual(row.images.count, 1)
+        XCTAssertTrue(entries.first?.isProcessGroup == true)
+        XCTAssertTrue(row.images.isEmpty)
+        XCTAssertEqual(row.nativeStyle, .process)
         XCTAssertEqual(row.nativeText, "")
         XCTAssertFalse(row.showsHeader)
+        let expanded = builder.nativeAppKitRow(try XCTUnwrap(entries.first), expandedTurnIds: ["turn"])
+        XCTAssertTrue(expanded.images.isEmpty)
+        XCTAssertEqual(expanded.processSteps.count, 1)
     }
 
     @MainActor func testImageCardUsesSharedGalleryHeightAndSuppressesProviderPlaceholder() throws {
@@ -78,7 +84,7 @@ final class ChatImageModelTests: XCTestCase {
         let row = builder.nativeAppKitRow(.init(kind: .message(item)), expandedTurnIds: [])
         XCTAssertEqual(row.images.count, 1)
         XCTAssertEqual(row.nativeText, "")
-        let layout = NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: 400)
+        let layout = LegacyTimelineLayoutReference.shared.layout(for: row, columnWidth: 400)
         XCTAssertEqual(layout.cardWidth, 108)
         XCTAssertGreaterThanOrEqual(layout.rowHeight,
             88 + 20)

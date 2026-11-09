@@ -58,17 +58,6 @@ export class TaskDeletionRepository {
         operation = activeDeletion;
         return;
       }
-      const activeStart = this.selectOne(
-        `SELECT startup_operation_id FROM work_session_startup_operations
-         WHERE task_id=? AND state IN ('allocated','worktree_prepared','session_bound','provider_bound','compensating') LIMIT 1`,
-        [id]
-      );
-      if (activeStart) {
-        const error = new Error("Task is starting. Wait for startup to finish before deletion.");
-        error.code = "TASK_DELETE_BLOCKED";
-        error.statusCode = 409;
-        throw error;
-      }
       const timestamp = createdAtFromOrNow();
       const operationId = `task-deletion:${randomUUID()}`;
       this.db.run(
@@ -90,6 +79,8 @@ export class TaskDeletionRepository {
         ) VALUES (?, ?, ?, 'queued', 'freezing', ?, ?, ?)`,
         [operationId, id, key, JSON.stringify(input), timestamp, timestamp]
       );
+      if (input.actor?.type !== "child_delivery") this.db.run(
+        "UPDATE child_task_delivery_operations SET state='superseded',revision=revision+1 WHERE child_task_id=? AND state IN ('queued','running','waiting','blocked')", [id]);
       operation = this.selectOne(
         "SELECT * FROM task_deletion_operations WHERE operation_id=?", [operationId]
       );
@@ -193,6 +184,10 @@ export class TaskDeletionRepository {
       this.db.run(`UPDATE collaboration_requests SET source_task_id=NULL WHERE source_task_id=?`, [id]);
       this.db.run(`UPDATE collaboration_requests SET target_task_id=NULL WHERE target_task_id=?`, [id]);
       this.db.run(`UPDATE project_integration_runs SET conflict_task_id=NULL WHERE conflict_task_id=?`, [id]);
+      // A retained Worktree remains in the project inventory, but no longer
+      // participates as a live Task delivery. Historical receipts stay intact.
+      this.db.run("DELETE FROM task_delivery_worktrees WHERE task_id=?", [id]);
+      if (item.parent_task_id) this.db.run("UPDATE tasks SET hierarchy_revision=hierarchy_revision+1 WHERE id=?", [item.parent_task_id]);
       // Completion, cancellation, startup, and repair records are immutable
       // audit evidence with RESTRICT references to the Task identity. A
       // user-visible deletion therefore retires the live resource while

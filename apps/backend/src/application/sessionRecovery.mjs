@@ -1,3 +1,4 @@
+import { logError } from "../utils/errorDiagnostics.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import {
   buildSessionRecoveryHandoffSource,
@@ -386,11 +387,6 @@ function recoveryHandoffEntries({ attempt, visible, handoff, tailCount }) {
     .filter((entry, index, array) => index === 0 || entry.sequence !== array[index - 1].sequence);
 }
 
-function recoveryHandoffCharacterBudget(maxContextTokens) {
-  if (!Number.isInteger(maxContextTokens) || maxContextTokens <= 0) return 64_000;
-  return Math.min(120_000, Math.max(24_000, Math.floor(maxContextTokens * 0.8)));
-}
-
 export class SessionRecoveryCoordinator {
   constructor({ store, providerPort, resolveProviderDescriptor, compressHandoff = null, clock = () => new Date(), observe = () => {} }) {
     if (!store?.freezeSessionRecoveryAttempt
@@ -444,6 +440,7 @@ export class SessionRecoveryCoordinator {
     try {
       return await this.#recover(input);
     } catch (cause) {
+      logError("session-recovery.prepare", cause, { logicalSessionId: input?.logicalSessionId, stage: "prepare" });
       const error = mapSessionRecoveryError(cause);
       // Message-triggered recovery starts only after the Provider operation
       // proved that no command was sent. Keep that dispatch fact so a failed
@@ -459,7 +456,8 @@ export class SessionRecoveryCoordinator {
           const persisted = recoveryPersistence(error);
           this.store.failSessionRecoveryAttempt(attempt.attemptId, persisted.code, persisted.message);
         }
-      } catch {
+      } catch (reportError) {
+        logError("session-recovery.failure-persistence", reportError, { logicalSessionId: input?.logicalSessionId, stage: "failure-persistence" });
         // Error reporting must never replace the stable business error with a
         // database or Adapter implementation detail.
       }
@@ -507,9 +505,7 @@ export class SessionRecoveryCoordinator {
     let plan = planReplay({ attempt, timelineEvents, capabilities, thresholds });
     if (plan.strategy === "handoff_only" && this.compressHandoff && input.compressHandoff !== false) {
       const sourceEntries = replayEntriesFromTimeline(timelineEvents);
-      const source = buildSessionRecoveryHandoffSource(sourceEntries, {
-        characterBudget: recoveryHandoffCharacterBudget(capabilities.maxContextTokens)
-      });
+      const source = buildSessionRecoveryHandoffSource(sourceEntries);
       try {
         const handoff = normalizeSessionRecoveryHandoff(await this.compressHandoff({ attempt, source }));
         plan = planReplay({
@@ -612,8 +608,11 @@ export class SessionRecoveryCoordinator {
       }
       return committed;
     } catch (cause) {
+      logError("session-recovery.execute", cause, { attemptId: attempt.attemptId, stage: "recover" });
       if (!committed && replacement) {
-        await this.providerPort.cancelReplacement({ attempt, replacement, cause }).catch(() => {});
+        await this.providerPort.cancelReplacement({ attempt, replacement, cause }).catch((error) => {
+          logError("session-recovery.compensate", error, { attemptId: attempt.attemptId, stage: "cancel-replacement" });
+        });
       }
       const error = mapSessionRecoveryError(cause);
       const persisted = recoveryPersistence(error);
@@ -629,7 +628,9 @@ export class SessionRecoveryCoordinator {
 
   async cancel(attemptId) {
     const attempt = this.store.requestSessionRecoveryCancellation(attemptId);
-    if (attempt?.replacement) await this.providerPort.cancelReplacement({ attempt, replacement: attempt.replacement }).catch(() => {});
+    if (attempt?.replacement) await this.providerPort.cancelReplacement({ attempt, replacement: attempt.replacement }).catch((error) => {
+      logError("session-recovery.cancel", error, { attemptId, stage: "cancel-replacement" });
+    });
     return this.store.cancelSessionRecoveryAttempt(attemptId);
   }
 

@@ -158,19 +158,20 @@ struct WarRoomView: View {
                     deletionNotice = CorptieTaskDeletionNotice(
                         phase: .guidance,
                         message: L10nFormat(
-                            "CorptieTask 未删除。请先在项目 Worktree 管理中将分支 %@ 合并到目标主分支，确认无待提交文件后再重试删除。",
+                            presentation.plan.parentTaskId == nil
+                                ? "CorptieTask 未删除。请先在项目 Worktree 管理中将分支 %@ 合并到目标主分支，确认无待提交文件后再重试删除。"
+                                : "子任务未删除。可在 Worktree 管理中将分支 %@ 合并到父分支，或重新选择强制删除。",
                             presentation.plan.worktree?.branchName ?? ""
                         ),
                         retryItem: presentation.task
                     )
                 },
-                onDelete: { force, branch, deleteWorktree, artifactDisposition in
+                onDelete: { force, deleteWorktree, artifactDisposition, options in
                     enqueueDeletion(
                         presentation.task,
                         force: force,
-                        confirmedBranchName: branch,
                         deleteWorktree: deleteWorktree,
-                        artifactDisposition: artifactDisposition
+                        artifactDisposition: artifactDisposition, options: options
                     )
                 }
             )
@@ -350,7 +351,7 @@ struct WarRoomView: View {
             let owningWork = client.works.first(where: { $0.id == task.workId })
             CorptieTaskDetailView(
                 task: task,
-                contributorAgentIds: owningWork?.contributorAgentIds ?? [],
+                contributorRoleIds: owningWork?.contributorRoleIds ?? [],
                 isDeletionPending: pendingDeletionIds.contains(task.id),
                 onRequestDeletion: { Task { await prepareDeletion(task) } },
                 onRequestReload: { tasksReloadToken &+= 1 }
@@ -458,9 +459,9 @@ struct WarRoomView: View {
     private func enqueueDeletion(
         _ task: CorptieTask,
         force: Bool,
-        confirmedBranchName: String?,
         deleteWorktree: Bool,
-        artifactDisposition: CorptieTaskArtifactDisposition
+        artifactDisposition: CorptieTaskArtifactDisposition,
+        options: ClientTaskDeletionOptions
     ) {
         guard !deletingCorptieTaskIds.contains(task.id) else { return }
 
@@ -474,9 +475,8 @@ struct WarRoomView: View {
             let deleted = await client.deleteCorptieTask(
                 taskId: task.id,
                 force: force,
-                confirmedBranchName: confirmedBranchName,
                 deleteWorktree: deleteWorktree,
-                artifactDisposition: artifactDisposition
+                artifactDisposition: artifactDisposition, options: options
             )
             deletingCorptieTaskIds.remove(task.id)
 

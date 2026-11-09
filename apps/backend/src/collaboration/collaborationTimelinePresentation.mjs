@@ -3,13 +3,15 @@ import { collaborationWorkPresentation } from "./collaborationWorkPresentation.m
 import { collaborationEnvelopeFailure } from "../utils/sessionEventPresentation.mjs";
 import { userMessageStatusForAgentWork } from "../utils/agentWorkQueue.mjs";
 import { userMessageDeletionEligibility } from "../application/userMessageDeletion.mjs";
+import { isMailboxOperation } from "../application/mailboxTimelinePolicy.mjs";
 
 // Read-only presentation: event publishing and delivery execution stay with their owners.
 export function createCollaborationTimelinePresentation({ store, collaborationCore, sessionChannelService }) {
   function agentWorkTimelineItem(task, sessionId, queuePosition = null) {
-    if (!task?.taskId || task.source?.deleted === true) return null;
+    if (isMailboxOperation(task)) return null;
+    if (!task?.taskId || task.source?.deleted === true || task.source?.batchedInto || task.source?.mailboxDisposition) return null;
     const presentation = collaborationPresentationForTask(task, sessionId);
-    const userMessageStatus = userMessageStatusForAgentWork(task.status);
+    const userMessageStatus = userMessageStatusForAgentWork(task.status, task.targetTurnId ?? null);
     const canonicalId = task.kind === "user"
       ? (task.source?.messageId ?? task.taskId)
       : `work:${task.taskId}`;
@@ -223,7 +225,7 @@ export function createCollaborationTimelinePresentation({ store, collaborationCo
       });
       return {
         presentationRole: "collaboration",
-        presentationText: envelope.message.body,
+        presentationText: task.source?.batchId ? task.source.presentationText : envelope.message.body,
         collaborationDirection: "inbound",
         collaborationSenderAgentId: envelope.message.senderAgentId,
         collaborationSenderName: envelope.message.senderAgentName,

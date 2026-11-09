@@ -35,6 +35,14 @@ export function createCollaborationHttpRoutes({
       },
       onChannelRequestResolved: resolveSessionChannelRequest,
       onChannelMessageCreated: async (result) => {
+        if (["parent_child_policy", "first_message_confirmation_disabled"].includes(result.routeAuthorization) && result.requestId) {
+          const resolved = sessionChannelService.getRequest(result.requestId);
+          if (resolved?.status === "confirmed") emitEvent("SessionChannelRequestResolved", {
+            sessionId: resolved.requestingSessionId, request: resolved
+          }, { sessionId: resolved.requestingSessionId,
+            eventId: `session-channel-policy-resolved:${resolved.requestId}`,
+            source: { type: result.routeAuthorization } });
+        }
         projectSessionChannelMessageForSender(result);
         await syncSessionChannelDeliveriesIntoAgentWorkQueue();
       },
@@ -47,8 +55,8 @@ export function createCollaborationHttpRoutes({
         arguments: args,
         metadata
       }),
-      onSearchSkills: (agentId, intent) => skillRegistryService.searchForAgent(agentId, intent),
-      onLoadSkill: (agentId, skillId) => skillRegistryService.loadForAgent(agentId, skillId),
+      onSearchSkills: (agentId, intent, metadata) => skillRegistryService.searchForAgent(agentId, intent, metadata?.sessionId),
+      onLoadSkill: (agentId, skillId, metadata) => skillRegistryService.loadForAgent(agentId, skillId, metadata?.sessionId),
       onReportTaskAcceptance: reportTaskAcceptanceForAgent
     })) {
       return true;

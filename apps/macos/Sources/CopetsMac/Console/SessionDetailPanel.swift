@@ -21,6 +21,9 @@ struct SessionDetailPanel: View {
     @State private var contextReferences: [SessionContextReference] = []
     @State private var isLoadingContextReferences = false
     @State private var displayValues = SessionDetailPanelValues()
+    @State private var focusTaskSource: [CorptieTask] = []
+    @State private var focusWorkID: String?
+    @State private var focusTasks: [ConversationFocusTask] = []
     @State private var pendingProviderId: String?
     @State private var showProviderSwitchConfirmation = false
     @State private var isSwitchingProvider = false
@@ -29,7 +32,7 @@ struct SessionDetailPanel: View {
     @State private var providerCatalogLoadFailed = false
     @State private var showsAllContextReferences = false
     private enum DetailNativeSheet: Identifiable {
-        case artifact(WorkArtifact), task(CorptieTask), provider(String), worktree(String), work(Work), agent(Agent)
+        case artifact(WorkArtifact), task(CorptieTask), provider(String), worktree(String), work(Work), agent(Role)
         var id: String {
             switch self {
             case .artifact(let value): "artifact:\(value.artifactId)"
@@ -37,7 +40,7 @@ struct SessionDetailPanel: View {
             case .provider(let id): "provider:\(id)"
             case .worktree(let id): "worktree:\(id)"
             case .work(let value): "work:\(value.id)"
-            case .agent(let value): "agent:\(value.agentId)"
+            case .agent(let value): "agent:\(value.roleId)"
             }
         }
     }
@@ -48,12 +51,45 @@ struct SessionDetailPanel: View {
     @State private var nativeManagementExpanded = false
 
     private func updateDisplayValues() {
-        let value = SessionDetailPanelValues(tasks: entityClient.tasks, works: entityClient.works,
-            agents: entityClient.agents, providers: modelCatalog.agentProviders,
-            models: modelCatalog.models(for: session.external?.provider),
-            defaultReasoning: modelCatalog.defaultReasoning(for: session.external?.provider),
-            isSwitchingModel: backendClient.isSwitchingModel, isSwitchingReasoning: backendClient.isSwitchingReasoning)
+        updateEntityDisplayValues()
+        updateModelDisplayValues()
+        updateCommandDisplayValues()
+    }
+    private func updateEntityDisplayValues() {
+        var value = displayValues
+        value.tasks = entityClient.tasks
+        value.works = entityClient.works
+        value.roles = entityClient.roles
+        let relevantTasks = value.tasks.filter {
+            $0.workId == session.workId && $0.archived != true && $0.deletionStatus == nil && $0.lifecycleState != "done"
+        }
         if displayValues != value { displayValues = value }
+        if focusTaskSource != relevantTasks || focusWorkID != session.workId {
+            focusWorkID = session.workId
+            focusTaskSource = relevantTasks
+            focusTasks = relevantTasks.sorted {
+                if $0.summaryNeedsIntervention != $1.summaryNeedsIntervention { return $0.summaryNeedsIntervention }
+                return $0.updatedAt > $1.updatedAt
+            }.prefix(3).map {
+                ConversationFocusTask(id: $0.id, title: $0.title, sessionID: $0.currentSessionId, summary: $0.conversationDetailSummary)
+            }
+        }
+    }
+    private func updateModelDisplayValues() {
+        let provider = session.external?.provider
+        let providers = modelCatalog.agentProviders
+        let models = modelCatalog.models(for: provider)
+        let reasoning = modelCatalog.defaultReasoning(for: provider)
+        if displayValues.providers != providers { displayValues.providers = providers }
+        if displayValues.models != models { displayValues.models = models }
+        if displayValues.defaultReasoning != reasoning { displayValues.defaultReasoning = reasoning }
+    }
+    private func updateCommandDisplayValues() {
+        // Sending/command notifications must never read or filter entity arrays.
+        let model = backendClient.isSwitchingModel
+        let reasoning = backendClient.isSwitchingReasoning
+        if displayValues.isSwitchingModel != model { displayValues.isSwitchingModel = model }
+        if displayValues.isSwitchingReasoning != reasoning { displayValues.isSwitchingReasoning = reasoning }
     }
     private func restoreOwnedReferences() {
         let source = backendClient.supplementaryDataController
@@ -119,25 +155,25 @@ struct SessionDetailPanel: View {
             guard !Task.isCancelled, allows(generation) else { return }
             await loadProviderCatalogIfNeeded()
         }
-        .onReceive(backendClient.supplementaryDataController.$selectedContextReferences) { references in
+        .onReceive(backendClient.supplementaryDataController.$selectedContextReferences.whilePresented(isPresentationActive)) { references in
             guard isPresentationActive, backendClient.supplementaryDataController.contextReferencesSessionID == session.id else { return }
             let owned = references.filter { $0.ownerSessionId == session.id || $0.ownerSessionId == session.external?.logicalSessionId }
             if contextReferences != owned { contextReferences = owned }
         }
-        .onReceive(backendClient.supplementaryDataController.$isLoadingContextReferences) { isLoading in
+        .onReceive(backendClient.supplementaryDataController.$isLoadingContextReferences.whilePresented(isPresentationActive)) { isLoading in
             if isPresentationActive && backendClient.selectedSession?.id == session.id { isLoadingContextReferences = isLoading }
         }
-        .onReceive(modelCatalog.objectWillChange.receive(on: DispatchQueue.main)) { _ in
+        .onReceive(modelCatalog.objectWillChange.receive(on: DispatchQueue.main).whilePresented(isPresentationActive)) { _ in
             guard isPresentationActive else { return }
-            updateDisplayValues()
+            updateModelDisplayValues()
         }
-        .onReceive(entityClient.sessionGroupingDidChange) { _ in
+        .onReceive(entityClient.sessionGroupingDidChange.whilePresented(isPresentationActive)) { _ in
             guard isPresentationActive else { return }
-            updateDisplayValues()
+            updateEntityDisplayValues()
         }
-        .onReceive(backendClient.sessionCommandController.objectWillChange.receive(on: DispatchQueue.main)) { _ in
+        .onReceive(backendClient.sessionCommandController.objectWillChange.receive(on: DispatchQueue.main).whilePresented(isPresentationActive)) { _ in
             guard isPresentationActive else { return }
-            updateDisplayValues()
+            updateCommandDisplayValues()
         }
         .sheet(item: $contextReferenceAddMode) { mode in
             let generation = detailOpeningGeneration
@@ -152,7 +188,7 @@ struct SessionDetailPanel: View {
             case .task(let task):
                 CorptieTaskEditView(task: task) { }
             case .work(let work): WorkDetailView(work: work)
-            case .agent(let agent): AgentDetailView(agent: agent).environmentObject(AppTabRouter.shared)
+            case .agent(let agent): RoleDetailView(agent: agent).environmentObject(AppTabRouter.shared)
             case .provider:
                 VStack(alignment: .leading, spacing: 12) {
                     Text(L10n("Provider 管理")).font(.headline)
@@ -175,15 +211,18 @@ struct SessionDetailPanel: View {
                                 OperationNotificationManager.shared.track(jobID: job.id, resourceName: "Worktree")
                                 if let notification = job.notification { OperationNotificationManager.shared.observe(notification) }
                             }
-                        }, localize: { L10n($0) })
+                        }, localize: { L10n($0) },openParent:{ id in
+                            guard isPresentationActive,let target=residentDetailSessionID(id) else { return }
+                            AppTabRouter.shared.openSession(target,source:.userSelection)
+                        })
                     Button(L10n("关闭")) { detailNativeSheet = nil }
                 }.padding(20).frame(minWidth: 360)
             }
         }
         .onChange(of: session.id) { _, _ in richDetailReady = nil; nativeManagementExpanded = false; retireDetailDestination() }
         .onChange(of: session.taskId) { _, _ in retireDetailDestination() }
-        .onChange(of: session.workId) { _, _ in retireDetailDestination() }
-        .onChange(of: session.external?.provider) { _, _ in retireDetailDestination() }
+        .onChange(of: session.workId) { _, _ in updateDisplayValues(); retireDetailDestination() }
+        .onChange(of: session.external?.provider) { _, _ in updateModelDisplayValues(); retireDetailDestination() }
         .onChange(of: isPresentationActive) { _, active in if !active { retireDetailDestination() } }
         .onDisappear { retireDetailDestination() }
         .alert(L10n("切换 Provider？"), isPresented: Binding(
@@ -197,8 +236,16 @@ struct SessionDetailPanel: View {
     }
 
     private var sessionCard: some View {
-        ConversationDetailDashboard {
+        ConversationDetailDashboard(fixedContentWidth: railWidth - 24) {
             sessionDetailContent
+            if isPresentationActive {
+                SessionAbilityPanel(sessionID: session.id, logicalSessionID: session.external?.logicalSessionId)
+                    .modifier(ConversationDetailModuleSurface())
+            }
+            if let taskID = session.taskId {
+                TaskExecutionChecklistDetailCard(taskID: taskID, width: railWidth - 28,
+                    active: isPresentationActive)
+            }
         }
     }
 
@@ -265,7 +312,11 @@ struct SessionDetailPanel: View {
             }, resident: .init(taskTitle: task?.title ?? "", workName: work?.name ?? "", workDescription: work?.description ?? ""),
             referenceManagement: .init(addKinds: ConversationReferenceAddKind.allCases, canAdd: canManageReferences,
                 add: beginAddingReference, operations: referenceOperations, perform: performReferenceOperation),
-            openArtifact: { guard isPresentationActive else { return }; AppTabRouter.shared.openResource($0) })
+            openArtifact: { guard isPresentationActive else { return }; AppTabRouter.shared.openResource($0) },
+            openSession: { id in
+                guard isPresentationActive,let target=residentDetailSessionID(id) else { return }
+                AppTabRouter.shared.openSession(target,source:.userSelection)
+            })
     }
     private var canManageReferences: Bool {
         guard isPresentationActive, activity?.allows(generation: activity?.generation ?? 0) ?? true,
@@ -315,8 +366,8 @@ struct SessionDetailPanel: View {
                 if let value = backendClient.appState.task(reference.targetId ?? "") { detailNativeSheet = .task(value) }
                 else { AppTabRouter.shared.navigationError = "Task 暂不可用，请先刷新资源列表" }
             case .agent:
-                if let value = displayValues.agents.first(where: { $0.agentId == reference.targetId }) { detailNativeSheet = .agent(value) }
-                else { AppTabRouter.shared.navigationError = "Agent 暂不可用，请先刷新资源列表" }
+                if let value = displayValues.roles.first(where: { $0.roleId == reference.targetId }) { detailNativeSheet = .agent(value) }
+                else { AppTabRouter.shared.navigationError = "角色暂不可用，请先刷新资源列表" }
             case .session:
                 if let target = reference.targetId, let resolved = residentDetailSessionID(target) {
                     AppTabRouter.shared.openSession(resolved, source: .userSelection)
@@ -395,7 +446,10 @@ struct SessionDetailPanel: View {
                         OperationNotificationManager.shared.track(jobID: job.id, resourceName: "Worktree")
                         if let notification = job.notification { OperationNotificationManager.shared.observe(notification) }
                     }
-                }, localize: { L10n($0) })
+                }, localize: { L10n($0) },openParent:{ id in
+                    guard isPresentationActive,let target=residentDetailSessionID(id) else { return }
+                    AppTabRouter.shared.openSession(target,source:.userSelection)
+                })
                 .id(session.id)
 
             if detailKind == .workDetail,
@@ -550,19 +604,6 @@ struct SessionDetailPanel: View {
     private var workDetailContent: some View {
         if let work = displayValues.works.first(where: { $0.id == session.workId }) {
             ConversationWorkOverviewCard(description: work.description)
-            let relevantTasks = displayValues.tasks.filter {
-                $0.workId == work.id && $0.archived != true && $0.deletionStatus == nil
-                    && $0.lifecycleState != "done"
-            }.sorted {
-                if $0.summaryNeedsIntervention != $1.summaryNeedsIntervention {
-                    return $0.summaryNeedsIntervention
-                }
-                return $0.updatedAt > $1.updatedAt
-            }
-            let focusTasks = relevantTasks.prefix(3).map { task in
-                ConversationFocusTask(id: task.id, title: task.title,
-                    sessionID: task.currentSessionId, summary: task.conversationDetailSummary)
-            }
             ConversationFocusTasksCard(tasks: focusTasks) { taskID, sessionID in
                 AppTabRouter.shared.openTaskSession(taskId: taskID, sessionId: sessionID, source: .userSelection)
             }
@@ -599,7 +640,7 @@ struct SessionDetailPanel: View {
                     Divider()
                     Button("Work…", systemImage: "scope") { contextReferenceAddMode = .work }
                     Button("CorptieTask…", systemImage: "checklist") { contextReferenceAddMode = .task }
-                    Button("Agent…", systemImage: "person.2") { contextReferenceAddMode = .agent }
+                    Button("Role…", systemImage: "person.2") { contextReferenceAddMode = .agent }
                     Button("其他会话…", systemImage: "bubble.left.and.bubble.right") { contextReferenceAddMode = .session }
             } label: { ConversationDetailHeaderIcon(systemName: "plus") }
             .menuStyle(.borderlessButton)
@@ -854,7 +895,7 @@ struct SessionDetailPanel: View {
     }
 
     private var runtimeFields: [(String, String)] {
-        var fields = [("Agent", agentDisplayName)]
+        var fields = [("Role", agentDisplayName)]
         if let cwd = session.external?.cwd, !cwd.isEmpty {
             fields.append(("工作空间", compactPath(cwd)))
         }
@@ -862,12 +903,12 @@ struct SessionDetailPanel: View {
     }
 
     private var agentDisplayName: String {
-        sessionAgentDisplayName(session: session, agents: displayValues.agents)
+        sessionAgentDisplayName(session: session, roles: displayValues.roles)
     }
 
-    private var assistantAgent: Agent? {
-        guard let agentId = session.agentId else { return nil }
-        return displayValues.agents.first { $0.agentId == agentId }
+    private var assistantAgent: Role? {
+        guard let roleId = session.roleId else { return nil }
+        return displayValues.roles.first { $0.roleId == roleId }
     }
 
     private var friendlyUpdatedAt: String {
@@ -893,7 +934,7 @@ struct SessionDetailPanel: View {
 private struct SessionDetailPanelValues: Equatable {
     var tasks: [CorptieTask] = []
     var works: [Work] = []
-    var agents: [Agent] = []
+    var roles: [Role] = []
     var providers: [AgentProviderDescriptor] = []
     var models: [CodexModel] = []
     var defaultReasoning: String?

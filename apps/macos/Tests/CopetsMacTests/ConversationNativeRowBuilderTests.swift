@@ -8,6 +8,73 @@ import CorptieConversation
 
 @MainActor
 final class ConversationNativeRowBuilderTests: XCTestCase {
+    func testChildResultsAndScheduledTriggersUseSpecialCardsInBothSkins() throws {
+        let summary = "收到 1 个子任务的执行结果。\n\n子任务 1 · 已完成\n实现完成"
+        let notice = try item(["id": "mailbox-event:result", "type": "userMessage", "presentationRole": "system_event",
+            "systemEventKind": "child_task_result", "systemEventSource": "task_coordination",
+            "text": "private control preamble and JSON", "presentationText": summary])
+        let row = builder().nativeAppKitRow(.init(kind: .message(notice)), expandedTurnIds: [])
+        XCTAssertEqual(row.nativeStyle, .agent)
+        XCTAssertEqual(row.contentSurfaceRole, .interaction)
+        XCTAssertEqual(row.title, ConversationEventText(languageCode: AppLanguageController.shared.languageCode).systemKind("child_task_result"))
+        XCTAssertTrue(row.showsHeader)
+        XCTAssertNil(row.messageStatus)
+        XCTAssertEqual(row.copyText, summary)
+        XCTAssertFalse(row.nativeText.contains("private control"))
+        XCTAssertFalse(row.nativeText.contains(ConversationEventText(languageCode: AppLanguageController.shared.languageCode).systemNotice))
+        for skin in [ConversationSkin.classic, .codexFlat] {
+            XCTAssertLessThanOrEqual(LegacyTimelineLayoutReference.shared.layout(for: row, columnWidth: 1000, skin: skin).cardWidth, 480)
+        }
+        let trigger = try item(["id": "trigger", "type": "userMessage", "presentationRole": "automation",
+            "messageOrigin": "scheduled_task", "automationName": "定时检查", "automationRunId": "run:one",
+            "automationRunStatus": "queued", "text": String(repeating: "完整触发消息。", count: 100)])
+        let triggerRow = builder().nativeAppKitRow(.init(kind: .message(trigger)), expandedTurnIds: [])
+        XCTAssertEqual(triggerRow.nativeStyle, .agent)
+        XCTAssertEqual(triggerRow.contentSurfaceRole, .interaction)
+        XCTAssertNotNil(triggerRow.scheduledTrigger)
+        XCTAssertFalse(triggerRow.scheduledTrigger?.isExpanded ?? true)
+        XCTAssertNil(triggerRow.messageStatus)
+    }
+
+    func testAuthoritativeProcessingRendersACollapsedProcessBeforeFirstProviderItem() throws {
+        _ = NSApplication.shared
+        let user = try item(["id": "early-user", "type": "userMessage", "presentationRole": NSNull(),
+            "turnId": "turn:early", "turnStatus": "processing", "userMessageStatus": "processing"])
+        let projected = ConversationReplyProgressProjection.entries(makeChatDisplayEntries(from: [user]))
+        let entry = try XCTUnwrap(projected.last)
+        let waiting = builder().nativeAppKitRow(entry, expandedTurnIds: [])
+        XCTAssertEqual(waiting.id, "process:turn:early")
+        XCTAssertEqual(waiting.processCount, 0)
+        XCTAssertEqual(waiting.processState, .running)
+        XCTAssertFalse(waiting.isExpanded)
+        XCTAssertTrue(waiting.processSummaryText(languageCode: "zh").contains("处理中"))
+        XCTAssertTrue(MacSharedMessageTextCard.supportsProcess(waiting))
+        let snapshotUser = try item(["id": "early-user", "type": "userMessage", "presentationRole": NSNull(),
+            "turnId": "turn:early", "turnStatus": "inProgress", "status": "processing"])
+        let snapshotEntries = ConversationReplyProgressProjection.entries(makeChatDisplayEntries(from: [snapshotUser]))
+        let snapshotRow = builder().nativeAppKitRow(try XCTUnwrap(snapshotEntries.last), expandedTurnIds: [])
+        XCTAssertEqual(snapshotRow.id, waiting.id)
+        XCTAssertEqual(snapshotRow.processState, .running)
+        XCTAssertEqual(snapshotRow.processCount, 0)
+        for skin in [ConversationSkin.classic, .codexFlat] {
+            let layout = LegacyTimelineLayoutReference.shared.layout(for: waiting, columnWidth: 600, skin: skin)
+            XCTAssertGreaterThan(layout.rowHeight, 0)
+            let cell = AppKitSharedMessageTextCell(identifier: .init("early-process"))
+            cell.frame = .init(x: 0, y: 0, width: 600, height: layout.rowHeight)
+            cell.updateAppearance(skin: skin)
+            cell.setContent(waiting, availableWidth: 600, onToggleExpansion: { _ in })
+            cell.layoutSubtreeIfNeeded()
+            XCTAssertFalse(cell.subviews.isEmpty)
+        }
+        let step = try item(["id": "first-tool", "type": "mcpToolCall", "presentationRole": NSNull(),
+            "turnId": "turn:early", "turnStatus": "inProgress"])
+        let populated = ConversationReplyProgressProjection.entries(makeChatDisplayEntries(from: [user, step]))
+        let working = builder().nativeAppKitRow(try XCTUnwrap(populated.last), expandedTurnIds: [])
+        XCTAssertEqual(working.id, waiting.id)
+        XCTAssertEqual(working.processCount, 1)
+        XCTAssertNotEqual(working.contentRevision, waiting.contentRevision)
+    }
+
     func testScheduledTriggerPreviewsThreeVisualLinesAndExpandsWithoutTruncatingCopy() throws {
         let message = (0..<30).map { "Trigger line \($0): " + String(repeating: "完整任务内容 **literal** ", count: 8) }.joined(separator: "\n")
         let entry = ChatDisplayEntry(kind: .message(try item(["id": "scheduled-preview", "type": "automationEvent",
@@ -21,19 +88,19 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         let expanded = builder().nativeAppKitRow(entry, expandedTurnIds: [id])
         XCTAssertNotEqual(expanded.contentRevision, collapsed.contentRevision)
         for width: CGFloat in [320, 1000, 2400] {
-            let preview = NativeTimelineLayoutCache.shared.layout(for: collapsed, columnWidth: width)
-            let full = NativeTimelineLayoutCache.shared.layout(for: expanded, columnWidth: width)
-            XCTAssertEqual(preview.cardWidth, min(480, width - 4))
+            let preview = LegacyTimelineLayoutReference.shared.layout(for: collapsed, columnWidth: width)
+            let full = LegacyTimelineLayoutReference.shared.layout(for: expanded, columnWidth: width)
+            XCTAssertEqual(preview.cardWidth, min(480, width - 14))
             XCTAssertTrue(preview.triggerCanExpand)
             XCTAssertEqual(preview.triggerTextHeight, NativeTextKitLayout.height(of: try XCTUnwrap(preview.triggerText),
                 width: preview.cardWidth - 20, maximumLines: 3))
             XCTAssertGreaterThan(full.rowHeight, preview.rowHeight)
             XCTAssertEqual(full.triggerText?.string, message)
             XCTAssertTrue(preview.attributedText === full.attributedText)
-            XCTAssertEqual(NativeTimelineLayoutCache.shared.layout(for: collapsed, columnWidth: width).rowHeight, preview.rowHeight)
+            XCTAssertEqual(LegacyTimelineLayoutReference.shared.layout(for: collapsed, columnWidth: width).rowHeight, preview.rowHeight)
         }
         _ = NSApplication.shared
-        let layout = NativeTimelineLayoutCache.shared.layout(for: collapsed, columnWidth: 1000)
+        let layout = LegacyTimelineLayoutReference.shared.layout(for: collapsed, columnWidth: 1000)
         let cell = AppKitSharedMessageTextCell(identifier: .init("scheduled-preview"))
         cell.frame = .init(x: 0, y: 0, width: 1000, height: layout.rowHeight)
         var toggled: String?
@@ -52,7 +119,7 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         let short = ChatDisplayEntry(kind: .message(try item(["id": "short-scheduled", "type": "automationEvent",
             "presentationRole": "automation", "text": "Short trigger"])))
         let shortRow = builder().nativeAppKitRow(short, expandedTurnIds: [])
-        XCTAssertFalse(NativeTimelineLayoutCache.shared.layout(for: shortRow, columnWidth: 1000).triggerCanExpand)
+        XCTAssertFalse(LegacyTimelineLayoutReference.shared.layout(for: shortRow, columnWidth: 1000).triggerCanExpand)
     }
 
     func testFunctionalCardsStayCompactWhileReplyDocumentsUseTheWideLane() {
@@ -62,9 +129,9 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         let card = AppKitChatTimelineRow(id: "functional-card", contentRevision: 0, nativeText: text, copyText: text,
             nativeStyle: .agent, title: "Event", metadata: "", expandableTurnId: nil, isExpanded: false, showsHeader: true)
         for typography in [ConversationTypography.classic, .codexReading] {
-            XCTAssertEqual(NativeTimelineLayoutCache.shared.layout(for: document, columnWidth: 1600, typography: typography).cardWidth, 1596)
-            XCTAssertEqual(NativeTimelineLayoutCache.shared.layout(for: card, columnWidth: 1600, typography: typography).cardWidth, 480)
-            XCTAssertEqual(NativeTimelineLayoutCache.shared.layout(for: card, columnWidth: 320, typography: typography).cardWidth, 316)
+            XCTAssertEqual(LegacyTimelineLayoutReference.shared.layout(for: document, columnWidth: 1600, typography: typography).cardWidth, 1586)
+            XCTAssertEqual(LegacyTimelineLayoutReference.shared.layout(for: card, columnWidth: 1600, typography: typography).cardWidth, 480)
+            XCTAssertEqual(LegacyTimelineLayoutReference.shared.layout(for: card, columnWidth: 320, typography: typography).cardWidth, 306)
         }
     }
 
@@ -82,8 +149,8 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         let running = builder().nativeAppKitRow(projected[0], expandedTurnIds: [])
         XCTAssertEqual(running.processState, .running)
         let start = try XCTUnwrap(running.processStartedAt)
-        XCTAssertTrue(running.processSummaryText(now: start.addingTimeInterval(5), advancing: true, languageCode: "en").contains("5.00s"))
-        XCTAssertTrue(running.processSummaryText(now: start.addingTimeInterval(6), advancing: true, languageCode: "en").contains("6.00s"))
+        XCTAssertTrue(running.processSummaryText(now: start.addingTimeInterval(5), advancing: true, languageCode: "en").contains("Working for 5s"))
+        XCTAssertTrue(running.processSummaryText(now: start.addingTimeInterval(6), advancing: true, languageCode: "en").contains("Working for 6s"))
         guard case .process(_, let source) = projected[0].kind else { return XCTFail("Missing aggregate") }
         XCTAssertEqual(source[0].processEndedAt, first.processEndedAt)
         let again = ConversationReplyProgressProjection.entries(projected)
@@ -160,8 +227,8 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         ] {
             let model = builder().nativeAppKitRow(.init(kind: .message(try item(fields))), expandedTurnIds: [])
             XCTAssertEqual(model.contentSurfaceRole, .interaction)
-            let classic = NativeTimelineLayoutCache.shared.layout(for: model, columnWidth: 640, typography: .classic)
-            let codex = NativeTimelineLayoutCache.shared.layout(for: model, columnWidth: 640, typography: .codexReading)
+            let classic = LegacyTimelineLayoutReference.shared.layout(for: model, columnWidth: 640, typography: .classic)
+            let codex = LegacyTimelineLayoutReference.shared.layout(for: model, columnWidth: 640, typography: .codexReading)
             XCTAssertEqual(codex.typography, .classic)
             XCTAssertEqual(codex.rowHeight, classic.rowHeight)
             XCTAssertEqual(codex.cardWidth, classic.cardWidth)
@@ -171,7 +238,7 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
 
     func testAgentIdentityAppearsOncePerReplyAndSkipsSpecialMessages() throws {
         var projection = builder()
-        let identity = ConversationReplyIdentity(agentID: "agent:one", name: "Developer", avatarPath: nil)
+        let identity = ConversationReplyIdentity(roleID: "agent:one", name: "Developer", avatarPath: nil)
         projection.replyIdentity = identity
         let entries: [ChatDisplayEntry] = [
             .init(kind: .message(try item(["id": "u1", "type": "userMessage", "presentationRole": NSNull()]))),
@@ -189,8 +256,8 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         XCTAssertEqual(rows[2].replyIdentity, identity)
         XCTAssertEqual(rows.map(\.id), base.map(\.id))
         for index in [2, 7] {
-            let original = NativeTimelineLayoutCache.shared.layout(for: base[index], columnWidth: 640)
-            let decorated = NativeTimelineLayoutCache.shared.layout(for: rows[index], columnWidth: 640)
+            let original = LegacyTimelineLayoutReference.shared.layout(for: base[index], columnWidth: 640)
+            let decorated = LegacyTimelineLayoutReference.shared.layout(for: rows[index], columnWidth: 640)
             XCTAssertEqual(decorated.rowHeight, original.rowHeight + 44)
             XCTAssertEqual(decorated.cardHeight, original.cardHeight)
             XCTAssertEqual(decorated.cardWidth, original.cardWidth)
@@ -203,7 +270,7 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
 
     func testReplyIdentityMovesToEarlierContentWhenHistoryIsPrepended() throws {
         var projection = builder()
-        projection.replyIdentity = .init(agentID: "agent:one", name: "Developer", avatarPath: nil)
+        projection.replyIdentity = .init(roleID: "agent:one", name: "Developer", avatarPath: nil)
         let final = ChatDisplayEntry(kind: .message(try item(["id": "final"])))
         let earlier = ChatDisplayEntry(kind: .message(try item(["id": "earlier", "presentationRole": "commentary"])))
         let initial = projection.applyingReplyIdentity(to: [projection.nativeAppKitRow(final, expandedTurnIds: [])], entries: [final])
@@ -219,7 +286,7 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
 
     func testReplyIdentitySurvivesStreamingTailReplacementAndReusedPrefix() throws {
         var projection = builder()
-        projection.replyIdentity = .init(agentID: "agent:one", name: "Developer", avatarPath: nil)
+        projection.replyIdentity = .init(roleID: "agent:one", name: "Developer", avatarPath: nil)
         let first = ChatDisplayEntry(kind: .message(try item(["id": "first", "text": "Partial"])))
         let initial = projection.applyingReplyIdentity(to: [projection.nativeAppKitRow(first, expandedTurnIds: [])], entries: [first])
         let streamed = ChatDisplayEntry(kind: .message(try item(["id": "first", "text": "Complete answer"])))
@@ -262,6 +329,111 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         XCTAssertTrue(rows[2].isCollaboration)
         XCTAssertEqual(rows[3].processState, .running)
         XCTAssertFalse(rows[2].isCommentary)
+    }
+
+    func testCollaborationCardsAcceptEverySessionKindAndOptionalWorkInBothSkins() throws {
+        for direction in ["inbound", "outbound"] {
+            for sourceKind in ["assistantChat", "workChat", "worker"] {
+                for targetKind in ["assistantChat", "workChat", "worker"] {
+                    let message = try item([
+                        "id": "collaboration", "type": "userMessage", "presentationRole": "collaboration",
+                        "text": "Authored collaboration message", "presentationText": NSNull(),
+                        "collaborationDirection": direction, "collaborationChannelId": "channel:one",
+                        "collaborationInitiatorSessionId": "logical:source", "collaborationInitiatorSessionTitle": "Source",
+                        "collaborationRecipientSessionId": "logical:target", "collaborationRecipientSessionTitle": "Target",
+                        "collaborationInitiatorSessionKind": sourceKind, "collaborationRecipientSessionKind": targetKind,
+                        "collaborationSourceWorkId": sourceKind == "assistantChat" ? NSNull() : "work:source",
+                        "collaborationTargetWorkId": targetKind == "assistantChat" ? NSNull() : "work:target"
+                    ])
+                    let row = builder().nativeAppKitRow(.init(kind: .message(message)), expandedTurnIds: [])
+                    XCTAssertEqual(row.nativeStyle, .agent)
+                    XCTAssertTrue(row.isCollaboration)
+                    XCTAssertTrue(row.showsHeader)
+                    XCTAssertEqual(row.contentSurfaceRole, .interaction)
+                    XCTAssertNil(row.messageStatus, "Collaboration must not get the user status halo")
+                    XCTAssertEqual(row.copyText, "Authored collaboration message")
+                    XCTAssertFalse(MacSharedMessageTextCard.supports(row))
+                    XCTAssertTrue(row.metadata.contains(L10n(direction == "inbound" ? "收到" : "发出")))
+                    let route = try XCTUnwrap(row.collaborationRoute)
+                    XCTAssertEqual(route.destinationKind, .existingSession)
+                    if sourceKind == "assistantChat" { XCTAssertEqual(route.sourceWork, "Work · " + L10n("未关联 Work")) }
+                    if targetKind == "assistantChat" { XCTAssertEqual(route.targetWork, "Work · " + L10n("未关联 Work")) }
+                    for skin in [ConversationSkin.classic, .codexFlat] {
+                        XCTAssertEqual(skin.surface(for: row.contentSurfaceRole), .legacy)
+                        let layout = LegacyTimelineLayoutReference.shared.layout(for: row, columnWidth: 900,
+                            typography: skin.typography(for: .assistant), skin: skin)
+                        XCTAssertEqual(layout.typography, .classic)
+                        XCTAssertLessThanOrEqual(layout.cardWidth, ChatBubbleWidthPolicy.functionalCardMaximumWidth)
+                        XCTAssertFalse(layout.scrollsUserContent)
+                    }
+                }
+            }
+        }
+    }
+
+    func testNativeCollaborationSurfaceStaysDistinctAcrossSkinAndCellReuse() throws {
+        _ = NSApplication.shared
+        let cell = AppKitChatNativeTextCell(identifier: .init("collaboration-surface"))
+        let user = builder().nativeAppKitRow(.init(kind: .message(try item([
+            "id": "user", "type": "userMessage", "presentationRole": NSNull()]))), expandedTurnIds: [])
+        let partial = builder().nativeAppKitRow(.init(kind: .message(try item([
+            "id": "partial", "type": "userMessage", "presentationRole": "collaboration",
+            "text": "Historic message", "presentationText": NSNull()]))), expandedTurnIds: [])
+        var classicColor: CGColor?
+        for skin in [ConversationSkin.classic, .codexFlat, .classic] {
+            cell.updateAppearance(skin: skin)
+            cell.setContent(user, availableWidth: 800, onToggleExpansion: { _ in })
+            let surface = try XCTUnwrap(cell.subviews.compactMap { $0 as? NativeContentCardSurface }.first)
+            let userColor = try XCTUnwrap(surface.layer?.backgroundColor)
+            cell.setContent(partial, availableWidth: 800, onToggleExpansion: { _ in })
+            let collaborationColor = try XCTUnwrap(surface.layer?.backgroundColor)
+            XCTAssertNotEqual(collaborationColor, userColor)
+            if let classicColor { XCTAssertEqual(collaborationColor, classicColor) }
+            else { classicColor = collaborationColor }
+            XCTAssertEqual(surface.layer?.borderWidth, 0.5)
+            XCTAssertNil(partial.messageStatus)
+        }
+    }
+
+    func testPartialCollaborationKeepsCardAndCannotInventConfirmationActions() throws {
+        for role in ["collaboration", "collaboration_confirmation"] {
+            for confirmationID: Any in [NSNull(), "", "   "] {
+                let message = try item([
+                    "type": "userMessage", "presentationRole": role, "status": "pending",
+                    "collaborationAuthorizationKind": "session_channel",
+                    "collaborationConfirmationId": confirmationID, "text": "Historic collaboration"
+                ])
+                let row = builder().nativeAppKitRow(.init(kind: .message(message)), expandedTurnIds: [])
+                XCTAssertTrue(row.isCollaboration)
+                XCTAssertEqual(row.nativeStyle, .agent)
+                XCTAssertNil(row.collaborationRoute)
+                XCTAssertTrue(row.actions.isEmpty)
+                XCTAssertEqual(row.copyText, "Historic collaboration")
+                XCTAssertFalse(row.nativeText.contains(L10n("将创建新的 CorptieTask")))
+            }
+        }
+        let pending = try item(["type": "userMessage", "presentationRole": "collaboration_confirmation",
+            "status": "pending", "collaborationConfirmationId": "confirmation:one"])
+        XCTAssertEqual(builder().nativeAppKitRow(.init(kind: .message(pending)), expandedTurnIds: []).actions.count, 2)
+        let completed = try item(["type": "userMessage", "presentationRole": "collaboration_confirmation",
+            "status": "confirmed", "collaborationConfirmationId": "confirmation:one"])
+        XCTAssertTrue(builder().nativeAppKitRow(.init(kind: .message(completed)), expandedTurnIds: []).actions.isEmpty)
+    }
+
+    func testFixingCollaborationAppearancePreservesProcessAndFinalReplyOrder() throws {
+        let items = try [item(["id": "user", "type": "userMessage", "presentationRole": NSNull()]),
+            item(["id": "tool", "type": "mcpToolCall", "presentationRole": NSNull()]),
+            item(["id": "collaboration", "type": "userMessage", "presentationRole": "collaboration",
+                "turnId": "channel-message:one", "collaborationDirection": "outbound",
+                "collaborationInitiatorSessionId": "logical:source", "collaborationRecipientSessionId": "logical:target"]),
+            item(["id": "final", "presentationRole": "final_answer"])]
+        let entries = ConversationReplyProgressProjection.entries(ConversationTimeline.makeEntries(from: items))
+        XCTAssertEqual(entries.map(\.id), ["message:user", "process:turn:one", "message:collaboration", "message:final"])
+        let rows = entries.map { builder().nativeAppKitRow($0, expandedTurnIds: []) }
+        XCTAssertEqual(rows[0].nativeStyle, .user)
+        XCTAssertTrue(rows[2].isCollaboration)
+        XCTAssertFalse(rows[3].isCollaboration)
+        XCTAssertEqual(rows.map(\.id), entries.map(\.id))
     }
 
     private func item(_ overrides: [String: Any] = [:]) throws -> CodexThreadItem {
@@ -307,8 +479,8 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         var without = final
         without.showsReplyActions = false
         for typography in [ConversationTypography.classic, .codexReading] {
-            let layout = NativeTimelineLayoutCache.shared.layout(for: final, columnWidth: 900, typography: typography)
-            let previous = NativeTimelineLayoutCache.shared.layout(for: without, columnWidth: 900, typography: typography)
+            let layout = LegacyTimelineLayoutReference.shared.layout(for: final, columnWidth: 900, typography: typography)
+            let previous = LegacyTimelineLayoutReference.shared.layout(for: without, columnWidth: 900, typography: typography)
             XCTAssertEqual(layout.rowHeight - previous.rowHeight, 26)
             XCTAssertEqual(layout.cardHeight, previous.cardHeight)
             XCTAssertEqual(layout.cardWidth, previous.cardWidth)
@@ -325,7 +497,7 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
                 ? AppKitSharedMessageTextCell(identifier: .init("shared-actions"))
                 : AppKitChatNativeTextCell(identifier: .init("native-actions"))
             let cell = try XCTUnwrap(renderer as? NSView)
-            let layout = NativeTimelineLayoutCache.shared.layout(for: final, columnWidth: 900)
+            let layout = LegacyTimelineLayoutReference.shared.layout(for: final, columnWidth: 900)
             cell.frame = .init(x: 0, y: 0, width: 900, height: layout.rowHeight)
             renderer.setContent(final, availableWidth: 900, baseDirectory: nil, onToggleExpansion: { _ in },
                 onAction: { acted = $0.id })
@@ -381,7 +553,7 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
         XCTAssertTrue(row.copyText.contains("Choose route"))
         XCTAssertTrue(row.copyText.contains("A — Fast"))
         XCTAssertTrue(MacSharedMessageTextCard.supports(row))
-        let layout = NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: 600)
+        let layout = LegacyTimelineLayoutReference.shared.layout(for: row, columnWidth: 600)
         XCTAssertGreaterThan(layout.rowHeight, 180)
         _ = NSApplication.shared
         let cell = AppKitSharedMessageTextCell(identifier: .init("user-input-copy"))
@@ -412,7 +584,7 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
                 let row = builder().nativeAppKitRow(.init(kind: .message(try item([
                     "type": "userInput", "status": status, "userInput": input]))), expandedTurnIds: [])
                 for skin in [ConversationSkin.classic, .codexFlat] {
-                    let layout = NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: width,
+                    let layout = LegacyTimelineLayoutReference.shared.layout(for: row, columnWidth: width,
                         typography: skin.typography(for: .assistant))
                     let host = NSHostingView(rootView: MacSharedMessageTextCard(skin: skin, row: row, layout: layout)
                         .frame(width: width).fixedSize(horizontal: false, vertical: true))
@@ -421,7 +593,7 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
                     XCTAssertEqual(layout.rowHeight, ceil(host.fittingSize.height), accuracy: 1,
                         "Question row reserves unused space: status=\(status), width=\(width), skin=\(skin)")
                     XCTAssertEqual(layout.rowHeight, layout.cardHeight + 2 * layout.typography.rowInset)
-                    XCTAssertEqual(NativeTimelineLayoutCache.shared.layout(for: row, columnWidth: width,
+                    XCTAssertEqual(LegacyTimelineLayoutReference.shared.layout(for: row, columnWidth: width,
                         typography: skin.typography(for: .assistant)).rowHeight, layout.rowHeight)
                 }
             }
@@ -444,8 +616,8 @@ final class ConversationNativeRowBuilderTests: XCTestCase {
                 ["submittedAnswers": ["answer": [longAnswer]]]) { _, new in new }
         ]))), expandedTurnIds: [])
         XCTAssertNotEqual(short.contentRevision, long.contentRevision)
-        XCTAssertGreaterThan(NativeTimelineLayoutCache.shared.layout(for: long, columnWidth: 500).rowHeight,
-                             NativeTimelineLayoutCache.shared.layout(for: short, columnWidth: 500).rowHeight)
+        XCTAssertGreaterThan(LegacyTimelineLayoutReference.shared.layout(for: long, columnWidth: 500).rowHeight,
+                             LegacyTimelineLayoutReference.shared.layout(for: short, columnWidth: 500).rowHeight)
     }
 
     func testFinalAnswerForkAvailabilityChangesRevisionWithoutChangingIdentity() throws {

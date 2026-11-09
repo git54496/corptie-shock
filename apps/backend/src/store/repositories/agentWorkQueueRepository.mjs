@@ -57,8 +57,11 @@ export class AgentWorkQueueRepository {
 
   getAgentTaskForDelivery(deliveryId) {
     const row = this.selectOne(
-      "SELECT * FROM agent_operations WHERE delivery_id = ? OR channel_delivery_id = ?",
-      [deliveryId, deliveryId]
+      `SELECT op.* FROM agent_operations op
+       JOIN session_collaboration_batches b ON b.operation_id=op.task_id
+       JOIN session_collaboration_batch_items i ON i.batch_id=b.batch_id WHERE i.delivery_id=?`, [deliveryId]
+    ) ?? this.selectOne(
+      "SELECT * FROM agent_operations WHERE delivery_id = ? OR channel_delivery_id = ?", [deliveryId, deliveryId]
     );
     return row ? agentTaskFromRow(row) : null;
   }
@@ -129,7 +132,8 @@ export class AgentWorkQueueRepository {
   listQueuedAgentTasks(agentId, limit = 100) {
     return this.selectAll(
       `SELECT * FROM agent_operations WHERE agent_id = ? AND status = 'queued'
-       ORDER BY priority DESC, created_at ASC, task_id ASC LIMIT ?`,
+       ORDER BY CASE WHEN json_extract(source_json,'$.coordinationPurpose')='parent_report' THEN 1 ELSE 0 END,
+         priority DESC, created_at ASC, task_id ASC LIMIT ?`,
       [agentId, Math.max(1, Math.min(1000, Number(limit) || 100))]
     ).map(agentTaskFromRow);
   }
@@ -137,7 +141,8 @@ export class AgentWorkQueueRepository {
   listQueuedAgentTasksForSession(sessionId, limit = 100) {
     return this.selectAll(
       `SELECT * FROM agent_operations WHERE session_id = ? AND status = 'queued'
-       ORDER BY priority DESC, created_at ASC, task_id ASC LIMIT ?`,
+       ORDER BY CASE WHEN json_extract(source_json,'$.coordinationPurpose')='parent_report' THEN 1 ELSE 0 END,
+         priority DESC, created_at ASC, task_id ASC LIMIT ?`,
       [sessionId, Math.max(1, Math.min(1000, Number(limit) || 100))]
     ).map(agentTaskFromRow);
   }
@@ -176,6 +181,11 @@ export class AgentWorkQueueRepository {
     this.db.run(
       `UPDATE agent_operations SET status = 'running', started_at = ?, updated_at = ?, last_error = NULL
        WHERE task_id = ? AND status = 'queued'
+         AND (COALESCE(json_extract(source_json,'$.coordinationPurpose'),'') <> 'parent_report' OR NOT EXISTS (
+           SELECT 1 FROM agent_operations pending WHERE pending.session_id=agent_operations.session_id
+           AND pending.task_id<>agent_operations.task_id AND pending.status='queued' AND pending.kind='user'
+           AND COALESCE(json_extract(pending.source_json,'$.type'),'') NOT IN ('mailbox_event','scheduled_session_task')
+         ))
          AND NOT EXISTS (
            SELECT 1 FROM agent_operations running
            WHERE running.session_id = ? AND running.status = 'running'

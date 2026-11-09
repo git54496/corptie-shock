@@ -5,13 +5,13 @@ import Testing
 struct MainTabContentLayoutTests {
     @Test
     func selectedIndexTracksTheStableTabOrder() {
-        #expect(AppTab.allCases == [.console, .automations, .scenes, .worktrees, .resources, .agents, .memory, .codexHistory, .settings])
+        #expect(AppTab.allCases == [.console, .automations, .scenes, .worktrees, .resources, .roles, .memory, .codexHistory, .settings])
         #expect(AppTab.console.index == 0)
         #expect(AppTab.automations.index == 1)
         #expect(AppTab.scenes.index == 2)
         #expect(AppTab.worktrees.index == 3)
         #expect(AppTab.resources.index == 4)
-        #expect(AppTab.agents.index == 5)
+        #expect(AppTab.roles.index == 5)
         #expect(AppTab.console.systemImage == "circle.hexagongrid.fill")
         #expect(AppTab.scenes.systemImage == "camera.macro")
     }
@@ -56,7 +56,7 @@ struct MainTabContentLayoutTests {
 
     @MainActor
     @Test
-    func transitionsUseStableTabOrderAndAttachOnlyTwoFixedSizePages() throws {
+    func fadeImmediatelyHidesOldPageAndPreservesFixedSizeHosts() throws {
         let container = makeContainer(animationDuration: 10)
         container.frame = NSRect(x: 0, y: 0, width: 1_200, height: 700)
         container.select(.automations, animated: false)
@@ -66,11 +66,10 @@ struct MainTabContentLayoutTests {
 
         #expect(container.transition == MainTabTransition(
             from: .automations,
-            to: .worktrees,
-            direction: .forward
+            to: .worktrees
         ))
         #expect(container.attachedTabs == [.automations, .worktrees])
-        #expect(container.visibleTabs == [.automations, .worktrees])
+        #expect(container.visibleTabs == [.worktrees])
         #expect(container.attachedPageCount == 2)
         #expect(container.cachedPage(for: .automations)?.frame == container.bounds)
         #expect(container.cachedPage(for: .worktrees)?.frame == container.bounds)
@@ -85,46 +84,37 @@ struct MainTabContentLayoutTests {
 
     @MainActor
     @Test
-    func backwardAndRapidTransitionsNeverExposeAThirdOrWrongPage() {
+    func rapidClicksImmediatelySelectTheLatestPageWithoutWaitingForTheFade() {
         let container = makeContainer(animationDuration: 10)
         container.frame = NSRect(x: 0, y: 0, width: 980, height: 620)
-        container.select(.agents, animated: false)
+        container.select(.roles, animated: false)
         container.select(.automations)
-
-        #expect(container.transition?.direction == .backward)
-        #expect(container.attachedTabs == [.automations, .agents])
-        #expect(container.visibleTabs == [.automations, .agents])
+        #expect(container.visibleTabs == [.automations])
+        container.select(.automations)
+        #expect(container.transition != nil, "A normal update of the same page must preserve its fade")
 
         container.select(.worktrees)
-        #expect(container.selectedTab == .automations)
-        #expect(container.transition == MainTabTransition(
-            from: .agents,
-            to: .automations,
-            direction: .backward
-        ))
-        #expect(container.pendingTab == .worktrees)
-        #expect(container.attachedTabs == [.automations, .agents])
-        #expect(container.visibleTabs == [.automations, .agents])
-        #expect(container.attachedPageCount == 2)
+        #expect(container.selectedTab == .worktrees)
+        #expect(container.transition == MainTabTransition(from: .automations, to: .worktrees))
+        #expect(container.visibleTabs == [.worktrees])
+        #expect(container.cachedPage(for: .automations)?.layer?.animation(forKey: "main-tab-opacity") == nil)
 
         container.select(.console)
-        #expect(container.pendingTab == .console)
-        #expect(container.attachedTabs == [.automations, .agents])
-        #expect(container.visibleTabs == [.automations, .agents])
-        #expect(container.cachedPage(for: .worktrees) == nil)
+        #expect(container.selectedTab == .console)
+        #expect(container.transition == MainTabTransition(from: .worktrees, to: .console))
+        #expect(container.visibleTabs == [.console])
+        #expect(container.cachedPage(for: .worktrees)?.layer?.animation(forKey: "main-tab-opacity") == nil)
+        #expect(container.cachedPageCount == 4)
 
         container.finishActiveTransition()
-        #expect(container.selectedTab == .console)
-        #expect(container.transition == MainTabTransition(
-            from: .automations,
-            to: .console,
-            direction: .backward
-        ))
-        #expect(container.pendingTab == nil)
-        #expect(container.attachedTabs == [.console, .automations, .agents])
-        #expect(container.visibleTabs == [.console, .automations])
-        #expect(container.attachedPageCount == 3)
-        #expect(container.cachedPage(for: .agents)?.isHidden == true)
+        #expect(container.transition == nil)
+        #expect(container.visibleTabs == [.console])
+        #expect(container.cachedPage(for: .roles)?.isHidden == true)
+        container.select(.roles)
+        container.select(.roles, animated: false)
+        #expect(container.transition == nil, "Reduced motion or live resize must finish the fade immediately")
+        #expect(container.visibleTabs == [.roles])
+        #expect(container.cachedPage(for: .roles)?.layer?.animation(forKey: "main-tab-opacity") == nil)
     }
 
     @MainActor
@@ -137,27 +127,22 @@ struct MainTabContentLayoutTests {
         let fixedFrame = console.frame
         let layoutCount = container.activePageLayoutCount
 
-        container.select(.agents)
-        let agents = try #require(container.cachedPage(for: .agents))
+        container.select(.roles)
+        let roles = try #require(container.cachedPage(for: .roles))
 
         #expect(console.frame == fixedFrame)
-        #expect(agents.frame == fixedFrame)
+        #expect(roles.frame == fixedFrame)
         #expect(container.activePageLayoutCount == layoutCount + 1)
-        #expect(console.layer?.animation(forKey: "main-tab-translation") != nil)
-        #expect(agents.layer?.animation(forKey: "main-tab-translation") != nil)
-        #expect(console.layer?.animation(forKey: "main-tab-opacity") != nil)
-        #expect(agents.layer?.animation(forKey: "main-tab-opacity") != nil)
-
-        let outgoingTranslation = try #require(
-            console.layer?.animation(forKey: "main-tab-translation") as? CABasicAnimation
-        )
-        let incomingTranslation = try #require(
-            agents.layer?.animation(forKey: "main-tab-translation") as? CABasicAnimation
-        )
-        #expect((outgoingTranslation.fromValue as? CGFloat) == 0)
-        #expect((outgoingTranslation.toValue as? CGFloat) == -fixedFrame.width)
-        #expect((incomingTranslation.fromValue as? CGFloat) == fixedFrame.width)
-        #expect((incomingTranslation.toValue as? CGFloat) == 0)
+        #expect(console.isHidden)
+        #expect(!roles.isHidden)
+        #expect(console.layer?.animation(forKey: "main-tab-translation") == nil)
+        #expect(roles.layer?.animation(forKey: "main-tab-translation") == nil)
+        #expect(console.layer?.animation(forKey: "main-tab-opacity") == nil)
+        let incomingOpacity = try #require(roles.layer?.animation(forKey: "main-tab-opacity") as? CABasicAnimation)
+        #expect((incomingOpacity.fromValue as? Float) == 0)
+        #expect((incomingOpacity.toValue as? Float) == 1)
+        #expect(roles.layer.map { CATransform3DIsIdentity($0.transform) } == true)
+        #expect(MainTabPageContainer.defaultAnimationDuration == 0.12)
     }
 
     @MainActor
@@ -188,6 +173,46 @@ struct MainTabContentLayoutTests {
     }
 
     @MainActor
+    @Test
+    func warmSwiftUIPageKeepsWindowBindingAndStateAcrossSwitchAndResize() async throws {
+        _ = NSApplication.shared
+        let probe = TabWindowBindingProbe()
+        let container = MainTabPageContainer(animationDuration: 0) { tab in
+            let host = NSHostingView(rootView: TabStateProbe(probe: tab == .console ? probe : TabWindowBindingProbe()))
+            host.sizingOptions = []
+            return host
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = container
+        defer { window.contentView = nil }
+        container.select(.console, animated: false)
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        probe.increment?()
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(probe.value == 1)
+        let attachments = probe.attachments
+        let original = try #require(container.cachedPage(for: .console))
+        let originalFrame = original.frame
+        container.select(.worktrees, animated: false)
+        for width in [1100, 1200, 1300] {
+            container.setFrameSize(NSSize(width: width, height: 750))
+            window.layoutIfNeeded()
+        }
+        #expect(original.frame == originalFrame)
+        #expect(original.window === window)
+        container.select(.console, animated: false)
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(probe.value == 1)
+        #expect(probe.attachments == attachments)
+        #expect(probe.detachments == 0)
+        #expect(original.frame == container.bounds)
+    }
+
+    @MainActor
     private func makeContainer(animationDuration: TimeInterval) -> MainTabPageContainer {
         MainTabPageContainer(animationDuration: animationDuration) { _ in
             NSView(frame: .zero)
@@ -195,7 +220,7 @@ struct MainTabContentLayoutTests {
     }
 
     @Test
-    func mainWindowCoalescesNativeLiveResizeAndEnforcesContentMinimum() throws {
+    func mainWindowUsesNativeLiveResizeAndEnforcesContentMinimum() throws {
         let source = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -205,68 +230,34 @@ struct MainTabContentLayoutTests {
             + String(contentsOf: source.appendingPathComponent("Application/MainWindowRuntime.swift"), encoding: .utf8)
 
         #expect(contents.contains("let hostingView = MainWindowSurfaceContainer("))
-        #expect(contents.contains("rootView: FirstRunSetupRoot { MainWindowContentView() }.environmentObject(resizeState)"))
+        #expect(contents.contains("rootView: FirstRunSetupRoot { MainWindowContentView() }"))
+        #expect(contents.contains(".environmentObject(resizeState)"))
         #expect(!contents.contains("window.addTitlebarAccessoryViewController("))
         #expect(contents.contains("window.titlebarAppearsTransparent = true"))
         #expect(!contents.contains("chromeSurfaces: MainWindowChromeSurfaces("))
         #expect(contents.contains("override func viewWillStartLiveResize()"))
         #expect(contents.contains("override func viewDidEndLiveResize()"))
         #expect(contents.contains("NSWindow.willEnterFullScreenNotification"))
-        #expect(contents.contains("scheduleExactLayoutAfterStability()"))
-        #expect(contents.contains("displayLink("))
-        #expect(contents.contains("link.add(to: .main, forMode: .common)"))
+        #expect(!contents.contains("scheduleExactLayoutAfterStability()"))
+        #expect(!contents.contains("displayLink("))
+        #expect(contents.contains("hostingView.autoresizingMask = [.width, .height]"))
         #expect(!contents.contains("private var layoutTimer"))
         #expect(!contents.contains("scaleAxesIndependently"))
         #expect(!contents.contains("contentContainer.layer?.setAffineTransform"))
         #expect(!contents.contains("applyPresentationTransform"))
         #expect(contents.contains("layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor"))
-        #expect(contents.contains("CATransaction.setDisableActions(true)"))
+        #expect(!contents.contains("pendingContentSize"))
         #expect(!contents.contains("bitmapImageRepForCachingDisplay"))
         #expect(contents.contains("window.preservesContentDuringLiveResize = true"))
         #expect(contents.contains("window.contentMinSize = MainWindowInitialLayout.minimumContentSize"))
     }
 
     @Test
-    func tabButtonsExposeStableAutomationIdentifiersAndSelectionValues() throws {
-        let source = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources/CopetsMac/MainWindowNavigationRail.swift")
-        let contents = try String(contentsOf: source, encoding: .utf8)
-
-        #expect(contents.contains("accessibilityID: \"main-tab.\\($0.rawValue)\""))
-        #expect(contents.contains("PlatformNavigationRail("))
-    }
-
-    @Test
-    func tabCapsuleStaysBelowTitlebarAndKeepsSettingsInside() throws {
-        let source = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources/CopetsMac/MainWindowNavigationRail.swift")
-        let contents = try String(contentsOf: source, encoding: .utf8)
-
-        #expect(contents.contains("settingsAccessibilityID: \"main-window.settings\""))
-        #expect(contents.contains("PlatformNavigationRail("))
-        #expect(!contents.contains("verticalAlignment: .center"))
-        #expect(contents.contains(".padding(.top, MainWindowLayoutMetrics.titlebarHeight + 8)"))
-        #expect(contents.contains(".padding(.bottom, 8)"))
-        #expect(!contents.contains(".background(Color(nsColor: .windowBackgroundColor)"))
-        #expect(!contents.contains(".fill(Color(nsColor: .controlBackgroundColor))"))
-
-        let shared = source
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("packages/CorptieConversation/Sources/CorptieConversation/PlatformNavigationRail.swift")
-        let sharedContents = try String(contentsOf: shared, encoding: .utf8)
-        #expect(sharedContents.contains("onSettings()"))
-        #expect(sharedContents.contains("Text(settingsTitle)"))
-        #expect(!sharedContents.contains(".platformGlassSurface(in: Circle()"))
+    func navigationDestinationsKeepTheirAutomationContractAfterRestyling() {
+        #expect(AppTab.allCases.map(\.navigationAccessibilityIdentifier) == [
+            "main-tab.console", "main-tab.automations", "main-tab.scenes", "main-tab.worktrees",
+            "main-tab.resources", "main-tab.agents", "main-tab.memory", "main-window.settings"
+        ])
     }
 
     @Test
@@ -288,5 +279,35 @@ struct MainTabContentLayoutTests {
         #expect(!contentView.contains("Color.clear"))
         #expect(!contentView.contains("contentTopInset"))
         #expect(!contentView.contains("LinearGradient("))
+    }
+}
+
+@MainActor private final class TabWindowBindingProbe {
+    var attachments = 0
+    var detachments = 0
+    var value = 0
+    var increment: (() -> Void)?
+}
+
+private struct TabStateProbe: View {
+    let probe: TabWindowBindingProbe
+    @State private var value = 0
+    var body: some View {
+        let _ = { probe.value = value; probe.increment = { value += 1 } }()
+        TabBindingMarker(probe: probe).overlay(Text("State \(value)"))
+    }
+}
+private struct TabBindingMarker: NSViewRepresentable {
+    let probe: TabWindowBindingProbe
+    func makeNSView(context: Context) -> Marker { Marker(probe) }
+    func updateNSView(_ view: Marker, context: Context) {}
+    final class Marker: NSView {
+        let probe: TabWindowBindingProbe
+        init(_ probe: TabWindowBindingProbe) { self.probe = probe; super.init(frame: .zero) }
+        required init?(coder: NSCoder) { fatalError() }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil { probe.detachments += 1 } else { probe.attachments += 1 }
+        }
     }
 }

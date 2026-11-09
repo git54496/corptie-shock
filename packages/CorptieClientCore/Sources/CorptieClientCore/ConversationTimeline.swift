@@ -6,6 +6,8 @@ public protocol ConversationTimelineItem: Sendable {
     var id: String { get }
     var timelineTurnID: String { get }
     var timelineTurnStatus: String { get }
+    var userMessageStatus: String? { get }
+    var timelineLegacyMessageStatus: String? { get }
     var type: String { get }
     var text: String { get }
     var createdAt: String? { get }
@@ -14,18 +16,15 @@ public protocol ConversationTimelineItem: Sendable {
     var processStartedAt: String? { get set }
     var processEndedAt: String? { get set }
     var timelineHasImages: Bool { get }
+    var timelineMessageOrigin: String? { get }
 }
 
 public extension ConversationTimelineItem {
+    var userMessageStatus: String? { nil }
+    var timelineLegacyMessageStatus: String? { nil }
     var collaborationDirection: String? { nil }
     var timelineHasImages: Bool { false }
-
-    /// Media presentation is independent of authored/formal reply semantics.
-    /// Explicit event roles always win, even when an execution item has images.
-    var isStandaloneImage: Bool {
-        type == "imageView" && timelineHasImages
-            && ConversationPresentationKind.resolve(type: type, presentationRole: presentationRole) == .unknown
-    }
+    var timelineMessageOrigin: String? { nil }
 }
 
 public struct ConversationEntry<Item: ConversationTimelineItem>: Identifiable, Sendable {
@@ -86,7 +85,7 @@ public enum ConversationTimeline {
         var hasFinalReply: Bool = false
     }
 
-public static func makeEntries<Item: ConversationTimelineItem>(from items: [Item]) -> [ConversationEntry<Item>] {
+public static func makeEntries<Item: ConversationTimelineItem>(from items: [Item], showsPendingInputAsProcessing: Bool = false) -> [ConversationEntry<Item>] {
     let ordered = orderedItems(items)
     guard !ordered.isEmpty else { return [] }
 
@@ -199,7 +198,8 @@ public static func makeEntries<Item: ConversationTimelineItem>(from items: [Item
             : "\(sourceTurnId):display-segment:\(segmentIndex)"
         entries.append(contentsOf: entriesForTurn(
             bucket.items,
-            displayTurnId: displayTurnId
+            displayTurnId: displayTurnId,
+            showsPendingInputAsProcessing: showsPendingInputAsProcessing
         ))
     }
     return entries
@@ -328,7 +328,8 @@ private static func isFixedUTCISO8601Timestamp(_ value: String, length: Int) -> 
 
 public static func entriesForTurn<Item: ConversationTimelineItem>(
     _ items: [Item],
-    displayTurnId: String? = nil
+    displayTurnId: String? = nil,
+    showsPendingInputAsProcessing: Bool = false
 ) -> [ConversationEntry<Item>] {
     let userMessages = items.filter {
         ConversationPresentationKind.resolve(type: $0.type, presentationRole: $0.presentationRole) == .userMessage
@@ -339,6 +340,19 @@ public static func entriesForTurn<Item: ConversationTimelineItem>(
     var processSegmentIndex = 0
 
     let baseTurnId = displayTurnId ?? items.first?.timelineTurnID ?? ""
+    // Only correlated execution diagnostics belong together. A lone error,
+    // interaction, unknown event or unbound legacy item stays independently visible.
+    let diagnosticIDs = Set(items.filter { item in
+        guard !item.timelineTurnID.isEmpty,
+              item.timelineTurnID == items.first?.timelineTurnID,
+              item.presentationRole == nil else { return false }
+        if item.type == "error" { return true }
+        return ["system", "taskComplete"].contains(item.type)
+            && ["failed", "error"].contains(item.timelineTurnStatus.lowercased())
+    }.map(\.id))
+    func isProcessItem(_ item: Item) -> Bool {
+        isDetailProcessItem(item) || (diagnosticIDs.count > 1 && diagnosticIDs.contains(item.id))
+    }
     let turnStartedAt = userMessages.compactMap(\.createdAt).first
         ?? items.compactMap(\.createdAt).first
     let isTerminalTurn = items.contains(where: {
@@ -347,7 +361,7 @@ public static func entriesForTurn<Item: ConversationTimelineItem>(
             && isTerminalTurnStatus($0.timelineTurnStatus)
     })
     let turnEndedAt = items.reversed().compactMap(\.createdAt).first
-    let lastProcessIndex = items.lastIndex(where: { isDetailProcessItem($0) })
+    let lastProcessIndex = items.lastIndex(where: { isProcessItem($0) })
 
     func flushProcessBuffer(isLastInTurn: Bool) {
         guard !processBuffer.isEmpty else { return }
@@ -377,18 +391,10 @@ public static func entriesForTurn<Item: ConversationTimelineItem>(
         ))
     }
 
+    let taskChecklists = items.filter { $0.type == "executionChecklist" }
     for (index, item) in items.enumerated() {
-        if item.isStandaloneImage {
-            let hasMoreProcessItems = lastProcessIndex.map { $0 > index } ?? false
-            flushProcessBuffer(isLastInTurn: !hasMoreProcessItems)
-            if index > 0, items[index - 1].isStandaloneImage,
-               let previous = entries.popLast(), case .message(let first) = previous.kind {
-                entries.append(.init(kind: .message(first), mediaItems:
-                    (previous.mediaItems.isEmpty ? [first] : previous.mediaItems) + [item]))
-            } else { entries.append(.init(kind: .message(item), mediaItems: [item])) }
-            continue
-        }
-        if isDetailProcessItem(item) {
+        if item.type == "executionChecklist" { continue }
+        if isProcessItem(item) {
             processBuffer.append(item)
         } else if item.type == "agentMessage" {
             if item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !item.timelineHasImages,
@@ -406,6 +412,34 @@ public static func entriesForTurn<Item: ConversationTimelineItem>(
         }
     }
     flushProcessBuffer(isLastInTurn: true)
+    // Processing and opted-in pending user feedback can precede visible
+    // Provider content. Reuse a process row without rewriting source lifecycle
+    // or creating a persisted message/tool step.
+    if lastProcessIndex == nil, !isTerminalTurn, !baseTurnId.isEmpty,
+       let input = items.last(where: { item in
+           let state = UserMessageProcessingState(authoritativeValue: item.userMessageStatus,
+               legacyStatus: item.timelineLegacyMessageStatus)
+           let kind = ConversationPresentationKind.resolve(type: item.type, presentationRole: item.presentationRole)
+           guard state == .processing || (showsPendingInputAsProcessing && kind == .userMessage
+               && state == .preparing) else { return false }
+           return kind == .userMessage || kind == .systemEvent || kind == .automationEvent
+               || (kind == .collaborationMessage && item.collaborationDirection?.lowercased() == "inbound")
+       }) {
+        let insertion = entries.lastIndex(where: { entry in
+            guard case .message(let item) = entry.kind else { return false }
+            return item.id == input.id
+        }).map { $0 + 1 } ?? 0
+        entries.insert(.init(kind: .process(turnId: baseTurnId, items: []),
+                             processReplyState: .running), at: insertion)
+    }
+    if !taskChecklists.isEmpty {
+        let insertion = entries.lastIndex(where: { $0.isProcessGroup }).map { $0 + 1 }
+            ?? entries.firstIndex(where: { entry in
+                if case .message(let item) = entry.kind { return item.type == "agentMessage" }
+                return false
+            }) ?? entries.count
+        entries.insert(contentsOf: taskChecklists.map { ConversationEntry<Item>(kind: .message($0)) }, at: insertion)
+    }
     return entries
 }
 
@@ -419,9 +453,7 @@ private static func isTerminalTurnStatus(_ status: String) -> Bool {
 }
 
 private static func isDetailProcessItem<Item: ConversationTimelineItem>(_ item: Item) -> Bool {
-    // Materialized image output must be directly visible, not hidden inside
-    // an execution disclosure. The same shared rule governs every client.
-    if item.isStandaloneImage { return false }
+    // Tool image inspection stays in execution, even when an image was archived.
     let kind = ConversationPresentationKind.resolve(type: item.type, presentationRole: item.presentationRole)
     if kind == .collaborationMessage || kind == .collaborationConfirmation
         || kind == .systemEvent || kind == .automationEvent { return false }

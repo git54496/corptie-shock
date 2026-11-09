@@ -33,6 +33,9 @@ export function createProductEventPublisher({
       ? null
       : options.sessionId || sessionIdFromEventPayload(payload);
     const sessionId = resolveDurableEventSessionId(store, requestedSessionId);
+    if (type === "SessionAbilitiesChanged") {
+      clientDeviceGateway?.inspectorEvents.invalidate([sessionId, requestedSessionId].filter(Boolean));
+    }
     const createdAt = now();
     const durableEventId = options.eventId || randomUUID();
     if (options.eventId && store.db && store.hasSessionEvent(options.eventId)) return null;
@@ -103,7 +106,7 @@ export function createProductEventPublisher({
     if (outbox) store.markEventOutboxPublished(outbox.outbox_id, now());
     invalidateDetail?.(type, payload, sessionId);
     scheduleStateSyncPublish();
-    if (type === "TaskChanged" && payload?.entity?.id) {
+    if (type === "TaskChanged" && payload?.entity?.id && !["child-delivery-state", "coordination-state"].includes(payload.action)) {
       requestTaskSummary(payload.entity.id);
     }
 
@@ -146,10 +149,10 @@ export function createProductEventPublisher({
     const items = automationTimelineItems([sessionEvent], {
       resolveRun: id => store.getScheduledSessionRun?.(id)
     });
-    if (type === "SessionCommandCompleted" && payload?.item) {
+    if (["SessionCommandCompleted", "SessionCoordinationCompleted", "SessionCoordinationMilestone", "SessionToolPreparationWarning"].includes(type) && payload?.item) {
       items.push(payload.item);
     }
-    if (["AgentWorkQueued", "AgentWorkStarted", "AgentWorkCompleted", "AgentWorkFailed"].includes(type)) {
+    if (["AgentWorkQueued", "AgentWorkPreparing", "AgentWorkStarted", "AgentWorkCompleted", "AgentWorkFailed"].includes(type)) {
       const item = agentWorkTimelineItem(payload?.task, sessionId, payload?.queuePosition);
       if (item) items.push(item);
     }

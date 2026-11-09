@@ -24,18 +24,33 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     private weak var tableView: NSTableView?
     private weak var scrollView: NSScrollView?
     private weak var processCollapseButton: NSButton?
+    private weak var processCollapseHost: NSView?
     private var visibleProcessCollapseRowID: String?
     private var pendingProcessCollapseRowID: String?
     private var hasExpandedProcessRows = false
-    private var rows: [AppKitChatTimelineRow] = []
+    private var rowIndexesByID: [String: Int] = [:]
+    private var processGroupEndIndexes: [String: Int] = [:]
+    private var rows: [AppKitChatTimelineRow] = [] {
+        didSet {
+            rowIndexesByID = Dictionary(rows.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { first, _ in first })
+            processGroupEndIndexes = [:]
+            for (index, row) in rows.enumerated() {
+                if let parent = row.processParentID { processGroupEndIndexes[parent] = index }
+            }
+        }
+    }
     private var presentationActive = true
+    private var needsPresentationLayout = false
     private var lastAppliedContentRevision: UInt64?
     private var lastAppliedContentSessionID: String?
     private var canAdvanceProcessClock: Bool
-    private var processClockTimer: Timer?
+    /// The live elapsed clock is a chain of one-shot ticks, not a retained
+    /// repeating Timer. Stopping only bumps the generation; a tick already
+    /// queued in the RunLoop sees the stale generation and expires on its own.
+    private(set) var isProcessClockScheduled = false
+    private var processClockGeneration: UInt64 = 0
     private var activeProcessClockRowIndex: Int?
     private var revisionsByID: [String: Int] = [:]
-    private var heightCache: [HeightCacheKey: CGFloat] = [:]
     private var pendingImageGeometryRows = Set<String>()
     private var imageGeometryCommitScheduled = false
     private var cellsByKey: [CellCacheKey: NSTableCellView & AppKitChatRowRendering] = [:]
@@ -60,6 +75,9 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     private var pendingCorrection: Correction?
     private var correctionScheduled = false
     private var applyingCorrection = false
+    private var isProvidingCell = false
+    private var isSynchronizingDocumentExtent = false
+    private var isReloadingSDKRowData = false
     private var diagnosticEvents: [String] = []
 
     private func traceViewport(_ event: String) {
@@ -84,20 +102,15 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     private var isAwaitingSessionRows = false
     private var userOwnsViewport = false
     private var isProcessingUserScrollEvent = false
-    private var needsExactWidthReflow = false
+    #if DEBUG
+    private(set) var resizeLayoutCommitCount = 0
+    private(set) var sdkRowResetCount = 0
+    private(set) var documentHeightSyncCount = 0
+    #endif
     private var lastReflowMeasurementWidth: CGFloat?
     private var topClearance: CGFloat = 0
     private var bottomClearance: CGFloat = 0
     private var reservesVerticalScrollerGutter = true
-
-    private struct HeightCacheKey: Hashable {
-        let sessionID: String
-        let id: String
-        let revision: Int
-        let widthBucket: Int
-        let isLiveResizeApproximation: Bool
-        let imageGeometries: [MessageImageGeometry?]
-    }
 
     private struct CellCacheKey: Hashable {
         let sessionID: String
@@ -146,8 +159,8 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
 
     /// Rebinds the existing NSTableView to another Session. The old
     /// semantic viewport is published through the old callback before the
-    /// callback and row model change; native cells and the reuse queue stay
-    /// alive, while Session-specific height/revision state is discarded.
+    /// callback and row model change; native content views stay cached while
+    /// Session-specific revisions and SDK virtual row data are replaced.
     func switchSessionIfNeeded(
         to sessionID: String,
         initialPosition: AppKitChatTimelinePosition?,
@@ -164,6 +177,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         nearTopSuppressionGeneration &+= 1
         suppressesNearTopTrigger = false
         representedSessionID = sessionID
+        processStepVersions.removeAll()
         pendingSearchRowID = nil
         lastSearchRevision = -1
         if searchHighlightActive {
@@ -212,7 +226,8 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     }
 
     isolated deinit {
-        processClockTimer?.invalidate()
+        processClockGeneration &+= 1
+        isProcessClockScheduled = false
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -221,8 +236,17 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     func setPresentationActive(_ active: Bool) {
         guard presentationActive != active else { return }
         presentationActive = active
-        if !active { processClockTimer?.invalidate(); processClockTimer = nil }
+        if !active {
+            needsPresentationLayout = true
+            stopProcessClock()
+        }
         else {
+            if needsPresentationLayout {
+                needsPresentationLayout = false
+                synchronizeTableWidth()
+                reconcileLayout()
+                positionProcessCollapseButton()
+            }
             if needsTypographyReflow { reflowForTypography() }
             synchronizeProcessClock(); scheduleImageGeometryCommit(); scheduleUnderfilledHistoryEvaluation()
         }
@@ -240,19 +264,52 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         })
         let shouldTick = presentationActive && canAdvanceProcessClock && activeProcessClockRowIndex != nil
         guard shouldTick else {
-            processClockTimer?.invalidate()
-            processClockTimer = nil
+            stopProcessClock()
             return
         }
-        guard processClockTimer == nil else { return }
-        let timer = Timer(timeInterval: ConversationProcessPresentation.elapsedRefreshInterval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshVisibleProcessElapsed() }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        processClockTimer = timer
+        guard !isProcessClockScheduled else { return }
+        isProcessClockScheduled = true
+        scheduleProcessClockTick()
     }
 
-    var isProcessClockScheduled: Bool { processClockTimer != nil }
+    /// Stops the chain without owning anything to invalidate. A one-shot tick
+    /// already queued in the RunLoop fails the generation check on fire and
+    /// simply does not reschedule itself, so stopping leaves no object behind.
+    private func stopProcessClock() {
+        processClockGeneration &+= 1
+        isProcessClockScheduled = false
+    }
+
+    private func scheduleProcessClockTick() {
+        guard isProcessClockScheduled else { return }
+        let generation = processClockGeneration
+        let interval = ConversationProcessPresentation.elapsedRefreshInterval
+        // Fire at the next whole-second boundary of the running turn, so the
+        // label changes exactly when its displayed integer second changes.
+        let now = Date()
+        let fireAt: Date
+        if let index = activeProcessClockRowIndex, rows.indices.contains(index),
+           let start = rows[index].processStartedAt {
+            let elapsed = now.timeIntervalSince(start)
+            fireAt = start.addingTimeInterval((elapsed.rounded(.down) + 1) * interval)
+        } else {
+            fireAt = now.addingTimeInterval(interval)
+        }
+        let timer = Timer(fire: max(fireAt, now.addingTimeInterval(0.02)),
+                          interval: interval, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isProcessClockScheduled,
+                      self.processClockGeneration == generation else { return }
+                self.refreshVisibleProcessElapsed()
+                self.scheduleProcessClockTick()
+            }
+        }
+        // .default contains no NSEventTrackingRunLoopMode: during a window
+        // drag / live resize the tick never fires. On mouse-up the overdue
+        // one-shot fires once, reads the real clock, and realigns to the next
+        // boundary, so the label catches up without ever drifting.
+        RunLoop.main.add(timer, forMode: .default)
+    }
 
     private func refreshVisibleProcessElapsed(now: Date = Date()) {
         guard presentationActive, canAdvanceProcessClock, let tableView,
@@ -278,12 +335,17 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         collapseButton.identifier = NSUserInterfaceItemIdentifier("chat.timeline.process-follow-collapse")
         collapseButton.setAccessibilityLabel(L10n("Collapse") + " · " + L10n("Execution process"))
         collapseButton.isHidden = true
-        scrollView.addSubview(collapseButton, positioned: .above, relativeTo: scrollView.contentView)
+        // The handle lives in the message document, not in the viewport. Its
+        // frame is pinned to the end of the expanded process card, so scrolling
+        // and live resize move it with the content instead of chasing the
+        // visible rect on every frame.
+        let host = scrollView.documentView ?? tableView
+        host.addSubview(collapseButton, positioned: .above, relativeTo: nil)
+        processCollapseHost = host
         processCollapseButton = collapseButton
         if let firstLayoutScrollView = scrollView as? FirstLayoutRestoringScrollView {
             firstLayoutScrollView.onLayout = { [weak self] in
                 self?.restoreInitialViewportSynchronouslyIfNeeded()
-                self?.reconcileLayout()
                 if let self {
                     SessionSwitchTrace.shared.mark(.viewportLayout, sessionID: self.representedSessionID)
                 }
@@ -299,8 +361,15 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
                 scroller.onEnd = firstLayoutScrollView.onUserScrollDidEnd
             }
         }
+        if let intrinsicTable = tableView as? IntrinsicHeightTableView {
+            intrinsicTable.onLayout = { [weak self] in
+                self?.scheduleDocumentExtentSync()
+            }
+        }
         tableView.dataSource = self
         tableView.delegate = self
+        tableView.usesAutomaticRowHeights = true
+        tableView.rowHeight = 100 // AppKit's offscreen estimate, never an exact height cache.
         NotificationCenter.default.addObserver(self, selector: #selector(messageSubmissionAccepted(_:)), name: .sessionTimelineSubmissionAccepted, object: nil)
         scrollView.postsFrameChangedNotifications = true
         tableView.postsFrameChangedNotifications = true
@@ -369,50 +438,28 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         rows.count
     }
 
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        guard rows.indices.contains(row) else { return tableView.rowHeight }
-        let item = rows[row]
-        let columnWidth = max(120, tableView.tableColumns.first?.width ?? tableView.bounds.width)
-        let isLiveResize = ConsoleNativeSplitView.isResizing(tableView)
-        let measurementWidth = LiveResizeWidthPolicy.measurementWidth(
-            columnWidth,
-            isLiveResize: isLiveResize
-        )
-        let key = HeightCacheKey(
-            sessionID: representedSessionID,
-            id: item.id,
-            revision: item.contentRevision,
-            widthBucket: Int((measurementWidth * 2).rounded()),
-            isLiveResizeApproximation: isLiveResize,
-            imageGeometries: item.imageGeometries
-        )
-        if let cached = heightCache[key] { return cached }
-
-        let height = NativeTimelineLayoutCache.shared.layout(
-            for: item,
-            columnWidth: measurementWidth,
-            typography: skin.typography(for: item.nativeStyle == .user ? .user : .assistant),
-            skin: skin
-        ).rowHeight
-        if heightCache.count >= 20_000 {
-            heightCache.removeAll(keepingCapacity: true)
-        }
-        heightCache[key] = height
-        return height
-    }
-
-
     private func usesSharedCard(_ row: AppKitChatTimelineRow) -> Bool {
-        return (row.scheduledTrigger != nil || row.userInput != nil || row.executionPlan != nil || (row.nativeStyle == .process ? useSharedProcessCards : useSharedTextCards))
+        return (row.coordinationProgress != nil || row.scheduledTrigger != nil || row.userInput != nil || row.executionPlan != nil || (row.nativeStyle == .process ? useSharedProcessCards : useSharedTextCards))
             && MacSharedMessageTextCard.supports(row)
     }
 
     /// Reuse the existing width reflow transaction for reading metrics too.
     func updateSkin(_ next: ConversationSkin) {
         guard skin != next else { return }
+        // Capture while the old width and typography still describe the
+        // displayed glyphs. synchronizeTableWidth may already reflow cells.
+        let oldWidth = tableView?.tableColumns.first?.width ?? 0
+        let anchor: TypographyAnchor?
+        if let saved = typographyReadingAnchor, saved.generation == scrollCommandGeneration,
+           saved.width == oldWidth, rows.contains(where: { $0.id == saved.anchor.rowID }), !followsLatest {
+            anchor = saved.anchor
+        } else {
+            anchor = presentationActive ? captureTypographyAnchor() : nil
+        }
         skin = next
+        synchronizeTableWidth()
         needsTypographyReflow = tableView != nil && !rows.isEmpty
-        if needsTypographyReflow && presentationActive { reflowForTypography() }
+        if needsTypographyReflow && presentationActive { reflowForTypography(preserving: anchor) }
     }
 
     private struct TypographyAnchor {
@@ -478,17 +525,18 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         return restore(anchor: (anchor.rowID, y - tableView.rect(ofRow: index).minY), in: tableView)
     }
 
-    private func reflowForTypography() {
+    private func reflowForTypography(preserving capturedAnchor: TypographyAnchor? = nil) {
         guard let tableView, let scrollView else { return }
         needsTypographyReflow = false
         let width = tableView.tableColumns.first?.width ?? tableView.bounds.width
         let anchor: TypographyAnchor?
-        if let saved = typographyReadingAnchor, saved.generation == scrollCommandGeneration,
+        if let capturedAnchor {
+            anchor = capturedAnchor
+        } else if let saved = typographyReadingAnchor, saved.generation == scrollCommandGeneration,
            saved.width == width, rows.contains(where: { $0.id == saved.anchor.rowID }), !followsLatest {
             anchor = saved.anchor
         } else { anchor = captureTypographyAnchor() }
         typographyReadingAnchor = anchor.map { ($0, scrollCommandGeneration, width) }
-        heightCache.removeAll(keepingCapacity: true)
         let visible = tableView.rows(in: scrollView.contentView.bounds)
         if visible.location != NSNotFound {
             for row in visible.location..<min(rows.count, NSMaxRange(visible)) {
@@ -496,12 +544,19 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
                     .updateAppearance(skin: skin)
             }
         }
+        // Typography changes can shrink native automatic heights even when
+        // width is unchanged. Invalidate these containers only for this action.
+        if visible.location != NSNotFound {
+            resetSDKRowContainers(IndexSet(integersIn: visible.location..<min(rows.count, NSMaxRange(visible))), in: tableView)
+        }
         performExactWidthReflow()
         if let anchor { _ = restoreTypographyAnchor(anchor) }
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard rows.indices.contains(row) else { return nil }
+        isProvidingCell = true
+        defer { isProvidingCell = false }
         let rowModel = rows[row]
         let cacheKey = CellCacheKey(
             sessionID: representedSessionID,
@@ -536,12 +591,14 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         }
         SessionSwitchTrace.shared.recordCell(.miss, sessionID: representedSessionID, rowID: rowModel.id)
         let identifier = usesSharedText ? Self.sharedTextCellIdentifier : Self.nativeCellIdentifier
-        let cell: NSTableCellView & AppKitChatRowRendering =
-            (tableView.makeView(withIdentifier: identifier, owner: nil) as? (NSTableCellView & AppKitChatRowRendering)) ?? {
+        // Cached cells remain bound to a semantic message. AppKit's reuse
+        // queue cannot also rebind them while a row container is recreated.
+        let cell: NSTableCellView & AppKitChatRowRendering = {
                 ChatPerformanceRecorder.shared.increment(.appKitCellsCreated)
                 if usesSharedText { return AppKitSharedMessageTextCell(identifier: identifier) }
                 return AppKitChatNativeTextCell(identifier: identifier)
             }()
+        cell.identifier = nil
         ChatPerformanceRecorder.shared.increment(.appKitRowsConfigured)
         configureImageGeometryCallback(cell, row: rowModel)
         cell.updateAppearance(skin: skin)
@@ -584,7 +641,6 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         let changed = IndexSet(rows.indices.filter { ids.contains(rows[$0].id) })
         guard !changed.isEmpty else { return }
         let anchor = followsLatest ? nil : visibleAnchor(in: tableView)
-        heightCache = heightCache.filter { !ids.contains($0.key.id) }
         let width = tableView.tableColumns.first?.width ?? tableView.bounds.width
         for index in changed {
             if let cell = tableView.view(atColumn: 0, row: index, makeIfNecessary: false) as? (NSTableCellView & AppKitChatRowRendering) {
@@ -592,6 +648,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
                     onToggleExpansion: onToggleExpansion, onAction: onAction)
             }
         }
+        resetSDKRowContainers(changed, in: tableView)
         tableView.noteHeightOfRows(withIndexesChanged: changed)
         synchronizeDocumentHeight(in: tableView)
         if followsLatest { enqueueCorrection(.bottom) }
@@ -630,6 +687,40 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         cellRecency.append(key)
     }
 
+    private var processStepVersions: [String: (step: NativeExecutionTimelineStep, revision: Int)] = [:]
+
+    private func virtualizedProcessRows(_ source: [AppKitChatTimelineRow]) -> [AppKitChatTimelineRow] {
+        var result: [AppKitChatTimelineRow] = []
+        var retained = Set(cellsByKey.keys.map(\.rowID))
+        for original in source {
+            guard original.nativeStyle == .process, original.isExpanded,
+                  original.processParentID == nil, !original.processSteps.isEmpty,
+                  original.rawStatusText.isEmpty, useSharedProcessCards else { result.append(original); continue }
+            var header = original
+            header.processSteps = []
+            header.nativeText = ""
+            header.hasVirtualProcessChildren = true
+            result.append(header)
+            for step in original.processSteps {
+                let id = original.id + "/step/" + step.id
+                let previous = processStepVersions[id]
+                let revision = previous?.step == step ? previous!.revision : (previous?.revision ?? 0) &+ 1
+                processStepVersions[id] = (step, revision)
+                retained.insert(id)
+                var child = AppKitChatTimelineRow(id: id, contentRevision: revision,
+                    nativeText: "", copyText: NativeExecutionTimelineProjection.plainText(for: [step]),
+                    nativeStyle: .process, title: "", metadata: "", expandableTurnId: nil,
+                    isExpanded: true, processSteps: [step], showsHeader: false)
+                child.sessionID = original.sessionID
+                child.processParentID = original.id
+                child.processStep = step
+                result.append(child)
+            }
+        }
+        processStepVersions = processStepVersions.filter { retained.contains($0.key) }
+        return result
+    }
+
     func apply(rows nextRows: [AppKitChatTimelineRow], contentRevision: UInt64? = nil, animated: Bool = false) {
         if let contentRevision, lastAppliedContentRevision == contentRevision,
            lastAppliedContentSessionID == representedSessionID { return }
@@ -637,9 +728,9 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         lastAppliedContentSessionID = representedSessionID
         let trace = SessionSwitchTrace.shared.start(.timelineApply, sessionID: representedSessionID)
         defer { SessionSwitchTrace.shared.finish(trace) }
-        let nextRows = ConversationTimeSeparatorPolicy.applying(to: Self.uniquedRows(nextRows))
+        let nextRows = ConversationTimeSeparatorPolicy.applying(to: Self.uniquedRows(virtualizedProcessRows(nextRows)))
         hasExpandedProcessRows = nextRows.contains { $0.nativeStyle == .process && $0.isExpanded }
-        defer { synchronizeProcessClock(); updateProcessCollapseButton() }
+        defer { synchronizeProcessClock(); positionProcessCollapseButton(); scheduleUnderfilledHistoryEvaluation() }
         suppressNearTopDuringLayout()
         guard let tableView else {
             rows = nextRows
@@ -652,13 +743,19 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
             isAwaitingSessionRows = false
             rows = nextRows
             revisionsByID = Dictionary(uniqueKeysWithValues: nextRows.map { ($0.id, $0.contentRevision) })
+            // Set the target width before mounting target cells. Width
+            // synchronization must not cause a second SDK data reload.
+            isReloadingSDKRowData = true
+            synchronizeTableWidth(reflowingRows: false)
             tableView.reloadData()
-            synchronizeTableWidth()
+            isReloadingSDKRowData = false
+            lastReflowMeasurementWidth = tableView.tableColumns.first?.width
             synchronizeDocumentHeight(in: tableView)
             restoreInitialViewportSynchronouslyIfNeeded()
             schedulePendingInitialViewportRestoreIfNeeded()
             return
         }
+        let previousRows = rows
         let oldIDs = rows.map(\.id)
         let newIDs = nextRows.map(\.id)
         let oldRevisions = revisionsByID
@@ -677,9 +774,12 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         // physical bottom must not strand a completed reply below the
         // visible document. Only an empty projection has no geometry to
         // consult, so it falls back to the semantic flag.
-        let shouldFollowAfterUpdate = pendingProcessCollapseRowID == nil && (rows.isEmpty
-            ? followedLatestBeforeUpdate
-            : isViewportNearBottom())
+        let shouldFollowAfterUpdate = pendingProcessCollapseRowID == nil
+            && (pendingRestorePosition?.followsLatest ?? (rows.isEmpty
+                ? followedLatestBeforeUpdate : isViewportNearBottom()))
+        // Native layout can resolve during the mutation. Commit physical
+        // reader intent first so an old SwiftUI follow value cannot win.
+        followsLatest = shouldFollowAfterUpdate
         synchronizeTableWidth()
         let width = tableView.tableColumns.first?.width ?? tableView.bounds.width
         let hasPendingInitialViewport = pendingRestorePosition != nil || pendingInitialScrollToBottom
@@ -698,13 +798,6 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         let prependAnchor = !shouldFollowAfterUpdate && !hasPendingInitialViewport
             ? visibleAnchor(in: tableView)
             : nil
-        if abs(width - lastMeasuredWidth) >= 1 {
-            lastMeasuredWidth = width
-            heightCache.removeAll(keepingCapacity: true)
-            if tableView.numberOfRows > 0 {
-                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<tableView.numberOfRows))
-            }
-        }
         rows = nextRows
         revisionsByID = Dictionary(uniqueKeysWithValues: nextRows.map { ($0.id, $0.contentRevision) })
 
@@ -717,11 +810,13 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
                 oldReplyIdentities: oldReplyIdentitiesByID,
                 in: tableView
             )
+            // Structural changes can remove headers or precede an explicit
+            // session restore; settle their document before compensation.
             synchronizeDocumentHeight(in: tableView)
             if let rowID = pendingProcessCollapseRowID {
                 pendingProcessCollapseRowID = nil
                 scrollToProcessRow(rowID)
-            } else if shouldFollowAfterUpdate, !pendingInitialScrollToBottom {
+            } else if shouldFollowAfterUpdate, !hasPendingInitialViewport {
                 scrollToBottom()
             } else if let returningFromEmptyProjection {
                 deferredEmptyProjectionViewport = nil
@@ -765,10 +860,12 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
                 || oldReplyIdentities[index] != nextRows[index].replyIdentity
         })
         guard !changed.isEmpty else { return }
-        heightCache = heightCache.filter { key, _ in
-            key.sessionID != representedSessionID
-                || !changed.contains { index in nextRows[index].id == key.id }
-        }
+        let resetSDKRows = IndexSet(changed.filter { index in
+            (oldRevisions[nextRows[index].id] != nextRows[index].contentRevision
+                && !(usesSharedCard(previousRows[index]) && usesSharedCard(nextRows[index])
+                    && SDKRowContainerResetPolicy.canRetainForAppend(previous: previousRows[index], next: nextRows[index])))
+                || (oldReplyIdentities[index] == nil) != (nextRows[index].replyIdentity == nil)
+        })
         for row in changed {
             let currentCell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false)
             if let nativeCell = currentCell as? (NSTableCellView & AppKitChatRowRendering) {
@@ -784,15 +881,24 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
                     onAction: onAction
                 )
                 cacheCell(nativeCell, for: nextRows[row])
+
             }
         }
+        resetSDKRowContainers(resetSDKRows, in: tableView)
         tableView.noteHeightOfRows(withIndexesChanged: changed)
-        synchronizeDocumentHeight(in: tableView)
+        // The reset classification above already checked the suffix. Reuse
+        // that result instead of scanning an appended body a second time.
+        let onlyStableAppend = resetSDKRows.isEmpty && changed.allSatisfy {
+            oldRevisions[nextRows[$0].id] != nextRows[$0].contentRevision
+        }
+        if !onlyStableAppend || !shouldFollowAfterUpdate || hasPendingInitialViewport {
+            synchronizeDocumentHeight(in: tableView)
+        }
         if let rowID = pendingProcessCollapseRowID {
             pendingProcessCollapseRowID = nil
             scrollToProcessRow(rowID)
         } else if shouldFollowAfterUpdate,
-           !pendingInitialScrollToBottom {
+           !hasPendingInitialViewport {
             scrollToBottom()
         } else if let prependAnchor {
             restore(anchor: prependAnchor, in: tableView)
@@ -808,75 +914,98 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         oldReplyIdentities: [String: ConversationReplyIdentity],
         in tableView: NSTableView
     ) {
+        let selectedIDs = tableView.selectedRowIndexes.compactMap {
+            oldIDs.indices.contains($0) ? oldIDs[$0] : nil
+        }
+        let width = tableView.tableColumns.first?.width ?? tableView.bounds.width
+        let visible = tableView.rows(in: tableView.visibleRect)
+        let mountedIDs = Set(visible.location == NSNotFound ? [] : oldIDs.dropFirst(visible.location).prefix(visible.length))
+        for row in rows where mountedIDs.contains(row.id) {
+            guard let revision = oldRevisions[row.id],
+                  revision != row.contentRevision || oldReplyIdentities[row.id] != row.replyIdentity,
+                  let cell = cellsByKey[CellCacheKey(sessionID: representedSessionID, rowID: row.id, revision: revision)],
+                  (cell is AppKitSharedMessageTextCell) == usesSharedCard(row) else { continue }
+            cell.setContent(row, availableWidth: width, baseDirectory: baseDirectory,
+                onToggleExpansion: onToggleExpansion, onAction: onAction)
+            cacheCell(cell, for: row)
+        }
+        let selectedRows = IndexSet(selectedIDs.compactMap { rowIndexesByID[$0] })
         let difference = newIDs.difference(from: oldIDs)
-        var removals = IndexSet()
-        var insertions = IndexSet()
+        var removed = IndexSet(), inserted = IndexSet()
         for change in difference {
             switch change {
-            case .remove(let offset, _, _): removals.insert(offset)
-            case .insert(let offset, _, _): insertions.insert(offset)
+            case .remove(let offset, _, _): removed.insert(offset)
+            case .insert(let offset, _, _): inserted.insert(offset)
             }
         }
-
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0
-            context.allowsImplicitAnimation = false
+            context.duration = 0; context.allowsImplicitAnimation = false
             tableView.beginUpdates()
-            if !removals.isEmpty {
-                tableView.removeRows(at: removals, withAnimation: [])
-            }
-            if !insertions.isEmpty {
-                tableView.insertRows(at: insertions, withAnimation: [])
-            }
+            if !removed.isEmpty { tableView.removeRows(at: removed, withAnimation: []) }
+            if !inserted.isEmpty { tableView.insertRows(at: inserted, withAnimation: []) }
             tableView.endUpdates()
         }
+        tableView.selectRowIndexes(selectedRows, byExtendingSelection: false)
+    }
 
-        let changedSurvivors = IndexSet(newIDs.indices.filter { index in
-            !insertions.contains(index)
-                && (oldRevisions[newIDs[index]] != rows[index].contentRevision
-                    || oldReplyIdentities[newIDs[index]] != rows[index].replyIdentity)
-        })
-        if !changedSurvivors.isEmpty {
-            heightCache = heightCache.filter { key, _ in
-                key.sessionID != representedSessionID
-                    || !changedSurvivors.contains { rows[$0].id == key.id }
+    private func scheduleDocumentExtentSync() {
+        guard presentationActive, !isSynchronizingDocumentExtent, !applyingCorrection else { return }
+        scheduleViewportCommit()
+    }
+
+    /// Layout completion and scroll intent share one pending main-queue effect.
+    private func scheduleViewportCommit() {
+        guard !correctionScheduled else { return }
+        correctionScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.correctionScheduled = false
+            guard self.presentationActive, let table = self.tableView else { return }
+            if self.pendingCorrection != nil { self.commitCorrection() }
+            else {
+                let previousHeight = self.scrollView?.documentView?.frame.height
+                self.synchronizeDocumentExtent(in: table)
+                // Only a changed document extent needs follow reconciliation.
+                // Ordinary native layout while scrolling must not create a jump.
+                if previousHeight != self.scrollView?.documentView?.frame.height {
+                    self.reconcileLayout()
+                }
             }
-            tableView.reloadData(
-                forRowIndexes: changedSurvivors,
-                columnIndexes: IndexSet(integer: 0)
-            )
-            tableView.noteHeightOfRows(withIndexesChanged: changedSurvivors)
         }
     }
 
     private func synchronizeDocumentHeight(in tableView: NSTableView) {
+        #if DEBUG
+        documentHeightSyncCount += 1
+        #endif
         tableView.layoutSubtreeIfNeeded()
+        synchronizeDocumentExtent(in: tableView)
+    }
+
+    private func synchronizeDocumentExtent(in tableView: NSTableView) {
+        guard !isSynchronizingDocumentExtent else { return }
+        isSynchronizingDocumentExtent = true
+        defer { isSynchronizingDocumentExtent = false }
         let rowsHeight = (rows.isEmpty
             ? 0
             : tableView.rect(ofRow: rows.count - 1).maxY)
-        // Keep chrome clearance in the scrollable document, outside the table.
-        // The table's origin is the readable top boundary at scroll position 0.
-        if abs(tableView.frame.minY - topClearance) >= 0.5
-            || abs(tableView.frame.height - rowsHeight) >= 0.5 {
-            tableView.frame = NSRect(
-                x: 0,
-                y: topClearance,
-                width: tableView.frame.width,
-                height: rowsHeight
-            )
+        if abs(tableView.frame.minY - topClearance) >= 0.5 || abs(tableView.frame.height - rowsHeight) >= 0.5 {
+            tableView.frame = NSRect(x: tableView.frame.minX, y: topClearance,
+                width: tableView.frame.width, height: rowsHeight)
         }
-        let documentHeight = topClearance + rowsHeight + bottomClearance
-        if let documentView = scrollView?.documentView {
-            let documentSize = NSSize(
-                width: max(tableView.frame.width, scrollView?.contentView.bounds.width ?? 0),
-                height: documentHeight
-            )
-            if abs(documentView.frame.width - documentSize.width) >= 0.5
-                || abs(documentView.frame.height - documentSize.height) >= 0.5 {
-                documentView.setFrameSize(documentSize)
+        if let document = scrollView?.documentView {
+            let height = topClearance + rowsHeight + bottomClearance
+            if abs(document.frame.height - height) >= 0.5 {
+                document.setFrameSize(NSSize(width: document.frame.width, height: height))
             }
         }
-        scheduleUnderfilledHistoryEvaluation()
+        // Measured row heights can move the process card's bottom edge. Snap
+        // the pinned handle to it, but never during a live resize frame:
+        // windowDidEndLiveResize performs that single catch-up on mouse-up.
+        if !(scrollView?.window?.inLiveResize ?? false),
+           !(scrollView.map(ConsoleNativeSplitView.isResizing) ?? false) {
+            positionProcessCollapseButton()
+        }
     }
 
     func setTopClearance(_ value: CGFloat) {
@@ -932,6 +1061,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
             guard let self,
                   self.presentationActive, self.underfilledHistoryEvaluationGeneration == generation,
                   self.hasMoreHistory,
+                  self.scrollView.map({ !ConsoleNativeSplitView.isResizing($0) }) == true,
                   self.underfilledHistoryRequestCount < 4,
                   let tableView = self.tableView,
                   let clipView = self.scrollView?.contentView,
@@ -1010,13 +1140,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         } else {
             pendingCorrection = correction
         }
-        guard !correctionScheduled else { return }
-        correctionScheduled = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.correctionScheduled = false
-            self.commitCorrection()
-        }
+        scheduleViewportCommit()
     }
 
     private func commitCorrection(allowDuringUserScroll: Bool = false) {
@@ -1027,7 +1151,10 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         pendingCorrection = nil
         applyingCorrection = true
         defer { applyingCorrection = false }
-        tableView.layoutSubtreeIfNeeded()
+        if case let .anchor(id, _) = correction,
+           let index = rows.firstIndex(where: { $0.id == id }) {
+            prepareSDKDestination(index, in: tableView)
+        }
         synchronizeDocumentHeight(in: tableView)
         let maximumY = max(0, (scrollView?.documentView?.frame.height ?? 0) - clip.bounds.height)
         let y: CGFloat
@@ -1039,7 +1166,24 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
             guard !followsLatest, let index = rows.firstIndex(where: { $0.id == id }) else { return }
             y = min(maximumY, max(0, tableView.rect(ofRow: index).minY + offset))
         }
+        let realizedRows = tableView.rows(in: tableView.visibleRect)
         clip.scroll(to: NSPoint(x: 0, y: y))
+        if tableView.needsLayout || tableView.rows(in: tableView.visibleRect) != realizedRows
+            || abs(max(0, (scrollView?.documentView?.frame.height ?? 0) - clip.bounds.height) - maximumY) > 0.5 {
+            // Scrolling realizes neighbouring estimates. Resolve that layout
+            // once in this transaction before committing the semantic target.
+            synchronizeDocumentHeight(in: tableView)
+            let maximum = max(0, (scrollView?.documentView?.frame.height ?? 0) - clip.bounds.height)
+            let settledY: CGFloat
+            switch correction {
+            case .bottom: settledY = maximum
+            case let .anchor(id, offset):
+                guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
+                settledY = min(maximum, max(0, tableView.rect(ofRow: index).minY + offset))
+            }
+            clip.scroll(to: NSPoint(x: 0, y: settledY))
+        }
+
         scrollView?.reflectScrolledClipView(clip)
         let anchor = visibleAnchor(in: tableView)
         traceViewport("commit y=\(y) anchor=\(anchor?.id ?? "none")")
@@ -1047,6 +1191,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     }
 
     private func reconcileLayout() {
+        guard presentationActive else { needsPresentationLayout = true; return }
         guard !applyingCorrection, !isRestoringInitialViewport,
               !isProcessingUserScrollEvent,
               pendingRestorePosition == nil, !pendingInitialScrollToBottom else { return }
@@ -1095,7 +1240,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     }
 
     @objc private func viewportBoundsDidChange(_ notification: Notification) {
-        updateProcessCollapseButton()
+        // The collapse handle is document-anchored; scrolling never repositions it.
         viewportDidScroll()
     }
 
@@ -1112,51 +1257,52 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         onToggleExpansion(turnID)
     }
 
-    private func updateProcessCollapseButton() {
+    /// The collapse handle is anchored to the bottom edge of the last expanded
+    /// process group. Its frame lives in document coordinates, so neither
+    /// scrolling nor a live resize moves it; only a content/layout change (new
+    /// rows, measured row heights, or a finished resize) repositions it.
+    private func positionProcessCollapseButton() {
         guard hasExpandedProcessRows,
-              let tableView, let scrollView, let button = processCollapseButton,
+              let tableView, let button = processCollapseButton,
+              let host = processCollapseHost ?? button.superview,
               let column = tableView.tableColumns.first, !rows.isEmpty else {
             processCollapseButton?.isHidden = true
             visibleProcessCollapseRowID = nil
             return
         }
-        let clip = scrollView.contentView
-        let visible = tableView.convert(clip.bounds, from: clip)
-        let readable = NSRect(x: visible.minX, y: visible.minY + topClearance,
-                              width: visible.width,
-                              height: max(0, visible.height - topClearance - bottomClearance))
-        let range = tableView.rows(in: readable)
-        guard range.location != NSNotFound else {
+        guard let headerIndex = rows.lastIndex(where: {
+            $0.nativeStyle == .process && $0.isExpanded && $0.expandableTurnId != nil
+        }) else {
+            button.isHidden = true
+            visibleProcessCollapseRowID = nil
+            return
+        }
+        let lastMountedRow = min(rows.count, tableView.numberOfRows) - 1
+        guard lastMountedRow >= 0 else {
+            button.isHidden = true
+            visibleProcessCollapseRowID = nil
+            return
+        }
+        let endIndex = min(processGroupEndIndexes[rows[headerIndex].id] ?? headerIndex, lastMountedRow)
+        let endRect = tableView.rect(ofRow: endIndex)
+        guard endRect.height > 0 else {
             button.isHidden = true
             visibleProcessCollapseRowID = nil
             return
         }
         let cardWidth = MessageBubbleWidthPolicy.processCardWidth(
             summaryWidth: 0, expanded: true, laneWidth: column.width)
-        let candidates: [ProcessCollapseCandidate] = (range.location..<min(rows.count, range.location + range.length))
-            .compactMap { index in
-                let row = rows[index]
-                guard row.nativeStyle == .process, row.isExpanded,
-                      row.expandableTurnId != nil else { return nil }
-                let rowRect = tableView.rect(ofRow: index)
-                return ProcessCollapseCandidate(id: row.id,
-                    frame: CGRect(x: rowRect.minX + 2,
-                                  y: rowRect.minY + (skin.showsTimelineTimeSeparators ? row.timeSeparatorHeight : 0) + row.replyIdentityHeight,
-                                  width: cardWidth,
-                                  height: max(0, rowRect.height - (skin.showsTimelineTimeSeparators ? row.timeSeparatorHeight : 0) - row.replyIdentityHeight)),
-                    headerHeight: row.processCurrentStepTitle == nil ? 32 : 48)
-            }
-        guard let placement = ProcessCollapsePlacementPolicy.placement(
-            candidates: candidates, viewport: readable,
-            handleSize: button.frame.size) else {
-            button.isHidden = true
-            visibleProcessCollapseRowID = nil
-            return
-        }
-        visibleProcessCollapseRowID = placement.id
-        let buttonRect = NSRect(origin: placement.origin, size: button.frame.size)
-        let converted = tableView.convert(buttonRect, to: scrollView)
-        if button.frame != converted { button.frame = converted }
+        let size = button.frame.size
+        let margin: CGFloat = 10
+        let rightEdge = min(endRect.maxX, endRect.minX + 2 + cardWidth)
+        let targetInTable = NSRect(
+            x: max(endRect.minX + margin, rightEdge - size.width - margin),
+            y: max(endRect.minY, endRect.maxY - size.height - margin),
+            width: size.width, height: size.height)
+        let target = host === tableView
+            ? targetInTable : tableView.convert(targetInTable, to: host)
+        if button.frame != target { button.frame = target }
+        visibleProcessCollapseRowID = rows[headerIndex].id
         button.isHidden = false
     }
 
@@ -1197,6 +1343,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         // so `userDidBeginScrolling()` would otherwise leave follow mode
         // false even though the viewport never left the latest region.
         // Reconcile once from final geometry after every user gesture.
+        if let tableView { synchronizeDocumentHeight(in: tableView) }
         viewportDidScroll(userInitiated: true)
         isProcessingUserScrollEvent = false
         scheduleImageGeometryCommit()
@@ -1217,10 +1364,23 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     }
 
     @objc private func containerFrameDidChange(_ notification: Notification) {
+        containerGeometryDidChange(isResizing: scrollView.map(ConsoleNativeSplitView.isResizing) ?? false)
+    }
+
+    func containerGeometryDidChange(isResizing: Bool) {
+        guard presentationActive else { needsPresentationLayout = true; return }
+        commitContainerGeometry()
+    }
+
+    private func commitContainerGeometry() {
+        #if DEBUG
+        resizeLayoutCommitCount += 1
+        #endif
+        // Read current geometry once; never replay queued intermediate widths.
+        // The collapse handle is left alone during live resize: it is pinned
+        // to the process card, not to the viewport.
         synchronizeTableWidth()
-        updateProcessCollapseButton()
         reconcileLayout()
-        scheduleUnderfilledHistoryEvaluation()
     }
 
     @objc private func capturePositionForTermination(_ notification: Notification) {
@@ -1232,9 +1392,12 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
 
     @objc private func windowDidEndLiveResize(_ notification: Notification) {
         guard let window = notification.object as? NSWindow,
-              window === scrollView?.window,
-              needsExactWidthReflow else { return }
-        performExactWidthReflow()
+              window === scrollView?.window else { return }
+        guard presentationActive else { needsPresentationLayout = true; return }
+        commitContainerGeometry()
+        // Row heights may have changed with the new column width; snap the
+        // document-anchored handle back onto the process card's bottom edge.
+        positionProcessCollapseButton()
     }
 
     func setReservesVerticalScrollerGutter(_ reserves: Bool) {
@@ -1244,46 +1407,33 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         reconcileLayout()
     }
 
-    private func synchronizeTableWidth() {
-        guard let tableView, let scrollView, let column = tableView.tableColumns.first else { return }
+    private func synchronizeTableWidth(reflowingRows: Bool = true) {
+        guard presentationActive else { needsPresentationLayout = true; return }
+        guard let tableView, let scrollView else { return }
         // Every timeline stays overlay-style: a restored legacy preference
         // would introduce an opaque track strip and narrow the clip view.
         if let timelineScrollView = scrollView as? FirstLayoutRestoringScrollView,
            !timelineScrollView.forcesOverlayScrollers {
             timelineScrollView.forcesOverlayScrollers = true
         }
-        // All timelines use the full parent width; overlay scrollers do not
-        // consume a layout lane or change text wrapping when they appear.
-        let width = max(120, scrollView.bounds.width)
-        guard abs(column.width - width) >= 0.5 else { return }
+        // Constraints own horizontal geometry; only wrapping-dependent row work remains.
+        let width = tableView.bounds.width
+        guard width > 0, abs((lastReflowMeasurementWidth ?? -1) - width) >= 0.5 else { return }
+        lastReflowMeasurementWidth = width
         let anchor = visibleAnchor(in: tableView)
-        column.width = width
-        if let documentView = scrollView.documentView {
-            documentView.setFrameSize(NSSize(
-                width: scrollView.contentView.bounds.width,
-                height: documentView.frame.height
-            ))
-        }
         // This path now runs only for an actual container resize. Scroller
         // visibility no longer changes the layout width.
         lastMeasuredWidth = width
-        if !rows.isEmpty {
+        if reflowingRows, !rows.isEmpty {
             let visible = tableView.rows(in: tableView.visibleRect)
             let isLiveResize = ConsoleNativeSplitView.isResizing(scrollView)
-            let measurementWidth = LiveResizeWidthPolicy.measurementWidth(
-                width,
-                isLiveResize: isLiveResize
-            )
-            let requiresReflow = LiveResizeWidthPolicy.requiresReflow(
-                previous: lastReflowMeasurementWidth,
-                next: measurementWidth
-            )
+            let measurementWidth = width
             let rowsToReflow = LiveResizeRowReflowPolicy.indexes(
                 rowCount: rows.count,
                 visibleRows: visible,
                 isLiveResize: isLiveResize
             )
-            if requiresReflow, visible.location != NSNotFound {
+            if visible.location != NSNotFound {
                 let upperBound = min(rows.count, visible.location + visible.length)
                 for row in visible.location..<upperBound {
                     if let nativeCell = tableView.view(
@@ -1311,15 +1461,13 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
                 // Keep the native viewport and visible text exact enough to
                 // interact with, but do not synchronously ask NSTableView
                 // to remeasure every offscreen message for every drag tick.
-                needsExactWidthReflow = true
-                if requiresReflow, !rowsToReflow.isEmpty {
-                    tableView.noteHeightOfRows(withIndexesChanged: rowsToReflow)
+                    if !rowsToReflow.isEmpty {
+                    updateWidthReflowHeights(rowsToReflow, in: tableView)
                 }
-            } else if requiresReflow {
-                tableView.noteHeightOfRows(withIndexesChanged: rowsToReflow)
-                synchronizeDocumentHeight(in: tableView)
+            } else {
+                updateWidthReflowHeights(rowsToReflow, in: tableView)
             }
-            if requiresReflow {
+            do {
                 lastReflowMeasurementWidth = measurementWidth
                 if followsLatest { enqueueCorrection(.bottom) }
                 else if let anchor { _ = restore(anchor: anchor, in: tableView) }
@@ -1328,9 +1476,8 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     }
 
     private func performExactWidthReflow() {
+        guard presentationActive else { needsPresentationLayout = true; return }
         guard let tableView else { return }
-        needsExactWidthReflow = false
-        heightCache = heightCache.filter { !$0.key.isLiveResizeApproximation }
         guard !rows.isEmpty else { return }
         let anchor = visibleAnchor(in: tableView)
         let exactWidth = tableView.tableColumns.first?.width ?? tableView.bounds.width
@@ -1360,12 +1507,38 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
             }
         }
         lastReflowMeasurementWidth = exactWidth
-        tableView.noteHeightOfRows(
-            withIndexesChanged: IndexSet(integersIn: 0..<rows.count)
-        )
-        synchronizeDocumentHeight(in: tableView)
+        // Finishing a resize reconciles mounted rows only. Offscreen
+        // estimates and their eventual exact heights belong to AppKit.
+        let affected = visible.location == NSNotFound ? IndexSet()
+            : IndexSet(integersIn: visible.location..<min(rows.count, NSMaxRange(visible)))
+        updateWidthReflowHeights(affected, in: tableView)
         if followsLatest { enqueueCorrection(.bottom) }
         else if let anchor { _ = restore(anchor: anchor, in: tableView) }
+    }
+
+    private func resetSDKRowContainers(_ indexes: IndexSet, in tableView: NSTableView) {
+        guard !indexes.isEmpty else { return }
+        #if DEBUG
+        sdkRowResetCount += indexes.count
+        #endif
+        // Content changes invalidate only their native row containers.
+        // Width-only changes bypass this path and retain mounted cells.
+        tableView.beginUpdates()
+        tableView.removeRows(at: indexes, withAnimation: [])
+        tableView.insertRows(at: indexes, withAnimation: [])
+        tableView.endUpdates()
+    }
+
+    private func updateWidthReflowHeights(_ indexes: IndexSet, in tableView: NSTableView) {
+        guard !isReloadingSDKRowData else { return }
+        let visible = tableView.rows(in: tableView.visibleRect)
+        guard visible.location != NSNotFound, visible.location < rows.count else { return }
+        let mounted = indexes.intersection(IndexSet(integersIn: visible.location..<min(rows.count, NSMaxRange(visible))))
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            tableView.noteHeightOfRows(withIndexesChanged: mounted)
+        }
     }
 
     private func visibleAnchor(in tableView: NSTableView) -> (id: String, offset: CGFloat)? {
@@ -1376,8 +1549,10 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         let readableY = max(0, clipView.bounds.minY)
         let row = tableView.row(at: NSPoint(x: 1, y: readableY))
         guard rows.indices.contains(row) else { return nil }
-        let offset = readableY - tableView.rect(ofRow: row).minY
-        return (rows[row].id, offset)
+        // Keep the existing semantic process anchor across child-row virtualization.
+        let anchorRow = rows[row].processParentID.flatMap { rowIndexesByID[$0] } ?? row
+        let offset = readableY - tableView.rect(ofRow: anchorRow).minY
+        return (rows[anchorRow].id, offset)
     }
 
     @discardableResult
@@ -1432,6 +1607,21 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         }
     }
 
+    private var navigationSessionID: String?
+    private var lastNavigationRevision = -1
+    private var pendingNavigationRowID: String?
+    func applyMessageNavigation(rowID: String?, revision: Int) {
+        if navigationSessionID != representedSessionID || lastNavigationRevision != revision {
+            navigationSessionID = representedSessionID
+            lastNavigationRevision = revision
+            pendingNavigationRowID = rowID
+        }
+        guard let id = pendingNavigationRowID,
+              let row = rows.firstIndex(where: { $0.id == id }), tableView != nil else { return }
+        pendingNavigationRowID = nil
+        scrollToRow(row)
+    }
+
     func scrollToTurn(_ turnID: String) {
         guard let row = AppKitChatTimelineView.rowIndex(forTurnID: turnID, in: rows) else { return }
         scrollToRow(row)
@@ -1446,6 +1636,13 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         }
     }
 
+    private func prepareSDKDestination(_ row: Int, in tableView: NSTableView) {
+        // Resolve only the semantic destination through AppKit, rather than
+        // navigating into an offscreen estimated row height.
+        _ = tableView.rowView(atRow: row, makeIfNecessary: true)
+        tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: row))
+    }
+
     private func scrollToRow(_ row: Int, clampsToDocument: Bool = false) {
         guard !isProcessingUserScrollEvent,
               let tableView,
@@ -1456,6 +1653,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         suppressNearTopDuringLayout()
         followsLatest = false
         if followsLatestBinding.wrappedValue { followsLatestBinding.wrappedValue = false }
+        prepareSDKDestination(row, in: tableView)
         tableView.layoutSubtreeIfNeeded()
         synchronizeDocumentHeight(in: tableView)
         // A collapsed row can be near the end of a now much shorter document.
@@ -1465,6 +1663,10 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         let y = clampsToDocument ? min(maximumY, targetY) : targetY
         clipView.scroll(to: NSPoint(x: 0, y: y))
         scrollView?.reflectScrolledClipView(clipView)
+        // One coalesced correction for this navigation intent. Subsequent
+        // input clears it through the existing viewport-intent machinery.
+        enqueueCorrection(.anchor(id: rows[row].id, offset: -10))
+
         schedulePositionPublish()
     }
 
@@ -1492,6 +1694,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
 
     func prepareInitialPosition(_ position: AppKitChatTimelinePosition) {
         lastRequestedRestorePosition = position
+        pendingCorrection = nil
         pendingRestorePosition = position
         pendingInitialScrollToBottom = false
         followsLatest = position.followsLatest
@@ -1519,7 +1722,7 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
     }
 
     private func restoreInitialViewportSynchronouslyIfNeeded() {
-        guard !isRestoringInitialViewport,
+        guard !isRestoringInitialViewport, !isProvidingCell,
               pendingRestorePosition != nil || pendingInitialScrollToBottom,
               let tableView,
               let clipView = scrollView?.contentView,
@@ -1529,6 +1732,10 @@ final class AppKitChatTimelineCoordinator: NSObject, NSTableViewDataSource, NSTa
         isRestoringInitialViewport = true
         defer { isRestoringInitialViewport = false }
         suppressNearTopDuringLayout()
+        if let position = pendingRestorePosition,
+           let row = rows.firstIndex(where: { $0.id == position.rowID }) {
+            prepareSDKDestination(row, in: tableView)
+        }
         tableView.layoutSubtreeIfNeeded()
         synchronizeDocumentHeight(in: tableView)
         let maximumY = max(0, (scrollView?.documentView?.frame.height ?? 0) - clipView.bounds.height)

@@ -4,7 +4,8 @@ import { providerToolSchemaCapabilities } from "../agent-provider/toolSchemaCapa
 import {
   TOOL_CATALOG_SEARCH,
   TOOL_DOMAIN_LOAD,
-  TOOL_RESTRICTED_GATEWAY
+  TOOL_RESTRICTED_GATEWAY,
+  RESTRICTED_GATEWAY_DEFINITION
 } from "./hostToolCatalog.mjs";
 import { buildToolExposurePlan } from "./toolExposurePlan.mjs";
 import { matchesToolMaterializationGeneration } from "./toolHostMaterializationCoordinator.mjs";
@@ -177,6 +178,10 @@ export class ToolHostService {
   }
 
   async #execute(input = {}) {
+    const canonical = input.tool === TOOL_RESTRICTED_GATEWAY ? input.arguments?.tool : input.tool;
+    const entry = canonical ? this.catalog.entry(canonical) : null;
+    const discovery = input.tool === TOOL_CATALOG_SEARCH || input.tool === TOOL_DOMAIN_LOAD;
+    await this.assertExecutionAllowed?.({ ...input, executionEffect: discovery ? "read" : entry?.executionEffect ?? "write" });
     if (input.tool === TOOL_CATALOG_SEARCH) {
       const scope = exactScope(input);
       const searchInput = {
@@ -365,6 +370,10 @@ export class ToolHostService {
     const definitions = [];
     for (const [canonicalName, owner] of Object.entries(record.exposurePlan?.ownership ?? {})) {
       if (owner.surface !== surface) continue;
+      if (canonicalName === TOOL_RESTRICTED_GATEWAY) {
+        definitions.push(RESTRICTED_GATEWAY_DEFINITION);
+        continue;
+      }
       const entry = this.catalog.entry(canonicalName);
       if (entry) definitions.push(entry.definition);
     }
@@ -422,7 +431,7 @@ export class ToolHostService {
       observationId: input.observationId
     });
     const applied = this.appliedDefinitions(input, "generated_authenticated_mcp");
-    const skillTools = this.skillMcpGateway
+    const skillTools = applied.tools.some(tool => tool.name === TOOL_RESTRICTED_GATEWAY) ? [] : this.skillMcpGateway
       ? await this.skillMcpGateway.definitions(input)
       : [];
     const names = new Set(applied.tools.map((tool) => tool.name.toLocaleLowerCase()));

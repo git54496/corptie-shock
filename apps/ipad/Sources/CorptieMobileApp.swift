@@ -46,7 +46,7 @@ struct CorptieMobileApp: App {
                 } else if connection.connected {
                     PadAppShell(connection: connection)
                 } else if connection.restoringConnection {
-                    ProgressView("正在连接上次的 Mac…")
+                    CorptieBrandProgress("正在连接上次的 Mac…", prominent: true)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
                 } else {
@@ -74,6 +74,19 @@ struct PairingView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    HStack(spacing: 16) {
+                        CorptieBrandLogo()
+                            .frame(width: 64, height: 64)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Corptie").font(.title2.weight(.semibold))
+                            Text("连接你的 Mac，随时与 Agent 协作。")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
                 Section("Corptie Cloud") {
                     if connection.cloudSignedIn {
                         Label(connection.cloudAccountStatus, systemImage: "person.crop.circle")
@@ -124,8 +137,8 @@ struct PairingView: View {
                         Text("登录后可在外网连接同账号下的 Mac。账号凭据保存在系统钥匙串，通信内容端到端加密。")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                    if connection.busy { ProgressView("正在处理 Cloud 登录或连接…") }
-                    if connection.cloudSignInPreparing { ProgressView("正在检查登录服务…") }
+                    if connection.busy { CorptieBrandProgress("正在处理 Cloud 登录或连接…") }
+                    if connection.cloudSignInPreparing { CorptieBrandProgress("正在检查登录服务…") }
                     if !connection.cloudNotice.isEmpty {
                         Text(connection.cloudNotice)
                             .font(.footnote)
@@ -142,7 +155,7 @@ struct PairingView: View {
                         Button("重试申请配对") { Task { await connection.requestPairing() } }
                             .accessibilityIdentifier("pairing-retry-request")
                     }
-                    if connection.busy { ProgressView("正在连接 Mac…") }
+                    if connection.busy { CorptieBrandProgress("正在连接 Mac…") }
                     if !connection.notice.isEmpty {
                         Text(connection.notice)
                             .font(.footnote)
@@ -159,7 +172,7 @@ struct PairingView: View {
                 }
                 if connection.lanConnecting || !connection.lanConnectionNotice.isEmpty {
                     Section {
-                        if connection.lanConnecting { ProgressView("正在恢复局域网连接…") }
+                        if connection.lanConnecting { CorptieBrandProgress("正在恢复局域网连接…") }
                         if !connection.lanConnectionNotice.isEmpty {
                             Text(connection.lanConnectionNotice).font(.footnote)
                                 .foregroundStyle(.secondary)
@@ -650,6 +663,7 @@ struct ConversationView: View {
             topOverlayHeight: nativeHeaderHeight + (usesStandardTimeline ? 0 : safeArea.top),
             imageStore: messageImages,
             tracksVisibleFrames: false,
+            rowAliases: workspace.timelineRowAliases,
             row: { id, width in timelineRow(id: id, width: width) },
             composer: Group {
                 if usesStandardTimeline { composer }
@@ -757,6 +771,11 @@ struct ConversationView: View {
             explicitJumpRevision &+= 1
             nativeTimeline.jump?()
         }
+        .onChange(of: workspace.timelineRowAliases) {
+            expandedProcessEntryIDs = Set(expandedProcessEntryIDs.compactMap {
+                workspace.resolveTimelineRowID($0)
+            })
+        }
         .onDisappear {
             if let value = nativeTimeline.currentPosition?() { persistNativePosition(value, scope: nativeScope) }
             cancelNativeHistory()
@@ -802,9 +821,10 @@ struct ConversationView: View {
         if let presentation = workspace.processPresentations[entryID] {
             PadProcessCard(entryID: entryID,
                            steps: workspace.processSteps[entryID] ?? [], presentation: presentation,
+                           commentaryIDs: workspace.processCommentaryIDs[entryID] ?? [],
                            laneWidth: laneWidth, coordinateSpace: timelineCoordinateSpace,
-                           startedAt: items.contains(where: { $0.processEndedAt != nil })
-                               ? nil : ConversationProcessPresentation.startedAt(for: items),
+                           startedAt: presentation.state == .running
+                               ? workspace.processReplyBounds[entryID]?.startedAt : nil,
                            canAdvance: PadProcessClockPolicy.canAdvance(
                                isActiveProcess: entryID == workspace.activeProcessEntryID,
                                clientIsOnline: connection.connected,
@@ -838,7 +858,10 @@ struct ConversationView: View {
             }.joined(separator: "|") + ":\(connection.connected):\(connection.busy):\(scenePhase == .active)"
             result[entry.id] = .init(messages: messages, decoration: decoration,
                 expanded: expandedProcessEntryIDs.contains(entry.id),
-                canRespond: workspace.capabilities?.collaborationConfirmation?.available == true)
+                canRespond: workspace.capabilities?.collaborationConfirmation?.available == true,
+                replyState: entry.processReplyState,
+                replyStartedAt: workspace.processReplyBounds[entry.id]?.startedAt,
+                replyEndedAt: workspace.processReplyBounds[entry.id]?.endedAt)
         }
         return result
     }
@@ -861,7 +884,13 @@ struct ConversationView: View {
             VStack(spacing: 0) {
                         switch entry.kind {
                         case .message(let message):
-                            if message.presentationKind == .collaborationMessage
+                            if let progress = message.coordinationProgress {
+                                CoordinationProgressCard(progress: progress, api: {
+                                    ClientDetailAPI(transport: try await connection.transport(), route: .pairedDevice)
+                                }, openSession: { id in
+                                    if let target = workspace.sessions.first(where: { $0.id == id || $0.logicalSessionId == id }) { workspace.selection = target.id }
+                                })
+                            } else if message.presentationKind == .collaborationMessage
                                 || message.presentationKind == .collaborationConfirmation {
                                 PadCollaborationCard(message: message, connection: connection, sessionID: sessionID,
                                     canRespond: workspace.capabilities?.collaborationConfirmation?.available == true,
@@ -871,7 +900,7 @@ struct ConversationView: View {
                                     })
                             } else if message.presentationKind == .automationEvent
                                         || message.presentationKind == .systemEvent
-                                        || (message.presentationKind == .unknown && !message.isStandaloneImage) {
+                                        || message.presentationKind == .unknown {
                                 PadSpecialEventCard(message: message)
                             } else if message.type == "userInput" {
                                 PadUserInputCard(message: message, connection: connection, sessionID: sessionID,
@@ -935,17 +964,21 @@ struct ConversationView: View {
             deviceID: scope[1], sessionID: scope[2])
         await workspace.waitForRealtimeTimelineOrFallback(connection)
         guard !Task.isCancelled, readingScope == scope, workspace.selection == sessionID else { return }
-        if let saved = savedNativePosition, !saved.followsLatest, let id = saved.entryID {
+        if let saved = savedNativePosition, !saved.followsLatest, saved.entryID != nil {
             for _ in 0..<20 {
                 guard !Task.isCancelled, readingScope == scope, workspace.selection == sessionID else { return }
-                if workspace.displayEntries.contains(where: { $0.id == id }) { break }
+                if let target = saved.resolvingRowID(workspace.resolveTimelineRowID).entryID,
+                   workspace.displayEntryByID[target] != nil { break }
                 guard !connection.busy, !workspace.isLoadingEarlier,
                       let cursor = workspace.historyRequestCursor else { break }
                 await workspace.loadEarlierMessagesIfNeeded(connection)
                 guard workspace.historyRequestCursor != cursor else { break }
             }
             guard !Task.isCancelled, readingScope == scope, workspace.selection == sessionID else { return }
-            if !workspace.displayEntries.contains(where: { $0.id == id }) {
+            if let target = saved.resolvingRowID(workspace.resolveTimelineRowID).entryID,
+               workspace.displayEntryByID[target] != nil {
+                savedNativePosition = saved.resolvingRowID(workspace.resolveTimelineRowID)
+            } else {
                 preserveSavedPosition = workspace.historyRequestCursor != nil
                 savedNativePosition = workspace.displayEntries.first.map {
                     .init(followsLatest: false, entryID: $0.id, minY: 0)
@@ -1580,7 +1613,9 @@ private struct PadProcessCard: View {
     let entryID: String
     let steps: [ConversationExecutionStep]
     let presentation: ConversationProcessPresentation
-    private let languageCode = Locale.preferredLanguages.first ?? "en"
+    let commentaryIDs: Set<String>
+    @Environment(\.locale) private var locale
+    private var languageCode: String { locale.identifier }
     let laneWidth: CGFloat
     let coordinateSpace: String
     let startedAt: Date?
@@ -1645,7 +1680,7 @@ private struct PadProcessCard: View {
 
     private func summary(at date: Date, startedAt: Date) -> String {
         let duration = ConversationProcessPresentation.durationText(
-            startedAt: startedAt, endingAt: date, showSeconds: true)
+            startedAt: startedAt, endingAt: date, showSeconds: true, fractionDigits: 0)
             ?? presentation.duration
         return ConversationProcessPresentation(state: presentation.state, count: presentation.count,
             duration: duration).summary(languageCode: languageCode)
@@ -1661,7 +1696,7 @@ private struct PadProcessCard: View {
                         toggle: toggle) {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     ForEach(steps) { step in
-                        PadExecutionStepCard(step: step)
+                        PadExecutionStepCard(step: step, isCommentary: commentaryIDs.contains(step.id))
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1694,12 +1729,14 @@ private struct PadProcessCardLayout: Layout {
 
 private struct PadExecutionStepCard: View {
     let step: ConversationExecutionStep
+    let isCommentary: Bool
     let presentation: ExecutionStepDetailPresentation
     let structuredPresentation: ExecutionStructuredStepPresentation?
     @State private var showsFull = false
 
-    init(step: ConversationExecutionStep) {
+    init(step: ConversationExecutionStep, isCommentary: Bool = false) {
         self.step = step
+        self.isCommentary = isCommentary
         self.presentation = ExecutionStepDetailPresentation(step: step)
         self.structuredPresentation = step.tool != nil || step.changeSet != nil
             ? ExecutionStructuredStepPresentation(step: step) : nil
@@ -1716,7 +1753,10 @@ private struct PadExecutionStepCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            if let plan = step.plan {
+            if isCommentary {
+                PadMessageText(text: step.detail ?? step.title, fromUser: false)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if let plan = step.plan {
                 if plan.steps.count > 12 {
                     ScrollView {
                         ExecutionPlanChecklist(plan: plan)
@@ -1733,7 +1773,7 @@ private struct PadExecutionStepCard: View {
                                steps: [presentation.displayedStep])
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if structuredPresentation?.hasOverflow ?? presentation.hasOverflow {
+            if !isCommentary, structuredPresentation?.hasOverflow ?? presentation.hasOverflow {
                 Button("查看完整内容") { showsFull = true }
                     .font(.caption2)
                     .accessibilityIdentifier("execution-step-full-details")
@@ -2196,6 +2236,7 @@ private struct PadSpecialEventCard: View {
     private var words: ConversationEventText { .init(languageCode: locale.identifier) }
 
     private var isSystemEvent: Bool { message.presentationKind == .systemEvent }
+    private var isChildTaskResult: Bool { isSystemEvent && message.systemEventKind == "child_task_result" }
     private var title: String {
         if message.presentationKind == .automationEvent { return message.automationName ?? words.automationTitle }
         if isSystemEvent { return words.systemKind(message.systemEventKind) }
@@ -2209,8 +2250,8 @@ private struct PadSpecialEventCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
-                Image(systemName: isSystemEvent ? "exclamationmark.triangle" : "clock.arrow.circlepath")
-                    .foregroundStyle(isSystemEvent ? .orange : .secondary)
+                Image(systemName: isChildTaskResult ? "tray.and.arrow.down" : isSystemEvent ? "exclamationmark.triangle" : "clock.arrow.circlepath")
+                    .foregroundStyle(isSystemEvent && !isChildTaskResult ? .orange : .secondary)
                     .accessibilityHidden(true)
                 Text(title).font(.headline)
             }
@@ -2236,7 +2277,7 @@ private struct PadSpecialEventCard: View {
                     LabeledContent(words.text("过期时间", "Expires at"), value: expires).font(.caption)
                 }
             }
-            if !isSystemEvent && message.automationRunId == nil && !bodyText.isEmpty {
+            if !isSystemEvent && (message.automationRunId == nil || message.messageOrigin == "scheduled_task") && !bodyText.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(words.text("触发消息", "Trigger message")).font(.caption.weight(.semibold))
                     Text(bodyText).font(.caption).textSelection(.enabled)
@@ -2245,13 +2286,15 @@ private struct PadSpecialEventCard: View {
             if let reason = message.systemEventReason {
                 LabeledContent(words.reasonLabel, value: words.reason(reason)).font(.caption).textSelection(.enabled)
             }
-            if isSystemEvent {
+            if isChildTaskResult {
+                Text(bodyText).font(.callout).textSelection(.enabled)
+            } else if isSystemEvent {
                 Text(words.systemNotice).font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(14)
         .frame(maxWidth: 560, alignment: .leading)
-        .modifier(ConversationContentSurface(cornerRadius: 14, tint: .secondary, tintOpacity: 0.045, isMessage: true))
+        .modifier(ConversationContentSurface(cornerRadius: 14, tint: .secondary, tintOpacity: 0.045, isMessage: true, role: .interaction))
         .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(Color.secondary.opacity(0.14)) }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
@@ -2365,7 +2408,6 @@ private struct MobileMessageBubble: View {
         ConversationMessageImageReferenceCache.shared.references(messageID: message.id, text: rawDisplayText)
     }
     private var displayText: String {
-        if message.isStandaloneImage { return "" }
         return MessageImageGalleryLayout.bodyText(ConversationMessageImageReference.removing(imageReferences, from: rawDisplayText),
             hasImages: !message.images.isEmpty)
     }

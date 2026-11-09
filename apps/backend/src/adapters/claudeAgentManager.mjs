@@ -1,3 +1,4 @@
+import { logError } from "../utils/errorDiagnostics.mjs";
 import { randomUUID } from "node:crypto";
 import { publicUserInput, validateInteractionAnswers } from "../application/interactionInput.mjs";
 import { question, elicitationInput, elicitationResponse, interactionError } from "../application/structuredInteraction.mjs";
@@ -278,6 +279,7 @@ export class ClaudeAgentManager {
       }
       throw new Error("Claude connection closed before returning a result.");
     } catch (error) {
+      logError("claude-sdk.connection-test", error, { secretValues: resolved.secretValues });
       throw normalizeClaudeProviderError(error, { secretValues: resolved.secretValues });
     } finally {
       clearTimeout(timeout);
@@ -317,7 +319,8 @@ export class ClaudeAgentManager {
     session.status = "running";
     session.phase = "input_sent";
     session.turnState = "running";
-    session.currentTurnId = options.turnId ?? `${session.id}:turn:${session.nextTurnSeq++}`;
+    const turnId = options.turnId ?? `${session.id}:turn:${session.nextTurnSeq++}`;
+    session.currentTurnId = turnId;
     if (options.turnId) session.nextTurnSeq += 1;
     session.lastInputAt = new Date().toISOString();
     session.updatedAt = session.lastInputAt;
@@ -331,13 +334,13 @@ export class ClaudeAgentManager {
     }
     this.emitProviderEvent(session, {
       type: "turn.started",
-      turnId: session.currentTurnId,
+      turnId,
       occurredAt: session.updatedAt
     });
     console.log(`[claude-sdk] send queued id=${id} chars=${value.length}`);
     const providerValue = providerMessageWithSessionContext(value, options.contextPrompt);
     this.enqueueInput(session, await makeClaudeUserMessage(providerValue, images));
-    return this.toSessionSummary(session);
+    return { ...this.toSessionSummary(session), turnId, delivery: "accepted" };
   }
 
   async switchWorkspace(id, cwd) {
@@ -861,6 +864,7 @@ export class ClaudeAgentManager {
       }));
       return startedQuery;
     } catch (error) {
+      if (!session.interruptRequested && error?.name !== "AbortError") logError("claude-sdk.query-startup", error, { sessionId: session.id });
       console.error("[claude-sdk] query startup", JSON.stringify({
         sessionId: session.id, agentSessionId: session.agentSessionId ?? null, status: "failed"
       }));
@@ -923,6 +927,7 @@ export class ClaudeAgentManager {
       }
     } catch (error) {
       const secretValues = [this.environment()?.ANTHROPIC_API_KEY].filter(Boolean);
+      if (!session.interruptRequested && error?.name !== "AbortError") logError("claude-sdk.query", error, { sessionId: session.id, secretValues });
       const failure = normalizeClaudeProviderError(error, {
         secretValues
       });
@@ -1205,7 +1210,7 @@ export class ClaudeAgentManager {
       hasAgentMessage,
       ...event
     })).catch((error) => {
-      console.error(`[claude-sdk] turn-settled callback failed id=${session.id}: ${error.message}`);
+      if (error?.name !== "AbortError") logError("claude-sdk.turn-settled-callback", error, { sessionId: session.id });
     }));
   }
 
@@ -1219,7 +1224,7 @@ export class ClaudeAgentManager {
       occurredAt: event.occurredAt ?? session.updatedAt,
       ...event
     })).catch((error) => {
-      console.error(`[claude-sdk] Provider event callback failed id=${session.id} type=${event.type}: ${error.message}`);
+      if (error?.name !== "AbortError") logError("claude-sdk.provider-event-callback", error, { sessionId: session.id, operation: event.type });
     }));
   }
 }

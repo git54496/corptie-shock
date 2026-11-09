@@ -107,23 +107,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             openSession: { [weak self] sessionID in self?.openSessionInPanel(sessionId: sessionID) }
         )
         self.agentOrbManager = agentOrbManager
-        backendClient.sessionsDidChange
+        // `AgentOrbManager.sync` only reads roles — its sessions argument is
+        // deliberately ignored, and `EntityAPIClient.roles` is just
+        // `AppStateStore.roles`. Two global subscriptions therefore did the
+        // same window-level work for every State frame. Observe only the roles
+        // commit counter (O(1) rather than deep-comparing the roles dictionary)
+        // so streaming bursts no longer rebuild orb visibility on the main thread.
+        AppStateStore.shared.$commitToken
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] sessions in
-                MainActor.assumeIsolated {
-                    guard self?.suppressAutomaticWindowPresentation != true else { return }
-                    self?.agentOrbManager?.sync(agents: EntityAPIClient.shared.agents, sessions: sessions)
-                }
-            }
-            .store(in: &cancellables)
-        AppStateStore.shared.$state
-            .receive(on: DispatchQueue.main)
+            .map(\.roles)
+            .removeDuplicates()
             .sink { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard self?.suppressAutomaticWindowPresentation != true else { return }
                     self?.agentOrbManager?.sync(
-                        agents: AppStateStore.shared.agents,
-                        sessions: self?.backendClient.sessions ?? []
+                        roles: AppStateStore.shared.roles,
+                        sessions: []
                     )
                 }
             }
@@ -132,9 +131,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NotificationCenter.default.publisher(for: .showAgentOrb)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
-                guard let agentID = notification.userInfo?["agentId"] as? String,
-                      let agent = AppStateStore.shared.agents.first(where: { $0.agentId == agentID })
-                        ?? EntityAPIClient.shared.agents.first(where: { $0.agentId == agentID }) else {
+                guard let roleID = notification.userInfo?["agentId"] as? String,
+                      let agent = AppStateStore.shared.roles.first(where: { $0.roleId == roleID })
+                        ?? EntityAPIClient.shared.roles.first(where: { $0.roleId == roleID }) else {
                     return
                 }
                 self?.agentOrbManager?.show(agent: agent)

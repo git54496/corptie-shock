@@ -20,7 +20,7 @@ struct ConsoleChatCanvasCard: View {
                     Image(systemName: "plus").font(.system(size: 10, weight: .semibold))
                         .frame(width: 20, height: 18)
                 }
-                .buttonStyle(.plain).focused($createFocused)
+                .buttonStyle(.plain).consoleHoverFeedback().focused($createFocused)
                 .opacity(isHovering || createFocused ? 1 : 0)
                 .accessibilityLabel(L10n("New Agent Conversation"))
                 .help(L10n("New Agent Conversation"))
@@ -51,13 +51,14 @@ private struct ConsoleChatCanvasRow: View {
             ConsoleConversationCardLabel(title: session.title, execution: session.executionTaskStatus,
                 needsAttention: session.attention != nil, status: session.executionTaskStatus.rawValue,
                 isSelected: isSelected, isFixed: false, hasScheduledWake: session.hasPendingScheduledWake == true,
-                isUnread: isSessionUnread(session), isActive: isActive) {
+                isUnread: isSessionUnread(session), isActive: isActive, session: session) {
                 let text = TaskCardSummaryPreview.text(content: nil, isCurrent: false,
                     sessionSummary: session.attention?.reason ?? session.summary, description: "")
                 Text(text).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(4).help(text)
             }
         }
         .buttonStyle(.plain)
+        .consoleHoverFeedback()
         .contextMenu { SessionContextMenuContent(session: session, isRenaming: $isRenaming) }
         .sheet(isPresented: $isRenaming) {
             RenameSessionSheet(session: session) { isRenaming = false }

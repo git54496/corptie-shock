@@ -1,3 +1,5 @@
+import { redactInlineSecrets } from "../utils/providerRawMetadata.mjs";
+
 // Project and repository operations are independent of Agent Provider adapters.
 export function handleProjectWorkspaceHttpRequest({
   request, response, url, projectApplicationService,
@@ -47,7 +49,7 @@ export function handleProjectWorkspaceHttpRequest({
     /^\/worktree-management\/jobs\/([^/]+)$/
   );
   const worktreeManagementJobActionMatch = url.pathname.match(
-    /^\/worktree-management\/jobs\/([^/]+)\/(confirm|retry|cancel|resolve-conflict|commit-policy-prepare|commit-policy-decisions|commit-policy-residue)$/
+    /^\/worktree-management\/jobs\/([^/]+)\/(confirm|retry|cancel|cancel-preview|rollback|resume|resolve-conflict|commit-policy-prepare|commit-policy-decisions|commit-policy-residue)$/
   );
   const projectWorkspaceActionMatch = url.pathname.match(
     /^\/projects\/([^/]+)\/workspaces\/([^/]+)\/actions\/([^/]+)$/
@@ -145,7 +147,7 @@ export function handleProjectWorkspaceHttpRequest({
     const repositoryId = decodeURIComponent(worktreeManagementDeleteMatch[1]);
     const worktreeId = decodeURIComponent(worktreeManagementDeleteMatch[2]);
     readJson(request)
-      .then(() => worktreeIntegrationJobService.deleteWorktree(repositoryId, worktreeId))
+      .then((input) => worktreeIntegrationJobService.deleteWorktree(repositoryId, worktreeId, input))
       .then((result) => {
         emitEvent("WorktreeDeleted", { repositoryId, worktreeId, result });
         sendJson(response, 200, { result });
@@ -170,14 +172,17 @@ export function handleProjectWorkspaceHttpRequest({
     const action = worktreeManagementJobActionMatch[2];
     const knownActions = new Set([
       "confirm", "cancel", "commit-policy-prepare", "commit-policy-decisions", "commit-policy-residue",
-      "resolve-conflict", "retry"
+      "resolve-conflict", "retry", "cancel-preview", "rollback", "resume"
     ]);
     if (!knownActions.has(action)) {
       sendJson(response, 404, { error: `Unknown integration job action: ${action}`, code: "JOB_ACTION_NOT_FOUND" });
       return true;
     }
     readJson(request)
-      .then((input) => action === "confirm"
+      .then((input) => action === "cancel-preview" ? worktreeIntegrationJobService.prepareRollback(jobId)
+        : action === "resume" ? worktreeIntegrationJobService.resumeRollbackReview(jobId)
+        : action === "rollback" ? worktreeIntegrationJobService.confirmRollback(jobId, input)
+        : action === "confirm"
         ? worktreeIntegrationJobService.confirm(jobId, input)
         : action === "cancel"
           ? worktreeIntegrationJobService.cancel(jobId, input)
@@ -190,7 +195,7 @@ export function handleProjectWorkspaceHttpRequest({
           : action === "resolve-conflict"
             ? worktreeIntegrationJobService.resolveConflictWithAgent(jobId)
             : worktreeIntegrationJobService.retry(jobId))
-      .then((result) => sendJson(response, 202, { job: result }))
+      .then((result) => sendJson(response, 202, action === "cancel-preview" ? result : { job: result }))
       .catch((error) => sendJson(response, error.statusCode ?? unifiedErrorStatus(error), worktreeErrorBody(error)));
     return true;
   }
@@ -306,7 +311,7 @@ function decodeRouteId(value, code) {
 
 export function worktreeErrorBody(error) {
   return {
-    error: error.message,
+    error: redactInlineSecrets(String(error.message ?? "Worktree operation failed.")),
     code: error.code,
     ...(error.busyContext ? {busyContext:Object.fromEntries(
       ["worktreeId","sessionId","sessionTitle","reason","jobId","status","phase","count"]

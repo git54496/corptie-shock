@@ -22,11 +22,13 @@ extension BackendClient {
     }
 
     func loadTimelineWindow(
-        for session: TaskSession, anchorRowID: String, expectedSelectionGeneration: UInt64?
+        for session: TaskSession, anchorRowID: String, expectedSelectionGeneration: UInt64?,
+        retainedTailLimit: Int? = nil, acceptsResult: () -> Bool = { true }
     ) async -> TimelineAnchorWindowLoadResult {
         await timelineHistoryController.loadTimelineWindow(
             for: session, anchorRowID: anchorRowID,
-            expectedSelectionGeneration: expectedSelectionGeneration
+            expectedSelectionGeneration: expectedSelectionGeneration,
+            retainedTailLimit: retainedTailLimit, acceptsResult: acceptsResult
         )
     }
 
@@ -47,10 +49,10 @@ extension BackendClient {
 
     @discardableResult
     func loadEarlierMessages(
-        for session: TaskSession, expectedSelectionGeneration: UInt64? = nil
+        for session: TaskSession, expectedSelectionGeneration: UInt64? = nil, protectsHistoryWindow: Bool = true
     ) async -> EarlierHistoryLoadState {
         await timelineHistoryController.loadEarlierMessages(
-            for: session, expectedSelectionGeneration: expectedSelectionGeneration
+            for: session, expectedSelectionGeneration: expectedSelectionGeneration, protectsHistoryWindow: protectsHistoryWindow
         )
     }
 }
